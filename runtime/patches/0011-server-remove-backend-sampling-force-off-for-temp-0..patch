@@ -1,0 +1,32 @@
+From cc0c06c23f4894cc8b75244bde2b7732ce67d4e1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sun, 30 Aug 2026 23:41:32 +0200
+Subject: [PATCH 11/54] server: remove backend-sampling force-off for
+ temp<=0.01 (MTP disabled)
+
+The MTP-selective toggle forced backend-sampling OFF when temp<=0.01
+(code path), which moved the entire sampling (top-k over 248k vocab)
+back to CPU -> 90% CPU / freeze at 7 t/s. MTP draft removed from prod,
+so this force is now harmful: code temp 0 must use backend-sampling
+(GPU) like reasoning. Code temp 0: 25.5 -> 32.8 t/s.
+---
+ tools/server/server-context.cpp | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 5efbfc3854b..d54ad7c3f6d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1700,9 +1700,6 @@ private:
+ 
+             bool use_backend_sampling = task.params.sampling.backend_sampling;
+ 
+-            // le MTP sélectif désactive le backend-sampling (temp 0 = code)
+-            use_backend_sampling &= !(task.params.sampling.temp <= 0.01f);
+-
+             // TODO: getting pre sampling logits is not yet supported with backend sampling
+             use_backend_sampling &= !need_pre_sample_logits;
+ 
+-- 
+2.53.0
+

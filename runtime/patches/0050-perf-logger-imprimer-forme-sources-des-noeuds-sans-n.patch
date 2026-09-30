@@ -1,0 +1,44 @@
+From 6422243fd00eefe08c55b550cfcadb95b56e20d4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 19 Sep 2026 13:05:29 +0200
+Subject: [PATCH 50/54] perf-logger: imprimer forme + sources des noeuds sans
+ nom cb() (permis d'identifier les 12 gathers de l'expansion QSA)
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 18e61ae21a2..a58a9258052 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2536,10 +2536,24 @@ class vk_perf_logger {
+             return s.str();
+         }
+         // [TAG_PERF_NAMES] include the tensor name (graph cb() labels) for op attribution
+-        if (node->name && node->name[0]) {
++        // [TAG_PERF_SHAPES] ggml nomme TOUT tenseur "node_<id>" : un tel nom n'apporte rien, on
++        // imprime donc la forme de sortie ET les sources (c'est ce qui identifie le noeud, ex. un
++        // GET_ROWS sur une table [2560,248320,48] = le PLE).
++        const bool unnamed = !(node->name && node->name[0]) || strncmp(node->name, "node_", 5) == 0;
++        if (!unnamed) {
+             return fusion_str + ggml_op_name(node->op) + std::string(" |") + node->name;
+         }
+-        return fusion_str + ggml_op_name(node->op);
++        {
++            std::stringstream s;
++            s << fusion_str << ggml_op_name(node->op)
++              << " ne(" << node->ne[0] << "," << node->ne[1] << "," << node->ne[2] << "," << node->ne[3] << ")"
++              << " t=" << ggml_type_name(node->type);
++            for (int i = 0; i < GGML_MAX_SRC && node->src[i]; ++i) {
++                s << " |s" << i << "=" << ggml_op_name(node->src[i]->op)
++                  << "(" << node->src[i]->ne[0] << "," << node->src[i]->ne[1] << "," << node->src[i]->ne[2] << "," << node->src[i]->ne[3] << ")";
++            }
++            return s.str();
++        }
+     }
+ 
+     void log_timing(const ggml_tensor * node, const char *fusion_name, uint64_t time) {
+-- 
+2.53.0
+

@@ -1,0 +1,140 @@
+From 234aa75a7bafe39253ed1808f6156ff84ef741cc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 29 Aug 2026 13:51:58 +0200
+Subject: [PATCH 07/54] ngram-bias: desactiver le steering pendant le thinking
+ (P0)
+
+Le sampler ngram_bias suit desormais l'etat <think>/</think> (IDs extraits
+du vocab a l'init via common_tokenize) et ne fait plus le lookup n-gram
+pendant le raisonnement: le steering shell ne s'applique qu'a la reponse.
+
+Garde-fou 'ne pas biaiser dans le mauvais sens' n.1 (lecons chimere +
+recherche web NoWait/entropy-gated). Le reasoning xhigh n'est plus
+influence par le corpus shell.
+---
+ common/sampling.cpp   |  8 +++++++-
+ include/llama.h       |  4 +++-
+ src/llama-sampler.cpp | 25 ++++++++++++++++++++++---
+ 3 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index fe2304dac21..8c67e53b890 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -360,8 +360,14 @@ struct common_sampler * common_sampler_init(
+     if (!params.ngram_bias_cache.empty()) {
+         // loaded once, reused across slots (MVP: no hot reload of the steering table)
+         static common_ngram_cache ngram_bias_cache = common_ngram_cache_load(params.ngram_bias_cache);
++        // tokens think/endthink du vocab (steering desactive pendant le raisonnement)
++        const auto think_start_toks = common_tokenize(vocab, "<think>", false, true);
++        const auto think_end_toks   = common_tokenize(vocab, "</think>", false, true);
++        const int32_t think_start_token = think_start_toks.empty() ? -1 : think_start_toks[0];
++        const int32_t think_end_token   = think_end_toks.empty()   ? -1 : think_end_toks[0];
+         samplers.push_back(llama_sampler_init_ngram_bias(
+-            (void *) &ngram_bias_cache, ngram_bias_lookup_cb, params.ngram_bias_alpha, 2, 4, 8));
++            (void *) &ngram_bias_cache, ngram_bias_lookup_cb, params.ngram_bias_alpha, 2, 4, 8,
++            think_start_token, think_end_token));
+     }
+ 
+     if (params.mirostat == 0) {
+diff --git a/include/llama.h b/include/llama.h
+index d683c98c437..a88c815121e 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1543,7 +1543,9 @@ extern "C" {
+         float   alpha,
+         int32_t ngram_min,
+         int32_t ngram_max,
+-        int32_t n_last);
++        int32_t n_last,
++        int32_t think_start_token,
++        int32_t think_end_token);
+ 
+     // this sampler is meant to be used for fill-in-the-middle infilling
+     // it's supposed to be used after top_k + top_p sampling
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index d241735a8e1..fb8e0e9b8fa 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -4072,6 +4072,9 @@ struct llama_sampler_ngram_bias : public llama_sampler_backend {
+     int ngram_min;
+     int ngram_max;
+     int n_last;
++    int32_t think_start_token;
++    int32_t think_end_token;
++    bool in_thinking;
+     std::vector<llama_token> recent;
+ 
+     // backend state (GPU scatter)
+@@ -4095,6 +4098,12 @@ static void llama_sampler_ngram_bias_accept(struct llama_sampler * smpl, llama_t
+     if ((int) ctx->recent.size() > ctx->n_last) {
+         ctx->recent.erase(ctx->recent.begin());
+     }
++    // steering actif uniquement pendant la reponse, pas pendant le raisonnement
++    if (ctx->think_start_token >= 0 && token == ctx->think_start_token) {
++        ctx->in_thinking = true;
++    } else if (ctx->think_end_token >= 0 && token == ctx->think_end_token) {
++        ctx->in_thinking = false;
++    }
+ }
+ 
+ static void llama_sampler_ngram_bias_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+@@ -4105,6 +4114,9 @@ static void llama_sampler_ngram_bias_apply(struct llama_sampler * smpl, llama_to
+     if ((int) ctx->recent.size() < ctx->ngram_min) {
+         return;
+     }
++    if (ctx->in_thinking) {
++        return;
++    }
+     ctx->pairs_tokens.assign(LLAMA_NGRAM_BIAS_MAX_PAIRS, 0);
+     ctx->pairs_biases.assign(LLAMA_NGRAM_BIAS_MAX_PAIRS, 0.0f);
+     const int n = ctx->lookup_callback(ctx->cache, ctx->alpha, ctx->recent.data(),
+@@ -4183,7 +4195,7 @@ static void llama_sampler_ngram_bias_backend_set_input(struct llama_sampler * sm
+     sctx->pairs_biases.assign(LLAMA_NGRAM_BIAS_MAX_PAIRS, 0.0f);
+ 
+     if (sctx->lookup_callback != nullptr && sctx->alpha > 0.0f &&
+-            (int) sctx->recent.size() >= sctx->ngram_min) {
++            (int) sctx->recent.size() >= sctx->ngram_min && !sctx->in_thinking) {
+         sctx->lookup_callback(sctx->cache, sctx->alpha, sctx->recent.data(),
+                               (int) sctx->recent.size(), sctx->ngram_min, sctx->ngram_max,
+                               sctx->pairs_tokens.data(), sctx->pairs_biases.data(),
+@@ -4203,12 +4215,14 @@ static void llama_sampler_ngram_bias_backend_reset(struct llama_sampler * smpl)
+ static void llama_sampler_ngram_bias_reset(struct llama_sampler * smpl) {
+     auto * ctx = (llama_sampler_ngram_bias *) smpl->ctx;
+     ctx->recent.clear();
++    ctx->in_thinking = false;
+ }
+ 
+ static struct llama_sampler * llama_sampler_ngram_bias_clone(const struct llama_sampler * smpl) {
+     const auto * ctx = (const llama_sampler_ngram_bias *) smpl->ctx;
+     return llama_sampler_init_ngram_bias(ctx->cache, ctx->lookup_callback, ctx->alpha,
+-                                         ctx->ngram_min, ctx->ngram_max, ctx->n_last);
++                                         ctx->ngram_min, ctx->ngram_max, ctx->n_last,
++                                         ctx->think_start_token, ctx->think_end_token);
+ }
+ 
+ static void llama_sampler_ngram_bias_free(struct llama_sampler * smpl) {
+@@ -4236,7 +4250,9 @@ struct llama_sampler * llama_sampler_init_ngram_bias(
+         float   alpha,
+         int32_t ngram_min,
+         int32_t ngram_max,
+-        int32_t n_last) {
++        int32_t n_last,
++        int32_t think_start_token,
++        int32_t think_end_token) {
+     return llama_sampler_init(
+         /* .iface = */ &llama_sampler_ngram_bias_i,
+         /* .ctx   = */ new llama_sampler_ngram_bias {
+@@ -4247,6 +4263,9 @@ struct llama_sampler * llama_sampler_init_ngram_bias(
+             /* .ngram_min       = */ ngram_min,
+             /* .ngram_max       = */ ngram_max,
+             /* .n_last          = */ n_last,
++            /* .think_start_token = */ think_start_token,
++            /* .think_end_token   = */ think_end_token,
++            /* .in_thinking     = */ false,
+             /* .recent          = */ {},
+             /* .pairs_tokens    = */ {},
+             /* .pairs_biases    = */ {},
+-- 
+2.53.0
+

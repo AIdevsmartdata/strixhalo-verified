@@ -1,0 +1,797 @@
+From 157d5af3cf6ad22f6e2321174db8901d18b27a85 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sun, 13 Sep 2026 22:36:35 +0200
+Subject: [PATCH 41/54] wip: etat prod 13/09 avant cherry-pick
+ MMID_SCALE_EPILOGUE (tag backup_avant_cherry_mmid)
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 159 ++++++++++++++++--
+ .../vulkan-shaders/count_experts.comp         | 104 +++++++++++-
+ .../ggml-vulkan/vulkan-shaders/mul_mm.comp    |  50 ++++--
+ .../vulkan-shaders/mul_mm_cm2.comp            |  25 ++-
+ .../vulkan-shaders/mul_mm_id_funcs.glsl       |  15 ++
+ .../ggml-vulkan/vulkan-shaders/mul_mmq.comp   |  35 ++--
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   1 +
+ src/llama-graph.cpp                           |  26 ++-
+ src/models/qwen4exp.cpp                       |  10 +-
+ tests/test-backend-ops.cpp                    |   6 +
+ 10 files changed, 382 insertions(+), 49 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 7a8bd5a0eb6..7120c7c111b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -5,6 +5,13 @@
+ // Must match the per-node fusion bookkeeping array in ggml_backend_vk_graph_compute().
+ #define GGML_VK_MAX_FUSED_OPS 12
+ 
++// [TAG_MOE_HOIST] Le hoisting des row-IDs (upstream 90c26fcd4) indexe les tableaux partages de
++// count_experts.comp par expert ; upstream les dimensionnait a BLOCK_SIZE et limitait donc le
++// hoisting a `n_as <= 256`. Notre modele a 512 experts : la borne devient celle de MAX_EXPERTS
++// dans count_experts.comp (a garder synchronise). La consommation memoire partagee resultante
++// est de 3 x MAX_EXPERTS x 4 o = 12 Ko.
++#define GGML_VK_HOIST_MAX_EXPERTS 1024
++
+ #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
+ #include <chrono>
+ #include "ggml-cpu.h"
+@@ -1367,6 +1374,8 @@ struct vk_mat_mat_id_push_constants {
+     uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
+     uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
+     uint32_t padded_N;
++    uint32_t n_experts;
++    uint32_t hoist_row_ids;
+ };
+ struct vk_mat_vec_id_push_constants {
+     uint32_t ncols;
+@@ -1447,6 +1456,10 @@ struct vk_op_count_experts_push_constants {
+     uint32_t nb00;
+     uint32_t nb01;
+     uint32_t a_offset;
++    uint32_t n_experts;
++    uint32_t hoist_row_ids;
++    uint32_t ne00mp;
++    uint32_t ne00L;
+ };
+ 
+ struct vk_op_glu_push_constants {
+@@ -1625,6 +1638,10 @@ template <> void init_pushconst_fastdiv(vk_op_glu_push_constants &p) {
+     init_fastdiv_values(p.ne20,                p.ne2_0mp,      p.ne2_0L);
+ }
+ 
++template <> void init_pushconst_fastdiv(vk_op_count_experts_push_constants &p) {
++    init_fastdiv_values(p.ne00, p.ne00mp, p.ne00L);
++}
++
+ struct vk_op_binary_push_constants {
+     uint32_t ne;
+     uint32_t ne00; uint32_t ne01; uint32_t ne02; uint32_t ne03; uint32_t nb00; uint32_t nb01; uint32_t nb02; uint32_t nb03;
+@@ -2370,6 +2387,26 @@ class vk_perf_logger {
+                 " (" << node->src[0]->ne[0] << "," << node->src[0]->ne[1] << "," << node->src[0]->ne[2] << "," << node->src[0]->ne[3] << ")";
+             return name.str();
+         }
++        // [TAG_PERF_SHAPES] Enrichit le nom du noeud avec sa FORME et ses PARENTS.
++        // Motif : les noeuds anonymes (node_NNNN) coutent cher (76 GET_ROWS a ~9.6 us
++        // en decodage) et ne sont attribuables ni par le nom ni par le grep source.
++        // GGML_VK_PERF_SHAPES=1 active l'enrichissement ; OFF par defaut.
++        static const bool perf_shapes = getenv("GGML_VK_PERF_SHAPES") != nullptr;
++        if (perf_shapes) {
++            std::stringstream s;
++            s << fusion_str << ggml_op_name(node->op)
++              << " |" << ((node->name && node->name[0]) ? node->name : "?")
++              << " ne(" << node->ne[0] << "," << node->ne[1] << "," << node->ne[2] << "," << node->ne[3] << ")"
++              << " t=" << ggml_type_name(node->type);
++            for (int i = 0; i < GGML_MAX_SRC && node->src[i]; ++i) {
++                s << " |s" << i << "=" << ggml_op_name(node->src[i]->op);
++                if (node->src[i]->name && node->src[i]->name[0]) {
++                    s << ":" << node->src[i]->name;
++                }
++                s << " ne(" << node->src[i]->ne[0] << "," << node->src[i]->ne[1] << ")";
++            }
++            return s.str();
++        }
+         // [TAG_PERF_NAMES] include the tensor name (graph cb() labels) for op attribution
+         if (node->name && node->name[0]) {
+             return fusion_str + ggml_op_name(node->op) + std::string(" |") + node->name;
+@@ -6421,7 +6458,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_count_equal_i32, "count_equal_i32", count_equal_i32_len, count_equal_i32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, { device->subgroup_size }, 1);
+ 
+-    ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
++    if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
++        ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_subgroup_len, count_experts_subgroup_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true, true);
++    } else {
++        ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
++    }
+ 
+     for (auto &s : device->pipeline_solve_tri_f32) {
+         const vk_solve_tri_pipeline_state &state = s.first;
+@@ -8448,6 +8489,36 @@ static int dmmv_large_amd_max_m() {
+     return v;
+ }
+ 
++// [TAG_DMMV_LARGE_AMD_COLS] max num_cols for the AMD LARGE matvec path.
++// Default 1 = stock behavior (LARGE only for pure n=1 matvecs).
++// N>1 lets multi-token graphs (MTP draft/verify batches) use LARGE too.
++static uint32_t dmmv_large_amd_cols() {
++    static const uint32_t v = [] {
++        const char * e = getenv("GGML_VK_DMMV_LARGE_AMD_COLS");
++        int n = e ? atoi(e) : 1;
++        if (n < 1)  n = 1;
++        if (n > 64) n = 64;
++        return (uint32_t) n;
++    }();
++    return v;
++}
++
++// [TAG_DMMV_LARGE_AMD_COLS_MAX_M] Restriction de forme pour le chemin LARGE
++// multi-tokens (num_cols > 1). A/B perf-logger 12/09 : sans restriction, LARGE
++// gagne sur HC w_inject (f16 m=4 k=10240) mais regresse sur q8_0 m=640 k=2560
++// (+44..+66 %) et q4_0 m=10240 k=320 (+14 %). Appliquer LARGE aux seules tres
++// petites hauteurs (m <= 8) rend les 7 groupes MTP tous negatifs.
++// N'a d'effet que si GGML_VK_DMMV_LARGE_AMD_COLS > 1. Env = seuil de m.
++static uint32_t dmmv_large_amd_cols_max_m() {
++    static const uint32_t v = [] {
++        const char * e = getenv("GGML_VK_DMMV_LARGE_AMD_COLS_MAX_M");
++        int n = e ? atoi(e) : 8;
++        if (n < 1) n = 1;
++        return (uint32_t) n;
++    }();
++    return v;
++}
++
+ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
+     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
+     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
+@@ -8529,7 +8600,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         // [TAG_DMMV_LARGE_AMD] gfx1151: LARGE WG for n=1 matvecs, tiny m / large k.
+         // A/B 02/09: m=4 k=10240 (HC w_inject) -125 ms, m=48 k=2560 -78 ms, f32 m=1 -20 ms.
+         // Env value = max_m gate (absent/0 = off). Strict num_cols==1 to protect prefill.
+-        || (dmmv_large_amd_max_m() > 0 && ctx->device->vendor_id == VK_VENDOR_ID_AMD && num_cols == 1 && m <= (uint32_t) dmmv_large_amd_max_m())) {
++        || (dmmv_large_amd_max_m() > 0 && ctx->device->vendor_id == VK_VENDOR_ID_AMD && m <= (uint32_t) dmmv_large_amd_max_m() &&
++            (num_cols == 1 || (num_cols <= dmmv_large_amd_cols() && m <= dmmv_large_amd_cols_max_m())))) {
+         // Prefer larger workgroups when M is small, to spread the work out more
+         // and keep more SMs busy.
+         // q6_k seems to prefer small workgroup size even for "medium" values of M.
+@@ -9654,13 +9726,13 @@ static void ggml_vk_matmul_id(
+         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
+         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
+         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
+-        uint32_t padded_n) {
++        uint32_t padded_n, bool hoist_row_ids) {
+     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
+         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
+         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
+         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
+     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
+-                                              nei0, nei1, nbi1, ne11, padded_n };
++                                              nei0, nei1, nbi1, ne11, padded_n, n_as, uint32_t(hoist_row_ids) };
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+ }
+ 
+@@ -10010,10 +10082,27 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
+ 
+     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
++    // [TAG_MATMUL_ALIGN_SMALLM] Etendre la variante alignee (chargements vectorises,
++    // sans clamp par element) aux petites hauteurs : les noeuds HC m=4/m=1 du modele
++    // tournent sinon a 112/27 GFLOPS contre 23 600 pour le GEMM dense (~4 % du prefill).
++    static const bool align_smallm = getenv("GGML_VK_MATMUL_ALIGN_SMALLM") != nullptr;
++    bool aligned = !quantize_y && ne10 == kpad && (align_smallm || ne01 > 8) && ne11 > 8;
+ 
+     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+ 
++    if (aligned && ne01 < pipeline->wg_denoms[0]) {
++        // [TAG_MATMUL_ALIGN_SMALLM] Le chemin aligne charge les lignes de A jusqu a BM
++        // sans borner idx_m < p.M (seuls les resultats hors p.M sont ecartes, par le store).
++        // La lecture doit rester DANS le buffer alloue, sinon faute GPU -> repli clampe.
++        const uint64_t overread = (uint64_t) pipeline->wg_denoms[0] * (uint64_t) src0->nb[1];
++        const vk_subbuffer sb0 = ggml_vk_tensor_subbuffer(ctx, src0);
++        if (sb0.offset + sb0.size + overread > sb0.buffer->size) {
++            aligned = false;
++            pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, false,
++                qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
++        }
++    }
++
+     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
+     }
+@@ -10865,6 +10954,16 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     // const uint64_t ne23 = dst->ne[3];
+ 
+     const uint64_t n_as = ne02;
++    // n_as counts, n_as offsets, one total, then one packed row id per (expert, token).
++    // Hoisting requires 16-bit indices for the packing and a table that fits one binding.
++    const uint64_t hoisted_row_id_words = 2 * n_as + 1 + nei0 * nei1;
++    // [TAG_MOE_HOIST] Interrupteur d'A/B : GGML_VK_NO_MOE_HOIST desactive le hoisting (0 expert
++    // eligible) sans avoir a reconstruire -> comparaison appariee dans le meme binaire.
++    static const bool no_moe_hoist = getenv("GGML_VK_NO_MOE_HOIST") != nullptr;
++    const uint64_t hoist_max_experts = no_moe_hoist ? 0 : (uint64_t) GGML_VK_HOIST_MAX_EXPERTS;
++    const bool hoist_row_ids = n_as <= hoist_max_experts && nei0 <= 0xffff && nei1 <= 0xffff &&
++                                hoisted_row_id_words * sizeof(uint32_t) <=
++                                    ctx->device->properties.limits.maxStorageBufferRange;
+ 
+     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
+@@ -11013,7 +11112,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     }
+     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
+ 
+-    uint32_t expert_count_size = sizeof(uint32_t) * n_as;
++    const size_t expert_data_size = sizeof(uint32_t) *
++        (hoist_row_ids ? hoisted_row_id_words : n_as);
+ 
+     {
+         if (
+@@ -11029,8 +11129,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+             ctx->prealloc_size_y = y_sz;
+             ggml_vk_preallocate_buffers(ctx, subctx);
+         }
+-        if (ctx->prealloc_size_split_k < expert_count_size) {
+-            ctx->prealloc_size_split_k = expert_count_size;
++        if (ctx->prealloc_size_split_k < expert_data_size) {
++            ctx->prealloc_size_split_k = expert_data_size;
+             ggml_vk_preallocate_buffers(ctx, subctx);
+         }
+ 
+@@ -11096,18 +11196,23 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         }
+     }
+     // Count how many times each expert is used
+-    vk_subbuffer expert_count_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
++    vk_subbuffer expert_count_buf = { ctx->prealloc_split_k, 0, expert_data_size };
+     if (ctx->prealloc_split_k_need_sync) {
+         ggml_vk_sync_buffers(ctx, subctx);
+     }
+     {
+-        const std::vector<uint32_t> pc = { (uint32_t)nei0,
++        vk_op_count_experts_push_constants pc = { (uint32_t)nei0,
+                                            (uint32_t)nei1,
+                                            (uint32_t)(nbi0 / ggml_type_size(ids->type)),
+                                            (uint32_t)(nbi1 / ggml_type_size(ids->type)),
+-                                           (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)) };
++                                           (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
++                                           (uint32_t)n_as,
++                                           uint32_t(hoist_row_ids),
++                                           0, 0 };
++        init_pushconst_fastdiv(pc);
+         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
+-            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { (uint32_t)n_as, 1, 1});
++            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc,
++            { hoist_row_ids ? 1u : (uint32_t)n_as, 1, 1});
+     }
+ 
+     if (x_non_contig) {
+@@ -11176,7 +11281,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
+         ne01, ne21, ne10, ne10, stride_b_y, ne01,
+         stride_batch_x, stride_batch_y, ne20*ne21,
+-        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n
++        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n, hoist_row_ids
+     );  // NOLINT
+ 
+     if (x_non_contig || qx_needs_dequant) {
+@@ -19594,6 +19699,19 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+         return;
+     }
+ 
++    // [TAG_FUSE_DUMP] ordre reel des noeuds MUL/UNARY avant la passe de reordonnancement.
++    static const bool fuse_dump = getenv("GGML_VK_FUSE_DIAG") != nullptr;
++    if (fuse_dump) {
++        fprintf(stderr, "[FUSE_DUMP] n_nodes=%d\n", graph->n_nodes);
++        for (int idn = 0; idn < graph->n_nodes; idn++) {
++            ggml_tensor * nd = graph->nodes[idn];
++            if (nd->op != GGML_OP_MUL && nd->op != GGML_OP_UNARY) continue;
++            fprintf(stderr, "[FUSE_DUMP] %4d %-10s %-26s s0=%s/%s s1=%s/%s\n",
++                idn, ggml_op_name(nd->op), nd->name[0]?nd->name:"?",
++                nd->src[0]?ggml_op_name(nd->src[0]->op):"-", (nd->src[0]&&nd->src[0]->name[0])?nd->src[0]->name:"-",
++                nd->src[1]?ggml_op_name(nd->src[1]->op):"-", (nd->src[1]&&nd->src[1]->name[0])?nd->src[1]->name:"-");
++        }
++    }
+     auto const &is_empty = [](ggml_tensor * node) -> bool {
+         return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
+     };
+@@ -19715,6 +19833,12 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
++                    // [TAG_FUSE_C1] Motif qwen shared-expert : MUL_MAT(gate) -> UNARY(SIGMOID) -> MUL(ffn_shexp).
++                    // Sans ces deux exceptions, `ok` devient faux (le UNARY et le MUL dependent chacun
++                    // d un MUL_MAT non encore 'used') et le hissage UNARY+MUL (l.19836) n est JAMAIS atteint.
++                    // Preuve : FUSE_DUMP montre UNARY idx 159 et MUL idx 160 ADJACENTS, et FUSE_DIAG = 0 ligne.
++                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_UNARY) &&
++                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_MUL) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
+                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
+@@ -19822,6 +19946,15 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+                             continue;
+                         }
+                         ggml_tensor * other = (mul->src[0] == graph->nodes[j]) ? mul->src[1] : mul->src[0];
++                        // [TAG_FUSE_DIAG]
++                        static const bool fuse_diag = getenv("GGML_VK_FUSE_DIAG") != nullptr;
++                        if (fuse_diag) {
++                            const bool other_ok_d = (other->op == GGML_OP_NONE || used_node_set.find(other) != used_node_set.end());
++                            const bool can_d = ggml_vk_can_fuse_unary_mul(graph, j, k);
++                            fprintf(stderr, "[FUSE_DIAG] UNARY=%s MUL=%s other=%s op=%s other_ok=%d can_fuse=%d\n",
++                                graph->nodes[j]->name[0]?graph->nodes[j]->name:"?", mul->name[0]?mul->name:"?",
++                                other->name[0]?other->name:"?", ggml_op_name(other->op), (int)other_ok_d, (int)can_d);
++                        }
+                         // the other src must either be weights or already processed
+                         if (!(other->op == GGML_OP_NONE || used_node_set.find(other) != used_node_set.end())) {
+                             continue;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/count_experts.comp b/ggml/src/ggml-vulkan/vulkan-shaders/count_experts.comp
+index ffc8608691f..b5fd545548d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/count_experts.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/count_experts.comp
+@@ -2,6 +2,11 @@
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+ 
++#ifdef USE_SUBGROUPS
++#extension GL_KHR_shader_subgroup_basic : enable
++#extension GL_KHR_shader_subgroup_arithmetic : enable
++#endif
++
+ #include "types.glsl"
+ 
+ layout (push_constant) uniform parameter
+@@ -11,26 +16,119 @@ layout (push_constant) uniform parameter
+     uint32_t nb00;
+     uint32_t nb01;
+     uint32_t a_offset;
++    uint32_t n_experts;
++    uint32_t hoist_row_ids;
++    uint32_t ne00mp;
++    uint32_t ne00L;
+ } p;
+ 
+ #define BLOCK_SIZE 256
+ 
++// [TAG_MOE_HOIST] Le chemin hoiste indexe ces tableaux partages PAR EXPERT : upstream les
++// dimensionnait a BLOCK_SIZE (256) et refusait donc le hoisting au-dessus de 256 experts
++// (condition `n_as <= 256` cote hote). Notre modele a 512 experts -> on dimensionne a part.
++// Doit rester synchronise avec GGML_VK_HOIST_MAX_EXPERTS dans ggml-vulkan.cpp.
++#define MAX_EXPERTS 1024
++
+ layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly buffer A {uint data_a[];};
+ layout (binding = 1) writeonly buffer D {uint data_d[];};
+ 
+-shared uint vals[BLOCK_SIZE];
++shared uint vals[MAX_EXPERTS];
++shared uint offsets[MAX_EXPERTS];
++shared uint cursors[MAX_EXPERTS];
+ 
++// see init_fastdiv_values in ggml-vulkan.cpp
++uint fastdiv(uint n, uint mp, uint L) {
++    uint msbs, lsbs;
++    // msbs = mulhi(n, mp)
++    umulExtended(n, mp, msbs, lsbs);
++    return (msbs + n) >> L;
++}
++
++// data_d layout when p.hoist_row_ids is set:
++//   [0,              n_experts)   per-expert row count
++//   [n_experts,    2*n_experts)   per-expert start offset into the row id region
++//   [2*n_experts]                 total row count
++//   [2*n_experts + 1,         )   row ids grouped by expert, packed as (i01 << 16) | (i00 & 0xffff)
++// Otherwise only data_d[expert_id] is written, holding that expert's row count.
+ void main() {
+     const uint expert_id = gl_WorkGroupID.x;
+     const uint num_elements = p.ne00 * p.ne01;
+     const uint tid = gl_LocalInvocationID.x;
+ 
++    if (p.hoist_row_ids != 0) {
++        // [TAG_MOE_HOIST] couvre n_experts > BLOCK_SIZE (upstream : un seul tour de tid)
++        for (uint e = tid; e < p.n_experts; e += BLOCK_SIZE) {
++            vals[e] = 0;
++        }
++        barrier();
++
++        for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
++            const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
++            const uint i00 = idx - i01 * p.ne00;
++            const uint expert = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
++            if (expert < p.n_experts) {
++                atomicAdd(vals[expert], 1);
++            }
++        }
++        barrier();
++
++#ifdef USE_SUBGROUPS
++        if (gl_SubgroupID == 0) {
++            // pad the trip count so the subgroup ops stay in uniform control flow
++            const uint n_experts_padded = (p.n_experts + gl_SubgroupSize - 1) & ~(gl_SubgroupSize - 1);
++            uint base = 0;
++            for (uint expert = gl_SubgroupInvocationID; expert < n_experts_padded; expert += gl_SubgroupSize) {
++                const bool in_range = expert < p.n_experts;
++                const uint count = in_range ? vals[expert] : 0;
++                const uint offset = base + subgroupExclusiveAdd(count);
++                if (in_range) {
++                    data_d[expert] = count;
++                    data_d[p.n_experts + expert] = offset;
++                    offsets[expert] = offset;
++                    cursors[expert] = 0;
++                }
++                base += subgroupAdd(count);
++            }
++            if (subgroupElect()) {
++                data_d[2 * p.n_experts] = base;
++            }
++        }
++#else
++        if (tid == 0) {
++            uint offset = 0;
++            for (uint expert = 0; expert < p.n_experts; ++expert) {
++                const uint count = vals[expert];
++                data_d[expert] = count;
++                data_d[p.n_experts + expert] = offset;
++                offsets[expert] = offset;
++                cursors[expert] = 0;
++                offset += count;
++            }
++            data_d[2 * p.n_experts] = offset;
++        }
++#endif
++        barrier();
++
++        for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
++            const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
++            const uint i00 = idx - i01 * p.ne00;
++            const uint expert = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
++            if (expert < p.n_experts) {
++                const uint row = atomicAdd(cursors[expert], 1);
++                const uint packed_row_id = (i01 << 16) | (i00 & 0xffffu);
++                data_d[2 * p.n_experts + 1 + offsets[expert] + row] = packed_row_id;
++            }
++        }
++        return;
++    }
++
+     uint count = 0;
+     for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+-        const uint i01 = idx / p.ne00;
+-        const uint i00 = idx % p.ne00;
++        const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
++        const uint i00 = idx - i01 * p.ne00;
+         const uint a = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
+ 
+         count += uint(a == expert_id);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
+index 3df88044a5e..72b1e2b0988 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp
+@@ -88,6 +88,9 @@ layout (push_constant) uniform parameter
+     uint nei1;
+     uint nbi1;
+     uint ne11;
++    uint padded_N;
++    uint n_experts;
++    uint hoist_row_ids;
+ #else
+     uint base_work_group_z;
+     uint num_batches;
+@@ -214,30 +217,37 @@ void main() {
+     const uint loadstride_b = gl_WorkGroupSize.x * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK;
+ 
+ #ifdef MUL_MAT_ID
+-#ifdef MUL_MAT_ID_USE_SUBGROUPS
+-    if (bitCount(p.nei0) == 1) {
+-        load_row_ids(expert_idx, true, ic);
++    if (p.hoist_row_ids != 0) {
++        load_row_ids_hoisted(expert_idx, ic);
+     } else {
+-        load_row_ids(expert_idx, false, ic);
+-    }
++#ifdef MUL_MAT_ID_USE_SUBGROUPS
++        if (bitCount(p.nei0) == 1) {
++            load_row_ids(expert_idx, true, ic);
++        } else {
++            load_row_ids(expert_idx, false, ic);
++        }
+ #else
+-    _ne1 = 0;
+-    for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
+-        for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
+-            if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
+-                if (_ne1 >= ic * BN) {
+-                    row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
++        _ne1 = 0;
++        for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
++            for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
++                if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
++                    if (_ne1 >= ic * BN) {
++                        row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
++                    }
++                    _ne1++;
+                 }
+-                _ne1++;
+             }
+         }
+-    }
+ 
+-    barrier();
++        barrier();
+ #endif
++    }
+ 
+     // Workgroup has no work
+     if (ic * BN >= _ne1) return;
++
++    uint required_work_items = (_ne1 - ic * BN) * BK / LOAD_VEC_B_EFF / LOAD_VEC_BATCH_B;
++    uint required_warp_c = (_ne1 - ic * BN + WN - 1) / WN;
+ #endif
+ 
+ #ifdef MUL_MAT_ID
+@@ -288,6 +298,9 @@ void main() {
+         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
+         }
++        #ifdef MUL_MAT_ID
++        if (gl_LocalInvocationID.x < required_work_items) {
++        #endif
+         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+ #if !defined(MUL_MAT_ID)
+             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
+@@ -295,6 +308,9 @@ void main() {
+             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
+ #endif
+         }
++        #ifdef MUL_MAT_ID
++        }
++        #endif
+ 
+         barrier();
+ 
+@@ -302,6 +318,9 @@ void main() {
+         pos_b += BK / LOAD_VEC_B_EFF;
+ 
+ #ifdef COOPMAT
++#ifdef MUL_MAT_ID
++        if (warp_c < required_warp_c) {
++#endif
+         [[unroll]] for (uint i = 0; i < BK; i += TK) {
+             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+                 // Load from shared into cache
+@@ -314,6 +333,9 @@ void main() {
+                 }
+             }
+         }
++#ifdef MUL_MAT_ID
++        }
++#endif
+ #else
+         [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
+             // Load from shared into cache
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp
+index a2e15f6f5ce..cf78474a925 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp
+@@ -67,6 +67,10 @@ layout (push_constant) uniform parameter
+ #endif
+     // N dimension for the B matrix can be >= p.N
+     uint padded_N;
++#ifdef MUL_MAT_ID
++    uint n_experts;
++    uint hoist_row_ids;
++#endif
+ } p;
+ 
+ 
+@@ -225,6 +229,23 @@ void load_row_ids(uint expert_idx, bool nei0_is_pow2, uint ic) {
+     }
+     barrier();
+ }
++
++void load_row_ids_hoisted(uint expert_idx, uint ic) {
++    _ne1 = uint(data_expert_count[expert_idx]);
++
++    const uint tile_begin = ic * BN;
++    const uint tile_count = tile_begin < _ne1 ? min(BN, _ne1 - tile_begin) : 0;
++    const uint expert_offset = uint(data_expert_count[p.n_experts + expert_idx]);
++    const uint row_ids_offset = 2 * p.n_experts + 1 + expert_offset + tile_begin;
++
++    for (uint i = gl_LocalInvocationIndex; i < tile_count; i += BLOCK_SIZE) {
++        const uint packed_row_id = uint(data_expert_count[row_ids_offset + i]);
++        const uint ii0 = packed_row_id & 0xffffu;
++        const uint ii1 = packed_row_id >> 16;
++        row_ids[i] = u16vec4(fastmod(ii0, p.ne11), ii1, ii0, 0);
++    }
++    barrier();
++}
+ #endif
+ 
+ void main() {
+@@ -266,7 +287,9 @@ void main() {
+     const uint ik = gl_WorkGroupID.x / blocks_m;
+ 
+ #ifdef MUL_MAT_ID
+-    if (bitCount(p.nei0) == 1) {
++    if (p.hoist_row_ids != 0) {
++        load_row_ids_hoisted(expert_idx, ic);
++    } else if (bitCount(p.nei0) == 1) {
+         load_row_ids(expert_idx, true, ic);
+     } else {
+         load_row_ids(expert_idx, false, ic);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_id_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_id_funcs.glsl
+index 26c5c12a49a..54ad60b2efb 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_id_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_id_funcs.glsl
+@@ -71,4 +71,19 @@ void load_row_ids(uint expert_idx, bool nei0_is_pow2, uint ic) {
+     barrier();
+ }
+ #endif // MUL_MAT_ID_USE_SUBGROUPS
++
++void load_row_ids_hoisted(uint expert_idx, uint ic) {
++    _ne1 = uint(data_expert_count[expert_idx]);
++
++    const uint tile_begin = ic * BN;
++    const uint tile_count = tile_begin < _ne1 ? min(BN, _ne1 - tile_begin) : 0;
++    const uint expert_offset = uint(data_expert_count[p.n_experts + expert_idx]);
++    const uint row_ids_offset = 2 * p.n_experts + 1 + expert_offset + tile_begin;
++
++    for (uint i = gl_LocalInvocationIndex; i < tile_count; i += BLOCK_SIZE) {
++        const uint packed_row_id = uint(data_expert_count[row_ids_offset + i]);
++        row_ids[i] = u16vec2(packed_row_id & 0xffffu, packed_row_id >> 16);
++    }
++    barrier();
++}
+ #endif // MUL_MAT_ID
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp
+index aae1c2e8ae9..c2d84c05b40 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mmq.comp
+@@ -56,6 +56,9 @@ layout (push_constant) uniform parameter
+     uint nei1;
+     uint nbi1;
+     uint ne11;
++    uint padded_N;
++    uint n_experts;
++    uint hoist_row_ids;
+ #else
+     uint base_work_group_z;
+     uint num_batches;
+@@ -157,27 +160,31 @@ void main() {
+     const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
+ 
+ #ifdef MUL_MAT_ID
+-#ifdef MUL_MAT_ID_USE_SUBGROUPS
+-    if (bitCount(p.nei0) == 1) {
+-        load_row_ids(expert_idx, true, ic);
++    if (p.hoist_row_ids != 0) {
++        load_row_ids_hoisted(expert_idx, ic);
+     } else {
+-        load_row_ids(expert_idx, false, ic);
+-    }
++#ifdef MUL_MAT_ID_USE_SUBGROUPS
++        if (bitCount(p.nei0) == 1) {
++            load_row_ids(expert_idx, true, ic);
++        } else {
++            load_row_ids(expert_idx, false, ic);
++        }
+ #else
+-    _ne1 = 0;
+-    for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
+-        for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
+-            if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
+-                if (_ne1 >= ic * BN) {
+-                    row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
++        _ne1 = 0;
++        for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
++            for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
++                if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
++                    if (_ne1 >= ic * BN) {
++                        row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
++                    }
++                    _ne1++;
+                 }
+-                _ne1++;
+             }
+         }
+-    }
+ 
+-    barrier();
++        barrier();
+ #endif
++    }
+ 
+     // Workgroup has no work
+     if (ic * BN >= _ne1) return;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 4211fb80cb1..fff04c00c68 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1079,6 +1079,7 @@ void process_shaders() {
+     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+ 
+     string_to_spv("count_experts", "count_experts.comp", merge_maps(base_dict, {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}}));
++    string_to_spv("count_experts_subgroup", "count_experts.comp", merge_maps(base_dict, {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"USE_SUBGROUPS", "1"}}));
+ 
+     for (std::string dim_str : {"", "_3d"}) {
+         for (bool bda : {false, true}) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index fd21a35e91d..8100d263f1f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3476,12 +3476,34 @@ ggml_tensor * llm_graph_context::build_rs(
+     // Clear a single state which will then be copied to the other cleared states.
+     // Note that this is a no-op when the view is zero-sized.
+     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
++    // [TAG_RS_FILL_ZERO] Cette ligne sert de source de zeros pour les cellules d'etat
++    // vides ; elle est remise a zero a CHAQUE graphe (36 couches x 3,1 Mo). Un SCALE
++    // inplace lit ET ecrit (mesure : 36,17 us/appel, 1,56 ms/graphe) ; GGML_OP_FILL
++    // n'a aucun buffer source (ecriture seule) -> 9,32 us, 0,37 ms/graphe (-76 %).
++    // Semantique identique (ecrire 0.0f == multiplier par 0), memes asserts (f32/f16,
++    // contigu) et meme mecanisme in-place. Gate LLAMA_RS_FILL_ZERO=1 (defaut = SCALE).
++    static const bool rs_fill_zero = getenv("LLAMA_RS_FILL_ZERO") != nullptr;
++    ggml_build_forward_expand(gf, rs_fill_zero
++        ? ggml_fill_inplace(ctx0, state_zero, 0.0f)
++        : ggml_scale_inplace(ctx0, state_zero, 0));
+ 
+     // copy states
+     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
+     // {state_size, rs_size} -> {state_size, n_seqs}
+-    ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
++    // [TAG_RS_DIRECT_COPY] Si le cache d'etat recurrent ne contient qu'une seule ligne,
++    // l'index du gather doit adresser une ligne valide de ce tenseur -> il vaut necessairement 0.
++    // Le GET_ROWS generique est alors remplacable par une copie contigue de la ligne 0 :
++    // meme resultat, sans lecture d'index ni kernel de gather (~478 Mo/token, 76 gathers/token).
++    // Gate LLAMA_RS_DIRECT_COPY=1 (OFF par defaut) -> aucune regression possible.
++    static const bool rs_direct_copy = getenv("LLAMA_RS_DIRECT_COPY") != nullptr;
++    const bool rs_can_direct = rs_direct_copy && states->ne[1] == 1 && n_seqs == 1;
++    if (rs_can_direct) {
++        static bool rs_logged = false;
++        if (!rs_logged) { rs_logged = true; fprintf(stderr, "[TAG_RS_DIRECT_COPY] ACTIF (states->ne[1]==1, n_seqs==1)\n"); }
++    }
++    ggml_tensor * output_states = rs_can_direct
++        ? ggml_cont(ctx0, states)
++        : get_state_rows(ctx0, states, state_copy_main);
+     ggml_build_forward_expand(gf, output_states);
+ 
+     // copy extra states which won't be changed further (between n_seqs and n_rs)
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index fce59092d19..6af0807c390 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -579,8 +579,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+ 
+     // fc_embedding(e) + fc_hidden(h) is one projection of the concatenation; the converter
+     // merges the two checkpoint tensors into this single eh_proj
+-    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj,
+-            ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
++    // [TAG_MTP_N] Les reshape hc ci-dessus mettent `hc` en ne1 : le matmul devient
++    // [2*n_embd, hc, n_tokens] soit n=hc=4 -> tuile BN du GEMM sous-utilisee (mesure : 1,56 TFLOPS
++    // contre 21,2 TFLOPS pour la meme charge aplatie en n=hc*n_tokens). Le poids est identique pour
++    // tous les flux hc, donc aplatir (hc, n_tokens) en une seule dimension colonne est exact.
++    ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0);
++    eh_in = ggml_reshape_2d(ctx0, eh_in, eh_in->ne[0], hc * n_tokens);
++    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj, eh_in, layer.nextn.eh_proj_s);
++    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
+     cb(inpL, "mtp_eh_proj", il);
+ 
+     ggml_tensor * inject = nullptr;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b64c905f9a1..b10d3e021af 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9267,6 +9267,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 512, 256)); // many rows
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
++    // [TAG_MATMUL_ALIGN_SMALLM] formes exactes des noeuds HC de Qwen3.8 (m<=8, n grand)
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 4, 2048, 10240, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, 2048, 2560, {1, 1}, {1, 1}));
++    // [TAG_MOE_HOIST] forme type MoE : n_mats=512 > 256 exerce l'extension des tableaux
++    // partages du hoisting des row-IDs (upstream limitait a 256 experts).
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 512, 10, false, 256, 512, 256));
+ 
+ #if 0
+     // > 4GB A matrix. Too slow to be enabled by default.
+-- 
+2.53.0
+

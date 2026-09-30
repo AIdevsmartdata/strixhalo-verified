@@ -1,0 +1,42 @@
+From 5fa1dd81fae4d4548dd037011ea3498b50af1d08 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Thu, 27 Aug 2026 23:11:23 +0200
+Subject: [PATCH 04/54] ngram-bias: use O(1) vocabulary-order fast path for
+ logit lookup
+
+Avoids a linear scan over the full vocab per biased token. When the
+candidate array is in vocabulary order (data[token].id == token), write
+directly to data[token].logit; fall back to linear scan only otherwise
+(grammar / candidate subset).
+---
+ common/ngram-cache.cpp | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/common/ngram-cache.cpp b/common/ngram-cache.cpp
+index c15aa79bb8c..f28d88b2c87 100644
+--- a/common/ngram-cache.cpp
++++ b/common/ngram-cache.cpp
+@@ -310,10 +310,16 @@ void common_ngram_cache_bias_logits(
+         for (const auto & kv : part) {
+             const float p = (float) kv.second / (float) total;
+             const float bias = alpha * std::log(p);
+-            for (size_t i = 0; i < n_data; ++i) {
+-                if (data[i].id == kv.first) {
+-                    data[i].logit += bias;
+-                    break;
++            const llama_token token = kv.first;
++            // chemin rapide : les donnees sont en ordre de vocabulaire (idx == id)
++            if (token >= 0 && n_data > (size_t) token && data[token].id == token) {
++                data[token].logit += bias;
++            } else {
++                for (size_t i = 0; i < n_data; ++i) {
++                    if (data[i].id == token) {
++                        data[i].logit += bias;
++                        break;
++                    }
+                 }
+             }
+         }
+-- 
+2.53.0
+

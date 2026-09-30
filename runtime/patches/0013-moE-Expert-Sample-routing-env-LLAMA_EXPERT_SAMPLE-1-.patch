@@ -1,0 +1,274 @@
+From 48fb33ad5f0f5533c649aaba40d2910d8ae1ad5e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Tue, 1 Sep 2026 17:13:00 +0200
+Subject: [PATCH 13/54] moE: Expert-Sample routing (env LLAMA_EXPERT_SAMPLE=1)
+ + THP madvise (env LLAMA_MMAP_THP=1)
+
+Expert-Sample (arXiv 2602.02443): top k_keep=6 experts deterministes + k-k_keep
+Gumbel-sampled dans le top r=4k. Bruit Gumbel via input tensor rempli host-side
+(llm_graph_input_es, pattern identique au PLE). Poids d'agregation = softmax d'origine.
+
+Mesures 01/09 sur prod (12 taches privates, decode temp 0) :
+- qualite pass@1 : identique (11/12 vs 11/12)
+- vitesse : -6.6% (29.6 vs 31.7 t/s) -> gain du papier = pass@32/best-of-n uniquement
+-> OFF par defaut, levier garde pour usage best-of-n.
+
+THP : madvise accepte mais 0 huge page file-backed reelle (MAP_SHARED) -> no-op sur ce kernel.
+get_rows du fork indexe la dim 1 : a=[1,n_expert,n_tokens] ids=[k,n_tokens] -> [1,k,n_tokens,1].
+---
+ src/llama-graph.cpp     | 58 +++++++++++++++++++++++++++++++++++++----
+ src/llama-graph.h       |  6 +++--
+ src/llama-mmap.cpp      | 15 +++++++++++
+ src/models/models.h     |  4 +++
+ src/models/qwen4exp.cpp | 54 +++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 129 insertions(+), 8 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8fca8e1bc0e..fd21a35e91d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1913,7 +1913,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts_in) const {
++         ggml_tensor * selected_experts_in,
++         ggml_tensor ** es_noise_out) const {
+     return build_moe_ffn(
+         cur,
+         gate_inp,  /* gate_inp_b  */ nullptr,
+@@ -1934,7 +1935,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         up_exps_s,
+         gate_exps_s,
+         down_exps_s,
+-        selected_experts_in
++        selected_experts_in,
++        es_noise_out
+     );
+ }
+ 
+@@ -1962,7 +1964,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts_in) const {
++         ggml_tensor * selected_experts_in,
++         ggml_tensor ** es_noise_out) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+@@ -2054,8 +2057,53 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // select experts
+     ggml_tensor * selected_experts = selected_experts_in;
+     if (selected_experts == nullptr) {
+-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
++        if (es_noise_out != nullptr && n_expert_used >= 6 && n_tokens > 0 && n_expert >= 4*n_expert_used) {
++            // [TAG_EXPERT_SAMPLE] Expert-Sample routing (arXiv 2602.02443): keep the top
++            // k_keep experts deterministic, sample the remaining experts from the tail of
++            // the top r=4k candidates, Gumbel-perturbed over log-probs (sample ∝ p).
++            // The aggregation weights stay the original softmax probs (unchanged below).
++            const int64_t k_keep = n_expert_used / 2 + 1;
++            const int64_t r      = 4 * n_expert_used;
++            const int64_t n_cand = r - k_keep;
++
++            ggml_tensor * top_all = ggml_argsort_top_k(ctx0, selection_probs, r); // [r, n_tokens]
++            cb(top_all, "ffn_moe_argsort_es", il);
++
++            ggml_tensor * top_keep = ggml_view_2d(ctx0, top_all, k_keep, n_tokens, top_all->nb[1], 0);
++            ggml_tensor * cand_ids = ggml_view_2d(ctx0, top_all, n_cand, n_tokens, top_all->nb[1], k_keep*ggml_type_size(top_all->type));
++            ggml_tensor * cand_ids_c = ggml_cont(ctx0, cand_ids); // [n_cand, n_tokens]
++
++            // this fork's get_rows gathers along dim 1: a=[1, n_expert, n_tokens], ids=[k, n_tokens] -> [1, k, n_tokens, 1]
++            ggml_tensor * sel3 = ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens);
++            ggml_tensor * cand_prob = ggml_get_rows(ctx0, sel3, cand_ids_c); // [1, n_cand, n_tokens, 1]
++            cand_prob = ggml_reshape_2d(ctx0, cand_prob, n_cand, n_tokens);
++            cand_prob = ggml_clamp(ctx0, cand_prob, 1e-12f, 1.0f);
++            ggml_tensor * cand_lp = ggml_log(ctx0, cand_prob); // [n_cand, n_tokens]
++
++            if (getenv("LLAMA_ES_DEBUG")) {
++                fprintf(stderr, "[ES_DEBUG] n_tokens=%lld n_expert=%lld cand_lp=[%lld,%lld,%lld,%lld]\n",
++                    (long long) n_tokens, (long long) n_expert,
++                    (long long) cand_lp->ne[0], (long long) cand_lp->ne[1], (long long) cand_lp->ne[2], (long long) cand_lp->ne[3]);
++            }
++
++            ggml_tensor * noise = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cand, n_tokens);
++            ggml_set_input(noise);
++            ggml_set_name(noise, "ffn_moe_gumbel_noise");
++            *es_noise_out = noise;
++
++            ggml_tensor * perturbed = ggml_add(ctx0, cand_lp, noise); // [n_cand, n_tokens]
++            ggml_tensor * sampled_idx = ggml_argsort_top_k(ctx0, perturbed, n_expert_used - k_keep); // [k-k_keep, n_tokens]
++
++            ggml_tensor * cand3 = ggml_reshape_3d(ctx0, cand_ids_c, 1, n_cand, n_tokens);
++            ggml_tensor * sampled = ggml_get_rows(ctx0, cand3, sampled_idx); // [1, k-k_keep, n_tokens, 1]
++            sampled = ggml_reshape_2d(ctx0, sampled, n_expert_used - k_keep, n_tokens);
++
++            selected_experts = ggml_concat(ctx0, ggml_cont(ctx0, top_keep), sampled, 0); // [n_expert_used, n_tokens]
++            cb(selected_experts, "ffn_moe_topk_es", il);
++        } else {
++            selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
++            cb(selected_experts->src[0], "ffn_moe_argsort", il);
++        }
+     }
+     cb(selected_experts, "ffn_moe_topk", il);
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3edd29d6e2d..782057d47c4 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1115,7 +1115,8 @@ struct llm_graph_context {
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+-             ggml_tensor * selected_experts_in = nullptr) const;
++             ggml_tensor * selected_experts_in = nullptr,
++             ggml_tensor ** es_noise_out = nullptr) const;
+ 
+     ggml_tensor * build_moe_ffn(
+              ggml_tensor * cur,
+@@ -1141,7 +1142,8 @@ struct llm_graph_context {
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+-             ggml_tensor * selected_experts_in = nullptr) const;
++             ggml_tensor * selected_experts_in = nullptr,
++             ggml_tensor ** es_noise_out = nullptr) const;
+ 
+     //
+     // inputs
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 4d183cbc9c4..04e3183bf5e 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -510,6 +510,21 @@ struct llama_mmap::impl {
+                         strerror(errno));
+             }
+         }
++#ifdef __linux__
++        // [TAG_THP] optional transparent huge pages for the resident weight ranges
++        // (enabled with LLAMA_MMAP_THP=1; huge pages cut the first-touch fault storm
++        //  after a restart by 512x: 2 MiB pages instead of 4 KiB)
++        if (getenv("LLAMA_MMAP_THP")) {
++            const size_t thp = 2*1024*1024;
++            for (const auto & range : ranges_complement(lazy_ranges, file->size())) {
++                const size_t beg = range.first  & ~(thp - 1);
++                const size_t end = std::min((range.second + thp - 1) & ~(thp - 1), (size_t) file->size());
++                if (beg < end && madvise((char *) addr + beg, end - beg, MADV_HUGEPAGE)) {
++                    LLAMA_LOG_WARN("warning: madvise(.., MADV_HUGEPAGE) failed: %s\n", strerror(errno));
++                }
++            }
++        }
++#endif
+ 
+         mapped_fragments.emplace_back(0, file->size());
+     }
+diff --git a/src/models/models.h b/src/models/models.h
+index 5a49a649481..2604282843a 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2284,6 +2284,7 @@ struct llama_model_qwen4exp : public llama_model_base {
+     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+ 
+     class llm_graph_input_qsa;
++    class llm_graph_input_es;
+ 
+     // set when the PLE table is left on disk (params.ple_on_disk): per_layer_tok_embd is
+     // then null and build_ple takes its rows from this reader instead of ggml_get_rows
+@@ -2356,6 +2357,9 @@ struct llama_model_qwen4exp : public llama_model_base {
+         // so the layers sharing a ratio share one input set
+         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+ 
++        // [TAG_EXPERT_SAMPLE] Gumbel noise input for Expert-Sample routing; owned by res->inputs
++        llm_graph_input_es * inp_es = nullptr;
++
+         // QSA: token indices this layer's queries may attend to, or nullptr for dense
+         ggml_tensor * build_qsa_top_k(
+   const llama_memory_hybrid_idx_context * mctx_hyb,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 7c7d3590421..1146813cb18 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <cmath>
++#include <random>
+ 
+ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+@@ -1284,9 +1286,48 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+     return cur;
+ }
+ 
++// [TAG_EXPERT_SAMPLE] Gumbel perturbation for Expert-Sample routing (arXiv 2602.02443):
++// the noise tensor is created by build_moe_ffn, filled host-side here and uploaded
++// via ggml_backend_tensor_set on every decode step (fresh noise -> fresh samples).
++class llama_model_qwen4exp::llm_graph_input_es : public llm_graph_input_i {
++public:
++    virtual ~llm_graph_input_es() = default;
++
++    ggml_tensor * noise = nullptr; // F32 [n_cand, n_tokens]
++
++    void set_input(const llama_ubatch * ubatch) override;
++
++    bool can_reuse(const llm_graph_params & params) override {
++        return noise != nullptr && noise->ne[1] == params.ubatch.n_tokens;
++    }
++
++    std::vector<float> buf;
++};
++
++void llama_model_qwen4exp::llm_graph_input_es::set_input(const llama_ubatch * /* ubatch */) {
++    if (!noise) {
++        return;
++    }
++
++    const size_t n = (size_t) noise->ne[0] * noise->ne[1];
++    buf.resize(n);
++
++    std::mt19937_64 rng(std::random_device{}());
++    std::uniform_real_distribution<float> U(1e-12f, 1.0f - 1e-12f);
++    for (size_t i = 0; i < n; ++i) {
++        buf[i] = -logf(-logf(U(rng)));
++    }
++
++    ggml_backend_tensor_set(noise, buf.data(), 0, n * sizeof(float));
++}
++
+ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+ 
++    // [TAG_EXPERT_SAMPLE] enabled via LLAMA_EXPERT_SAMPLE=1
++    const bool es_on = getenv("LLAMA_EXPERT_SAMPLE") != nullptr;
++    ggml_tensor * es_noise = nullptr;
++
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+             model.layers[il].ffn_gate_inp,
+@@ -1301,9 +1342,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+             nullptr, model.layers[il].ffn_gate_up_exps,
+             model.layers[il].ffn_up_exps_s,
+             model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
++            model.layers[il].ffn_down_exps_s,
++            nullptr,
++            es_on ? &es_noise : nullptr);
+     cb(moe_out, "ffn_moe_out", il);
+ 
++    if (es_noise) {
++        if (!inp_es) {
++            auto inp = std::make_unique<llm_graph_input_es>();
++            inp_es = inp.get();
++            res->add_input(std::move(inp));
++        }
++        inp_es->noise = es_noise;
++    }
++
+     // shared experts, as in the Qwen3Next reference
+     if (model.layers[il].ffn_up_shexp != nullptr) {
+         ggml_tensor * ffn_shexp =
+-- 
+2.53.0
+

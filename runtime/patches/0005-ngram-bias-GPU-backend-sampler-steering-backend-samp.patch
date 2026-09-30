@@ -1,0 +1,378 @@
+From 5aa9f8a58c26c3c01e8f40639f8f77a86b3b5fa1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 29 Aug 2026 13:31:34 +0200
+Subject: [PATCH 05/54] =?UTF-8?q?ngram-bias:=20GPU=20backend=20sampler=20?=
+ =?UTF-8?q?=E2=80=94=20steering=20+=20backend-sampling=20compatibles?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Transforme le sampler ngram_bias (steering logits[token] += alpha*ln(p)) en
+llama_sampler_backend complet, sur le modele du sampler logit_bias:
+
+- extrait common_ngram_cache_lookup_bias() (stupid backoff -> paires token/bias)
+- backend_apply: data->logits += ggml_set_rows(zeros, ngram_bias, ngram_idxs)
+- backend_set_input: lookup CPU -> tensor_set de 512 paires max (padding no-op)
+- le bias n-gram s'applique sur GPU AVANT le top-k GPU -> top-k reste backend
+
+Resultat mesure (bench_xhigh 6 questions): steering alpha=0.2 + backend-sampling
+= 30.45 t/s vs 30.64 baseline sans steering (-0.6%), au lieu de retomber a 24.9
+(-16%) avec l'ancien sampler CPU. Fini le conflit vitesse/qualite.
+---
+ common/ngram-cache.cpp |  48 ++++++++++-------
+ common/ngram-cache.h   |  24 +++++++--
+ common/sampling.cpp    |  15 +++++-
+ include/llama.h        |   8 +++
+ src/llama-sampler.cpp  | 113 ++++++++++++++++++++++++++++++++++++-----
+ 5 files changed, 174 insertions(+), 34 deletions(-)
+
+diff --git a/common/ngram-cache.cpp b/common/ngram-cache.cpp
+index f28d88b2c87..6987806b75e 100644
+--- a/common/ngram-cache.cpp
++++ b/common/ngram-cache.cpp
+@@ -285,17 +285,19 @@ void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ng
+     }
+ }
+ 
+-void common_ngram_cache_bias_logits(
+-    common_ngram_cache & cache, const llama_token * tokens, int n_tokens,
+-    int ngram_min, int ngram_max, float alpha, llama_token_data * data, size_t n_data) {
++size_t common_ngram_cache_lookup_bias(
++    const common_ngram_cache & cache, const llama_token * tokens, int n_tokens,
++    int ngram_min, int ngram_max, float alpha,
++    std::vector<std::pair<llama_token, float>> & out) {
++    out.clear();
+     if (alpha <= 0.0f || n_tokens < ngram_min) {
+-        return;
++        return 0;
+     }
+     // stupid backoff : essayer le plus long n-gram en premier
+     const int n_start = std::min(ngram_max, n_tokens);
+     for (int n = n_start; n >= ngram_min; --n) {
+         common_ngram ngram(tokens + n_tokens - n, n);
+-        common_ngram_cache::iterator it = cache.find(ngram);
++        common_ngram_cache::const_iterator it = cache.find(ngram);
+         if (it == cache.end()) {
+             continue;
+         }
+@@ -307,22 +309,34 @@ void common_ngram_cache_bias_logits(
+         if (total <= 0) {
+             continue;
+         }
++        out.reserve(part.size());
+         for (const auto & kv : part) {
+             const float p = (float) kv.second / (float) total;
+-            const float bias = alpha * std::log(p);
+-            const llama_token token = kv.first;
+-            // chemin rapide : les donnees sont en ordre de vocabulaire (idx == id)
+-            if (token >= 0 && n_data > (size_t) token && data[token].id == token) {
+-                data[token].logit += bias;
+-            } else {
+-                for (size_t i = 0; i < n_data; ++i) {
+-                    if (data[i].id == token) {
+-                        data[i].logit += bias;
+-                        break;
+-                    }
++            out.emplace_back(kv.first, alpha * std::log(p));
++        }
++        return out.size(); // stupid backoff : premier match (plus long) suffit
++    }
++    return 0;
++}
++
++void common_ngram_cache_bias_logits(
++    common_ngram_cache & cache, const llama_token * tokens, int n_tokens,
++    int ngram_min, int ngram_max, float alpha, llama_token_data * data, size_t n_data) {
++    std::vector<std::pair<llama_token, float>> pairs;
++    common_ngram_cache_lookup_bias(cache, tokens, n_tokens, ngram_min, ngram_max, alpha, pairs);
++    for (const auto & kv : pairs) {
++        const llama_token token = kv.first;
++        const float bias = kv.second;
++        // chemin rapide : les donnees sont en ordre de vocabulaire (idx == id)
++        if (token >= 0 && n_data > (size_t) token && data[token].id == token) {
++            data[token].logit += bias;
++        } else {
++            for (size_t i = 0; i < n_data; ++i) {
++                if (data[i].id == token) {
++                    data[i].logit += bias;
++                    break;
+                 }
+             }
+         }
+-        return; // stupid backoff : premier match (plus long) suffit
+     }
+ }
+diff --git a/common/ngram-cache.h b/common/ngram-cache.h
+index 2b20ffea184..7e5fef6b68c 100644
+--- a/common/ngram-cache.h
++++ b/common/ngram-cache.h
+@@ -5,6 +5,7 @@
+ #include <unordered_map>
+ #include <string>
+ #include <vector>
++#include <utility>
+ 
+ #define LLAMA_NGRAM_MIN    1
+ #define LLAMA_NGRAM_MAX    4
+@@ -46,11 +47,15 @@ struct common_token_hash_function {
+ 
+ struct common_ngram_hash_function {
+     size_t operator()(const common_ngram & ngram) const {
+-        size_t hash = common_token_hash_function{}(ngram.tokens[0]);
+-        for (int i = 1; i < LLAMA_NGRAM_MAX; ++i) {
+-            hash ^= common_token_hash_function{}(ngram.tokens[i]);
++        // FNV-1a séquentiel 64-bit : respecte l'ordre des tokens (AB != BA), contrairement
++        // à l'ancien XOR (commutatif) qui faisait collider les permutations. Le operator==
++        // exact gère les rares collisions résiduelles ; on gagne ici en distribution des buckets.
++        uint64_t hash = 1469598103934665603ull; // FNV offset basis 64
++        for (int i = 0; i < LLAMA_NGRAM_MAX; ++i) {
++            hash ^= (uint64_t) (uint32_t) ngram.tokens[i];
++            hash *= 1099511628211ull; // FNV prime 64
+         }
+-        return hash;
++        return (size_t) hash;
+     }
+ };
+ 
+@@ -90,6 +95,17 @@ void common_ngram_cache_draft(
+ // filename:    the path under which to save the ngram cache.
+ void common_ngram_cache_save(common_ngram_cache & ngram_cache, const std::string & filename);
+ 
++// Lookup the stupid-backoff n-gram match and fill out with (token, bias) pairs.
++// Steering (not speculation): bias = alpha * ln(p_engram[token]) for each token in the
++// empirical distribution of the matching n-gram. Separates the CPU lookup from the
++// logit application so the bias can be applied on the GPU backend.
++// tokens: the recent token history (last n_tokens tokens, oldest first).
++// Returns the number of pairs written (0 if no match or alpha <= 0).
++size_t common_ngram_cache_lookup_bias(
++    const common_ngram_cache & cache, const llama_token * tokens, int n_tokens,
++    int ngram_min, int ngram_max, float alpha,
++    std::vector<std::pair<llama_token, float>> & out);
++
+ // Bias logits toward the empirical next-token distribution of the matching n-gram.
+ // Steering (not speculation): adds alpha * ln(p) to the logits of the predicted tokens.
+ // tokens: the recent token history (last n_tokens tokens, oldest first).
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 388755c18f3..90a0c874e09 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -197,6 +197,19 @@ static void ngram_bias_cb(void * ctx, float alpha, const llama_token * tokens, i
+                                    ngram_min, ngram_max, alpha, data, n_data);
+ }
+ 
++static int ngram_bias_lookup_cb(void * ctx, float alpha, const llama_token * tokens, int n_tokens,
++                                int ngram_min, int ngram_max, int32_t * out_tokens, float * out_biases, int max_n) {
++    std::vector<std::pair<llama_token, float>> pairs;
++    common_ngram_cache_lookup_bias(*(const common_ngram_cache *) ctx, tokens, n_tokens,
++                                   ngram_min, ngram_max, alpha, pairs);
++    const int n = (int) std::min(pairs.size(), (size_t) max_n);
++    for (int i = 0; i < n; ++i) {
++        out_tokens[i] = pairs[i].first;
++        out_biases[i] = pairs[i].second;
++    }
++    return n;
++}
++
+ struct common_sampler * common_sampler_init(
+         const struct llama_model * model,
+         struct common_params_sampling & params) {
+@@ -354,7 +367,7 @@ struct common_sampler * common_sampler_init(
+         // loaded once, reused across slots (MVP: no hot reload of the steering table)
+         static common_ngram_cache ngram_bias_cache = common_ngram_cache_load(params.ngram_bias_cache);
+         samplers.push_back(llama_sampler_init_ngram_bias(
+-            (void *) &ngram_bias_cache, ngram_bias_cb, params.ngram_bias_alpha, 2, 4, 8));
++            (void *) &ngram_bias_cache, ngram_bias_cb, ngram_bias_lookup_cb, params.ngram_bias_alpha, 2, 4, 8));
+     }
+ 
+     if (params.mirostat == 0) {
+diff --git a/include/llama.h b/include/llama.h
+index b9fc46df636..94a81a85876 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1534,9 +1534,17 @@ extern "C" {
+         void * ctx, float alpha, const llama_token * tokens, int n_tokens,
+         int ngram_min, int ngram_max, llama_token_data * data, size_t n_data);
+ 
++    // Backend (GPU) variant: fills out_tokens/out_biases with up to max_n (token, bias)
++    // pairs from the stupid-backoff lookup. Returns the number of pairs written.
++    // The sampler pads the remainder with (token=0, bias=0) which is a no-op scatter.
++    typedef int (*llama_sampler_ngram_bias_lookup_callback)(
++        void * ctx, float alpha, const llama_token * tokens, int n_tokens,
++        int ngram_min, int ngram_max, int32_t * out_tokens, float * out_biases, int max_n);
++
+     LLAMA_API struct llama_sampler * llama_sampler_init_ngram_bias(
+         void * ctx,
+         llama_sampler_ngram_bias_callback callback,
++        llama_sampler_ngram_bias_lookup_callback lookup_callback,
+         float   alpha,
+         int32_t ngram_min,
+         int32_t ngram_max,
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index ca4f941a79c..f8520c9dd79 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -4068,13 +4068,24 @@ struct llama_sampler * llama_sampler_init_logit_bias(
+ struct llama_sampler_ngram_bias : public llama_sampler_backend {
+     void * cache;
+     llama_sampler_ngram_bias_callback callback;
++    llama_sampler_ngram_bias_lookup_callback lookup_callback;
+     float alpha;
+     int ngram_min;
+     int ngram_max;
+     int n_last;
+     std::vector<llama_token> recent;
++
++    // backend state (GPU scatter)
++    std::vector<int32_t> pairs_tokens;
++    std::vector<float>   pairs_biases;
++    struct ggml_tensor * inp_logit_bias;
++    struct ggml_tensor * inp_logit_idxs;
+ };
+ 
++// Max number of (token, bias) pairs pushed to the GPU backend per token.
++// A shell-command n-gram has << 512 successors; the lookup truncates beyond this.
++static const int LLAMA_NGRAM_BIAS_MAX_PAIRS = 512;
++
+ static const char * llama_sampler_ngram_bias_name(const struct llama_sampler * smpl) {
+     return ((llama_sampler_ngram_bias *) smpl->ctx)->get_name();
+ }
+@@ -4099,6 +4110,78 @@ static void llama_sampler_ngram_bias_apply(struct llama_sampler * smpl, llama_to
+                   ctx->ngram_min, ctx->ngram_max, cur_p->data, cur_p->size);
+ }
+ 
++static bool llama_sampler_ngram_bias_backend_init(
++        struct llama_sampler       * smpl,
++        ggml_backend_buffer_type_t   buft,
++        uint32_t                     n_outputs_max_per_seq) {
++    GGML_UNUSED(buft);
++    GGML_UNUSED(n_outputs_max_per_seq);
++
++    auto * sctx = (llama_sampler_ngram_bias *) smpl->ctx;
++    sctx->init(true);
++
++    // backend only when a lookup callback is available
++    return sctx->lookup_callback != nullptr;
++}
++
++static void llama_sampler_ngram_bias_backend_apply(
++        struct llama_sampler      * smpl,
++        struct ggml_context       * ctx,
++        struct ggml_cgraph        * gf,
++        struct llama_sampler_data * data) {
++    GGML_UNUSED(gf);
++
++    auto * sctx = (llama_sampler_ngram_bias *) smpl->ctx;
++
++    if (sctx->inp_logit_bias == nullptr) {
++        GGML_ASSERT(sctx->inp_logit_idxs == nullptr);
++
++        sctx->inp_logit_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, LLAMA_NGRAM_BIAS_MAX_PAIRS);
++        ggml_set_name(sctx->inp_logit_bias, "ngram_bias");
++        ggml_set_input(sctx->inp_logit_bias);
++
++        sctx->inp_logit_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, LLAMA_NGRAM_BIAS_MAX_PAIRS);
++        ggml_set_name(sctx->inp_logit_idxs, "ngram_idxs");
++        ggml_set_input(sctx->inp_logit_idxs);
++    }
++
++    ggml_tensor * cur = ggml_fill(ctx, data->logits, 0.0f);
++
++    cur = ggml_reshape_2d(ctx, cur, 1, ggml_nelements(cur));
++    cur = ggml_set_rows(ctx, cur, sctx->inp_logit_bias, sctx->inp_logit_idxs);
++    cur = ggml_reshape_1d(ctx, cur, ggml_nelements(cur));
++
++    data->logits = ggml_add(ctx, data->logits, cur);
++}
++
++static void llama_sampler_ngram_bias_backend_set_input(struct llama_sampler * smpl) {
++    auto * sctx = (llama_sampler_ngram_bias *) smpl->ctx;
++
++    GGML_ASSERT(sctx->inp_logit_bias != nullptr);
++    GGML_ASSERT(sctx->inp_logit_idxs != nullptr);
++
++    // padding (idx 0, bias 0) = no-op scatter entries
++    sctx->pairs_tokens.assign(LLAMA_NGRAM_BIAS_MAX_PAIRS, 0);
++    sctx->pairs_biases.assign(LLAMA_NGRAM_BIAS_MAX_PAIRS, 0.0f);
++
++    if (sctx->lookup_callback != nullptr && sctx->alpha > 0.0f &&
++            (int) sctx->recent.size() >= sctx->ngram_min) {
++        sctx->lookup_callback(sctx->cache, sctx->alpha, sctx->recent.data(),
++                              (int) sctx->recent.size(), sctx->ngram_min, sctx->ngram_max,
++                              sctx->pairs_tokens.data(), sctx->pairs_biases.data(),
++                              LLAMA_NGRAM_BIAS_MAX_PAIRS);
++    }
++
++    ggml_backend_tensor_set(sctx->inp_logit_bias, sctx->pairs_biases.data(), 0, ggml_nbytes(sctx->inp_logit_bias));
++    ggml_backend_tensor_set(sctx->inp_logit_idxs, sctx->pairs_tokens.data(), 0, ggml_nbytes(sctx->inp_logit_idxs));
++}
++
++static void llama_sampler_ngram_bias_backend_reset(struct llama_sampler * smpl) {
++    auto * sctx = (llama_sampler_ngram_bias *) smpl->ctx;
++    sctx->inp_logit_bias = nullptr;
++    sctx->inp_logit_idxs = nullptr;
++}
++
+ static void llama_sampler_ngram_bias_reset(struct llama_sampler * smpl) {
+     auto * ctx = (llama_sampler_ngram_bias *) smpl->ctx;
+     ctx->recent.clear();
+@@ -4106,7 +4189,7 @@ static void llama_sampler_ngram_bias_reset(struct llama_sampler * smpl) {
+ 
+ static struct llama_sampler * llama_sampler_ngram_bias_clone(const struct llama_sampler * smpl) {
+     const auto * ctx = (const llama_sampler_ngram_bias *) smpl->ctx;
+-    return llama_sampler_init_ngram_bias(ctx->cache, ctx->callback, ctx->alpha,
++    return llama_sampler_init_ngram_bias(ctx->cache, ctx->callback, ctx->lookup_callback, ctx->alpha,
+                                          ctx->ngram_min, ctx->ngram_max, ctx->n_last);
+ }
+ 
+@@ -4121,17 +4204,18 @@ static struct llama_sampler_i llama_sampler_ngram_bias_i = {
+     /* .reset             = */ llama_sampler_ngram_bias_reset,
+     /* .clone             = */ llama_sampler_ngram_bias_clone,
+     /* .free              = */ llama_sampler_ngram_bias_free,
+-    /* .backend_init      = */ nullptr,
++    /* .backend_init      = */ llama_sampler_ngram_bias_backend_init,
+     /* .backend_accept    = */ nullptr,
+-    /* .backend_apply     = */ nullptr,
+-    /* .backend_set_input = */ nullptr,
+-    /* .backend_reset     = */ nullptr,
++    /* .backend_apply     = */ llama_sampler_ngram_bias_backend_apply,
++    /* .backend_set_input = */ llama_sampler_ngram_bias_backend_set_input,
++    /* .backend_reset     = */ llama_sampler_ngram_bias_backend_reset,
+     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_ngram_bias>,
+ };
+ 
+ struct llama_sampler * llama_sampler_init_ngram_bias(
+         void * ctx,
+         llama_sampler_ngram_bias_callback callback,
++        llama_sampler_ngram_bias_lookup_callback lookup_callback,
+         float   alpha,
+         int32_t ngram_min,
+         int32_t ngram_max,
+@@ -4140,13 +4224,18 @@ struct llama_sampler * llama_sampler_init_ngram_bias(
+         /* .iface = */ &llama_sampler_ngram_bias_i,
+         /* .ctx   = */ new llama_sampler_ngram_bias {
+             ("ngram-bias"),
+-            /* .cache     = */ ctx,
+-            /* .callback  = */ callback,
+-            /* .alpha     = */ alpha,
+-            /* .ngram_min = */ ngram_min,
+-            /* .ngram_max = */ ngram_max,
+-            /* .n_last    = */ n_last,
+-            /* .recent    = */ {},
++            /* .cache           = */ ctx,
++            /* .callback        = */ callback,
++            /* .lookup_callback = */ lookup_callback,
++            /* .alpha           = */ alpha,
++            /* .ngram_min       = */ ngram_min,
++            /* .ngram_max       = */ ngram_max,
++            /* .n_last          = */ n_last,
++            /* .recent          = */ {},
++            /* .pairs_tokens    = */ {},
++            /* .pairs_biases    = */ {},
++            /* .inp_logit_bias  = */ nullptr,
++            /* .inp_logit_idxs  = */ nullptr,
+         }
+     );
+ }
+-- 
+2.53.0
+

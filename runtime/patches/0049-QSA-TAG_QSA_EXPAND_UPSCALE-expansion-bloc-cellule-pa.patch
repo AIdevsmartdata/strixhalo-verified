@@ -1,0 +1,205 @@
+From b70cb9ce3b230760e69d349dc0efea80fa299e82 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 19 Sep 2026 12:57:27 +0200
+Subject: [PATCH 49/54] QSA : TAG_QSA_EXPAND_UPSCALE (expansion bloc->cellule
+ par upscale NEAREST) - MESURE ET REJETEE
+
+Le poste, identifie par le logger (formes + sources pour les noeuds sans nom) :
+  GET_ROWS |node_* : s0=CONT(n_tps, n_blocks) | s1=NONE(n_kv)
+12 noeuds (1 par couche d'attention pleine) = l'expansion des scores de bloc vers chaque
+cellule, refaite a CHAQUE pas : 92 us/couche a 32k, 180 us a 64k -> 1,1 a 2,2 ms/pas
+(4 a 7 % du decodage), et le cout croit avec le contexte (gather de n_kv indices sur un
+tenseur minuscule : 46 Go/s effectifs, limite latence/occupation).
+
+cell_blk[c] == c/r (cellule = position) => l'expansion est une repetition, exprimable par
+ggml_upscale_ext(NEAREST). Implemente derriere LLAMA_QSA_EXPAND_UPSCALE (defaut = gather,
+comportement inchange). Le chemin upscale ne consomme plus cell_blk : il n'est donc plus cree
+comme entree de graphe (sinon ggml-alloc ne lui alloue pas de buffer et set_input ecrit dans
+NULL -> GGML_ASSERT(buffer), piege du 15/09) ; n_kv est des lors passe explicitement a
+set_input_qsa (nouveau parametre n_kv_hint, rempli par llm_graph_input_qsa::n_kv).
+
+Mesure (prefill 64k + 3 decodages, baselines encadrantes, drift 2,4 %) :
+  base (gather)        29,2 ms/forward
+  upscale NEAREST      31,0 ms/forward   -> +5 % PLUS LENT, rejete
+  base2 (controle)     29,9 ms/forward
+SHA identiques dans les deux bras : les VALEURS sont bit-a-bit correctes (l'idee est juste),
+c'est l'implementation Vulkan de ggml_upscale (shader d'interpolation generique) qui coute
+plus cher que le gather. Levier suivant documente : supprimer l'expansion (top_k au niveau
+bloc, puis projection sur les cellules selectionnees seulement).
+---
+ src/llama-memory-hybrid-idx.cpp | 25 ++++++++++++++++---------
+ src/llama-memory-hybrid-idx.h   |  4 ++--
+ src/models/qwen4exp.cpp         | 31 ++++++++++++++++++++++++-------
+ 3 files changed, 42 insertions(+), 18 deletions(-)
+
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index bfcff1b66ef..4a02f3d40e2 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -292,13 +292,17 @@ void llama_memory_hybrid_idx::set_input_qsa(
+         ggml_tensor * blk_ends,
+         const llama_ubatch * ubatch,
+         uint32_t ratio,
+-        bool blk_bias) const {
++        bool blk_bias,
++        int64_t n_kv_hint) const {
+     GGML_ASSERT(ratio > 0);
+     GGML_ASSERT(get_mem_idx() != nullptr);
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+-    const int64_t n_kv     = cell_blk->ne[0];
+-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
++    // [TAG_QSA_EXPAND_UPSCALE] cell_blk peut etre absent (chemin upscale NEAREST : aucun noeud ne
++    // le consomme, il n'est donc pas cree). n_kv vient alors du contexte memoire, et n_stream du
++    // tenseur de biais (3D : [n_kv|n_blocks, n_tps, n_stream]).
++    GGML_ASSERT(cell_blk == nullptr || ggml_backend_buffer_is_host(cell_blk->buffer));
++    const int64_t n_kv     = cell_blk != nullptr ? cell_blk->ne[0] : n_kv_hint;
++    const int64_t n_ns     = cell_blk != nullptr ? cell_blk->ne[1] : (int64_t) bias->ne[2];
+     // [TAG_QSA_CACHE_COMPRESSED] blk_cells et blk_pos ne servent qu'au pooling a la lecture : dans le
+     // chemin des cles de bloc resumees ils ne sont consommes par aucun noeud, donc ggml-alloc ne
+     // leur alloue pas de buffer (data == NULL). On les cree donc seulement quand ils servent, et on
+@@ -311,7 +315,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
+     GGML_ASSERT(n_tokens % n_ns == 0);
+     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
+ 
+-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
++    int32_t * dst_cell_blk  = cell_blk == nullptr ? nullptr : (int32_t *) cell_blk->data;
+     int32_t * dst_blk_cells = blk_cells == nullptr ? nullptr : (int32_t *) blk_cells->data;
+     int32_t * dst_blk_pos   = blk_pos   == nullptr ? nullptr : (int32_t *) blk_pos->data;
+     float   * dst_bias      = (float   *) bias->data;
+@@ -349,7 +353,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
+         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
+         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
+ 
+-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
++        int32_t * cur_cell_blk  = dst_cell_blk  == nullptr ? nullptr : dst_cell_blk + s*n_kv;
+         int32_t * cur_blk_cells = dst_blk_cells == nullptr ? nullptr : dst_blk_cells + s*(r*n_blocks);
+ 
+         if (cur_blk_cells != nullptr) {
+@@ -546,7 +550,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
+                 }
+             }
+ 
+-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
++            if (cur_cell_blk != nullptr) {
++                cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
++            }
+         }
+ 
+         // [TAG_QSA_CACHE_COMPRESSED] la cellule de fin de bloc (slot r-1) porte le resume du bloc,
+@@ -931,10 +937,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+         ggml_tensor * blk_ends,
+         const llama_ubatch * ubatch,
+         uint32_t ratio,
+-        bool blk_bias) const {
++        bool blk_bias,
++        int64_t n_kv_hint) const {
+     GGML_ASSERT(mem != nullptr);
+ 
+-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_ends, ubatch, ratio, blk_bias);
++    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_ends, ubatch, ratio, blk_bias, n_kv_hint);
+ }
+ 
+ void llama_memory_hybrid_idx_context::set_input_qsa_wr(
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index 5460a51d7fa..d9a55bb4149 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -87,7 +87,7 @@ public:
+     // resume) ; null quand le chemin des cles de bloc n'est pas arme
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                        ggml_tensor * bias, ggml_tensor * blk_ends, const llama_ubatch * ubatch,
+-                       uint32_t ratio, bool blk_bias) const;
++                       uint32_t ratio, bool blk_bias, int64_t n_kv_hint) const;
+ 
+     // [TAG_QSA_CACHE_COMPRESSED] listes d'ecriture des cles de bloc resumees : pour chaque bloc
+     // dont cet ubatch ecrit la derniere position, les cellules a moyenner, la cellule de fin (qui
+@@ -151,7 +151,7 @@ public:
+ 
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                        ggml_tensor * bias, ggml_tensor * blk_ends, const llama_ubatch * ubatch,
+-                       uint32_t ratio, bool blk_bias) const;
++                       uint32_t ratio, bool blk_bias, int64_t n_kv_hint) const;
+ 
+     void set_input_qsa_wr(ggml_tensor * wr_members, ggml_tensor * wr_cells, ggml_tensor * wr_pos,
+                           const llama_ubatch * ubatch, uint32_t ratio) const;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 96b31cd90ff..ab3e687017c 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -875,13 +875,17 @@ class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
+ public:
+     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
+         mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
++
++    // [TAG_QSA_EXPAND_UPSCALE] n_kv du graphe : le chemin upscale ne cree pas cell_blk, l'hote ne
++    // peut donc plus le deduire de cell_blk->ne[0] et le recoit explicitement.
++    int64_t n_kv = 0;
+     virtual ~llm_graph_input_qsa() = default;
+ 
+     void set_input(const llama_ubatch * ubatch) override {
+         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+         // [TAG_QSA_KEEPKEYS] entree reduite (ecriture des cles seules) : pas d'entrees de selection
+         if (cell_blk != nullptr) {
+-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_ends, ubatch, ratio, blk_bias);
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_ends, ubatch, ratio, blk_bias, n_kv);
+         }
+ 
+         // [TAG_QSA_CACHE_COMPRESSED] lists d'ecriture des cles de bloc (aussi sous le budget, ou
+@@ -974,6 +978,17 @@ public:
+     const bool blk_bias;
+ };
+ 
++// [TAG_QSA_EXPAND_UPSCALE] L'expansion bloc -> cellule est une simple repetition quand
++// cell_blk[c] == c/r (cellule = position). Lue une seule fois : elle change AUSSI ce qui est cree
++// comme entree de graphe (cell_blk devient inutile -> ne pas le creer, cf. le piege du 15/09).
++static bool qsa_expand_up_enabled() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_QSA_EXPAND_UPSCALE");
++        return e != nullptr && atoll(e) != 0;
++    }();
++    return v;
++}
++
+ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         const llama_memory_hybrid_idx_context * mctx_hyb,
+         ggml_tensor *                           cur,
+@@ -1132,16 +1147,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     } else {
+         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+         qsa->cmp = cmp;
++        qsa->n_kv = n_kv;
+ 
+         qsa->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+         if (select) {
+             // [TAG_QSA_CACHE_COMPRESSED] blk_cells et blk_pos ne servent qu'au pooling a la lecture :
+             // dans le chemin des cles de bloc resumees, AUCUN noeud ne les consomme, donc ggml-alloc
+             // ne leur alloue pas de buffer et set_input ecrirait dans NULL (segfault constate).
+-            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
++            // [TAG_QSA_EXPAND_UPSCALE] avec l'upscale NEAREST, cell_blk n'est consomme par AUCUN
++            // noeud : le creer ferait ecrire set_input dans un tenseur sans buffer (GGML_ASSERT(buffer)).
++            if (!qsa_expand_up_enabled()) {
++                qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
++                ggml_set_input(qsa->cell_blk);
++            }
+             qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+ 
+-            ggml_set_input(qsa->cell_blk);
+             ggml_set_input(qsa->bias);
+ 
+             if (!cmp) {
+@@ -1339,10 +1359,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // 12 couches -> 1,1 a 2,2 ms/pas = 4-8 % du decodage).
+     // ggml_upscale_ext avec NEAREST produit exactement la meme valeur au meme rang.
+     // Valeurs identiques pour toute cellule ecrite => SHA attendu invariant.
+-    static const bool qsa_expand_up = [] {
+-        const char * e = getenv("LLAMA_QSA_EXPAND_UPSCALE");
+-        return e != nullptr && atoll(e) != 0;
+-    }();
++    const bool qsa_expand_up = qsa_expand_up_enabled();
+ 
+     ggml_tensor * expanded;
+     if (qsa_expand_up) {
+-- 
+2.53.0
+

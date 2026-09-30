@@ -1,0 +1,39 @@
+From d26576f3d89b8f9189d4e606caa5b8f8fdbc36f9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Wed, 2 Sep 2026 20:00:05 +0200
+Subject: [PATCH 18/54] server: env-gate MTP drafting for temp>0
+ (LLAMA_MTP_ALL_TEMPS, default off)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[TAG_MTP_ALL_TEMPS] the fork drafted only at temp<=0.01; MTP v2 test (FINDINGS 74a)
+needed drafting at temp 0.7 to measure reasoning-medium speculative decode. Measured:
+n=2 5.7 t/s, n=1 4.2-4.8 t/s vs 31.3 baseline at acceptance 0.78-0.94 — the spec loop
+is single-thread CPU-bound (~135 ms/token orchestration), Vulkan stays disqualified.
+Gate defaults to the old behavior; env unset in prod.
+---
+ tools/server/server-context.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 98bef14456a..395be620f38 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2847,8 +2847,11 @@ private:
+ 
+                 const int n_draft_max = slot.get_n_draft_max();
+ 
+-                // MTP sélectif : drafter uniquement en temp 0 (code), jamais en reasoning temp>0
+-                const bool use_mtp = slot.task->params.sampling.temp <= 0.01f;
++                // MTP sélectif : par defaut drafter uniquement en temp 0 (code).
++                // [TAG_MTP_ALL_TEMPS] env LLAMA_MTP_ALL_TEMPS=1 : drafter aussi en temp>0
++                // (test v2 : la reference post4-bench donne n_max=2 comme sweet spot en reasoning)
++                const bool use_mtp = slot.task->params.sampling.temp <= 0.01f
++                                   || (getenv("LLAMA_MTP_ALL_TEMPS") != nullptr);
+ 
+                 if (n_draft_max > 0) {
+                     GGML_ASSERT(slot.can_speculate());
+-- 
+2.53.0
+

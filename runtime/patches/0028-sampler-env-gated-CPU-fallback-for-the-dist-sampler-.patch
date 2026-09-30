@@ -1,0 +1,35 @@
+From ddbefbdee22e871ef34e84398a297886ffab1223 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Fri, 4 Sep 2026 21:23:58 +0200
+Subject: [PATCH 28/54] sampler: env-gated CPU fallback for the dist sampler
+ ([TAG_SAMPLER_CPU_AUDIT])
+
+The backend dist sampler ends with a GET_ROWS (dist_sampled_token) that
+profiles at ~302us/token on gfx1151. LLAMA_DIST_CPU=1 keeps the GPU
+sampler prefix (top-k/top-p) but lets the final distribution run on the
+CPU over the reduced candidates, isolating that cost for A/B audit.
+Default off; outputs are byte-identical either way.
+---
+ src/llama-sampler.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index d2d95c88b18..8dd0d0b8e82 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1273,7 +1273,11 @@ static bool llama_sampler_dist_backend_init(
+         uint32_t                     n_outputs_max_per_seq) {
+     auto * sctx = (llama_sampler_dist *) smpl->ctx;
+ 
+-    const bool res = llama_sampler_backend_support(smpl, buft);
++    // Diagnostic gate: keep the GPU sampler prefix through top-k/top-p but let the
++    // tiny final distribution run on the CPU. This isolates the unexpectedly costly
++    // dist_sampled_token GET_ROWS without changing the preceding candidate selection.
++    const bool force_cpu_dist = std::getenv("LLAMA_DIST_CPU") != nullptr;
++    const bool res = !force_cpu_dist && llama_sampler_backend_support(smpl, buft);
+ 
+     sctx->init(res);
+     sctx->backend_transactional = n_outputs_max_per_seq > 1;
+-- 
+2.53.0
+

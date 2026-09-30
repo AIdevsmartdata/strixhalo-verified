@@ -1,0 +1,36 @@
+From ddb27b04343e729a927cd65d30afd12f30bf4773 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Fri, 4 Sep 2026 07:26:03 +0200
+Subject: [PATCH 21/54] qwen4exp: drop redundant cont in conv/PLE state
+ write-back ([TAG_ZC_TRANCHE0])
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The tail view fed to ggml_cpy was materialized through ggml_cont first — a
+pure redundant copy per GDN/PLE layer per token (~2.4 Mo each). ggml_cpy
+handles strided sources natively; write directly from the view.
+
+Tranche 0 of the zero-copy plan (PLAN_zerocopy.md).
+---
+ src/models/qwen4exp.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 474fac5b712..6189e700278 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1555,7 +1555,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+             conv_states_all->nb[1],
+             kv_head * row_size);
+ 
+-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
++    // [TAG_ZC_TRANCHE0] le CPY gère les src strides — le cont intermédiaire était une copie
++    // purement redondante (une par couche GDN/PLE par token, ~2,4 Mo inutiles)
++    ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+ 
+     return conv_input;
+ }
+-- 
+2.53.0
+

@@ -1,0 +1,149 @@
+From 1b38a26bde84624fbe1dc3040275f981d08bd02a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Wed, 9 Sep 2026 14:58:31 +0200
+Subject: [PATCH 38/54] vulkan: dmmv SPLITK wide-WG variant for AMD matvecs
+ (OFF by default)
+
+New DMMV_WG_SIZE_SPLITK workgroup variant (width = subgroup x factor,
+GGML_VK_DMMV_SPLITK_WG 2..8 default 8) reusing the existing HYBRID
+deterministic reduction (subgroupAdd + ordered cross-subgroup shmem sum).
+Gated by GGML_VK_DMMV_SPLITK_AMD=max_m (num_cols==1, m<=max_m, k>=2048).
+
+[TAG_DMMV_SPLITK_AMD] Measured on gfx1151 (8060S), m=320 k=10240 rocmfp4_fast
+(HC down projection): interleaved microbench -1.8% call time (34.74 vs 35.36 us,
+overhead-dominated), end-to-end gen neutral (+-1.5% noise, 3 restarts A/B).
+Thesis refuted: the 123 GB/s ceiling is not lane-level parallelism but the
+17-byte non-coalescable ROCmFP4 block stride. Kept OFF; correctness PASS
+(test-backend-ops MUL_MAT 0 fail, max_rel 1.06e-05 vs OFF, quality OK).
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 67 +++++++++++++++++++++++++---
+ 1 file changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index d428bb31521..7a8bd5a0eb6 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -563,6 +563,7 @@ vk_conv_block_size vk_conv_block_sizes[CONV_SHAPE_COUNT] = {
+ enum dmmv_wg_sizes {
+     DMMV_WG_SIZE_SUBGROUP,
+     DMMV_WG_SIZE_LARGE,
++    DMMV_WG_SIZE_SPLITK,
+     DMMV_WG_SIZE_COUNT,
+ };
+ 
+@@ -4441,6 +4442,35 @@ struct CompileTask {
+     uint32_t required_subgroup_size;
+ };
+ 
++// [TAG_DMMV_SPLITK_AMD] env GGML_VK_DMMV_SPLITK_WG = SPLITK workgroup width factor
++// (x subgroup size; 2..8, default 8). Clamped so local_size_x stays within device limits.
++// LDS safety: factor 8 keeps worst-case HYBRID tmpsh (4 cols x 4 rows x 512 lanes x 4B = 32KB) under the 64KB limit.
++static uint32_t dmmv_splitk_wg_factor(const vk_device & device) {
++    static const uint32_t f = [device] {
++        uint32_t v = 8;
++        if (const char * e = getenv("GGML_VK_DMMV_SPLITK_WG")) {
++            const int parsed = atoi(e);
++            if (parsed >= 2 && parsed <= 8) {
++                v = (uint32_t) parsed;
++            } else {
++                fprintf(stderr, "ggml_vulkan: GGML_VK_DMMV_SPLITK_WG unsupported %d (2..8), keeping 8\n", parsed);
++            }
++        }
++        const uint32_t sg = std::max(device->subgroup_size, 16u);
++        const uint32_t max_x = device->properties.limits.maxComputeWorkGroupSize[0];
++        const uint32_t max_inv = device->properties.limits.maxComputeWorkGroupInvocations;
++        const uint32_t cap = std::min(max_x, max_inv) / sg;
++        if (v > cap) {
++            fprintf(stderr, "ggml_vulkan: GGML_VK_DMMV_SPLITK_WG clamped %u -> %u (device limits)\n", v, cap);
++            v = cap;
++        }
++        return v;
++    }();
++    return f;
++}
++
++// [TAG_DMMV_SPLITK_AMD] env GGML_VK_DMMV_SPLITK_AMD = max_m gate for split-k (wide WG) matvecs on AMD
++// (0 or absent = off, N = apply when num_cols==1 && m <= N && k >= 2048).
+ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+ 
+@@ -5729,15 +5759,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #endif
+ 
+     for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
+-        const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
+-        const uint32_t wg_size_subgroup16 = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size16 : (subgroup_size16 * 4);
++        // [TAG_DMMV_SPLITK_AMD] WG width factor per variant: SUBGROUP x1, LARGE x4,
++        // SPLITK x GGML_VK_DMMV_SPLITK_WG (default 8, range 2..8, clamped by device limits).
++        // SPLITK reuses the same HYBRID reduction as LARGE (subgroupAdd + ordered
++        // cross-subgroup shmem sum, deterministic run-to-run): more lanes in flight per
++        // output row -> fewer serial k iterations -> better memory latency hiding.
++        const uint32_t wg_width_factor = (w == DMMV_WG_SIZE_SUBGROUP) ? 1u :
++                                         (w == DMMV_WG_SIZE_SPLITK)   ? dmmv_splitk_wg_factor(device) : 4u;
++
++        const uint32_t wg_size_subgroup   = subgroup_size   * wg_width_factor;
++        const uint32_t wg_size_subgroup16 = subgroup_size16 * wg_width_factor;
+ 
+         const shader_reduction_mode reduc = (use_subgroups && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
+-                                            (use_subgroups && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
++                                            (use_subgroups && (w == DMMV_WG_SIZE_LARGE || w == DMMV_WG_SIZE_SPLITK)) ? SHADER_REDUCTION_MODE_HYBRID :
+                                             SHADER_REDUCTION_MODE_SHMEM;
+ 
+         const shader_reduction_mode reduc16 = (use_subgroups16 && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
+-                                              (use_subgroups16 && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
++                                              (use_subgroups16 && (w == DMMV_WG_SIZE_LARGE || w == DMMV_WG_SIZE_SPLITK)) ? SHADER_REDUCTION_MODE_HYBRID :
+                                               SHADER_REDUCTION_MODE_SHMEM;
+ 
+         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
+@@ -5810,7 +5848,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+             if (device->integer_dot_product) {
+                 const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
+-                const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
++                const uint32_t wg_size_subgroup_int = subgroup_size_int * wg_width_factor;
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+@@ -5878,7 +5916,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+         if (device->integer_dot_product) {
+             const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
+-            const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
++            const uint32_t wg_size_subgroup_int = subgroup_size_int * wg_width_factor;
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_0], "mul_mat_vec_id_q2_0_q8_1_f32", arr_dmmv_id_q2_0_q8_1_f32_len[reduc], arr_dmmv_id_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_q8_1_f32", arr_dmmv_id_q4_0_q8_1_f32_len[reduc], arr_dmmv_id_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
+@@ -8392,6 +8430,14 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
+     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+ }
+ 
++static int dmmv_splitk_amd_max_m() {
++    static const int v = [] {
++        const char * e = getenv("GGML_VK_DMMV_SPLITK_AMD");
++        return e ? atoi(e) : 0;
++    }();
++    return v;
++}
++
+ // [TAG_DMMV_LARGE_AMD] env GGML_VK_DMMV_LARGE_AMD = max_m gate for LARGE workgroups on AMD
+ // (0 or absent = off, N = apply when num_cols==1 && m <= N)
+ static int dmmv_large_amd_max_m() {
+@@ -8472,7 +8518,14 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+ 
+     // heuristic to choose workgroup size
+     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+-    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL
++    if (
++        // [TAG_DMMV_SPLITK_AMD] wide-WG split-k for n=1 matvecs: small m / large k.
++        // More lanes in flight per output row, fewer serial k iterations.
++        // Strict num_cols==1 protects prefill; k >= 2048 keeps tiny-k shapes on LARGE/SUBGROUP.
++        dmmv_splitk_amd_max_m() > 0 && ctx->device->vendor_id == VK_VENDOR_ID_AMD && num_cols == 1 &&
++        m <= (uint32_t) dmmv_splitk_amd_max_m() && k >= 2048) {
++        dmmv_wg = DMMV_WG_SIZE_SPLITK;
++    } else if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL
+         // [TAG_DMMV_LARGE_AMD] gfx1151: LARGE WG for n=1 matvecs, tiny m / large k.
+         // A/B 02/09: m=4 k=10240 (HC w_inject) -125 ms, m=48 k=2560 -78 ms, f32 m=1 -20 ms.
+         // Env value = max_m gate (absent/0 = off). Strict num_cols==1 to protect prefill.
+-- 
+2.53.0
+

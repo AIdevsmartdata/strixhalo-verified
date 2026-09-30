@@ -1,0 +1,113 @@
+From 3e542f76e371f5c7003539ba879e866a3f94615d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Tue, 8 Sep 2026 17:38:24 +0200
+Subject: [PATCH 35/54] models: hybrid GDN prefill (chunked bulk + fused AR
+ tail) behind LLAMA_GDN_PREFILL_CHUNKED
+
+- large prompt ubatches route the first n-K tokens through the chunked
+  graph (parallel kernels), trailing K tokens stay on the fused AR op so
+  rollback snapshots keep identical ring semantics
+- measured at 133k ctx: neutral vs fused AR (144.1 vs 143.6/144.4 t/s;
+  first soak pays Vulkan pipeline warmup)
+- does NOT prevent the amdgpu ring-timeout reset at -ub 2048 (9 resets,
+  so the ub2048 watchdog lives outside the GDN AR kernel)
+- default OFF
+---
+ src/models/delta-net-base.cpp | 81 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ad661264773..2b221f57dcf 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -545,6 +545,87 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+ 
+     const bool keep = cparams.n_rs_seq > 0;
+ 
++    // [TAG_GDN_PREFILL_CHUNKED] Large prompt-processing ubatches through the
++    // chunked graph (parallel kernels, saturates all CUs) for the first
++    // n_seq_tokens - K tokens, then the fused AR op on the trailing K tokens so
++    // the rollback snapshots keep the exact same semantics as the pure fused
++    // path. Replay/verify ubatches are bounded by K+1 (split_equal keeps the
++    // trailing (1 + n_rs_seq) tokens in one ubatch), so they stay fully fused.
++    static const bool prefill_chunked = getenv("LLAMA_GDN_PREFILL_CHUNKED") != nullptr;
++    const int64_t K_snap = (int64_t) cparams.n_rs_seq + 1;
++
++    if (keep && prefill_chunked && n_seq_tokens > 2*K_snap) {
++        const int64_t n_bulk = n_seq_tokens - K_snap;
++
++        // slice [*, *, 0:n_bulk, *] of a [S, H, n_seq_tokens, n_seqs] tensor
++        auto slice_head = [&](ggml_tensor * t, int64_t S, int64_t H) {
++            return ggml_view_4d(ctx0, t, S, H, n_bulk, n_seqs,
++                ggml_row_size(t->type, S),
++                ggml_row_size(t->type, S * H),
++                ggml_row_size(t->type, S * H * n_seq_tokens),
++                0);
++        };
++        // slice [*, *, n_bulk:n_seq_tokens, *]
++        auto slice_tail = [&](ggml_tensor * t, int64_t S, int64_t H) {
++            return ggml_view_4d(ctx0, t, S, H, K_snap, n_seqs,
++                ggml_row_size(t->type, S),
++                ggml_row_size(t->type, S * H),
++                ggml_row_size(t->type, S * H * n_seq_tokens),
++                (size_t) n_bulk * ggml_row_size(t->type, S * H));
++        };
++
++        const int64_t S_k = q->ne[0];
++        const int64_t H_k = q->ne[1];
++        const int64_t H_v = v->ne[1];
++
++        // bulk: parallel chunked graph, produces state after token n_bulk-1
++        auto bulk = build_delta_net_chunking(
++                slice_head(q, S_k, H_k), slice_head(k, S_k, H_k),
++                slice_head(v, S_v, H_v), slice_head(g, g->ne[0], g->ne[1]),
++                slice_head(b, 1, H_v), s, il);
++        cb(bulk.first, "attn_output_bulk", il);
++        cb(bulk.second, "new_state_bulk", il);
++
++        // tail: fused AR op with K snapshots starting from the bulk state
++        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0,
++                slice_tail(q, S_k, H_k), slice_tail(k, S_k, H_k),
++                slice_tail(v, S_v, H_v), slice_tail(g, g->ne[0], g->ne[1]),
++                slice_tail(b, 1, H_v), bulk.second, K_snap);
++        res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
++
++        const int64_t attn_score_elems_tail = S_v * H_v * K_snap * n_seqs;
++        const int64_t state_size_per_snap  = S_v * S_v * H_v * n_seqs;
++        const size_t  row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
++
++        // attention outputs: [bulk | tail] concatenated on the token axis
++        ggml_tensor * out_tail = ggml_view_4d(ctx0, gdn_out,
++            S_v, H_v, K_snap, n_seqs,
++            ggml_row_size(gdn_out->type, S_v),
++            ggml_row_size(gdn_out->type, S_v * H_v),
++            ggml_row_size(gdn_out->type, S_v * H_v * K_snap),
++            0);
++        ggml_tensor * output = ggml_concat(ctx0, bulk.first, out_tail, 2);
++        output = ggml_cont(ctx0, output);
++        cb(output, "attn_output", il);
++
++        // snapshots: op writes min(K_snap, K_snap) = K_snap rows, all valid
++        ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
++            S_v * S_v, n_seqs, K_snap,
++            ggml_row_size(gdn_out->type, S_v * S_v),
++            ggml_row_size(gdn_out->type, state_size_per_snap),
++            ggml_row_size(gdn_out->type, attn_score_elems_tail));
++
++        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
++            S_v * S_v, n_seqs, K_snap,
++            ssm_states_all->nb[1],
++            (size_t) mem_size * row_size,
++            (size_t) kv_head * row_size);
++
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
++
++        return output;
++    }
++
+     if (!keep) {
+         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
+         ggml_tensor * output    = attn_out.first;
+-- 
+2.53.0
+

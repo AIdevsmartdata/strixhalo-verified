@@ -1,0 +1,333 @@
+From 734b9dcb6980f618505729c9a21f34fc1e5706c6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Wed, 2 Sep 2026 18:35:52 +0200
+Subject: [PATCH 17/54] server: grammar-compatible backend sampling (fast-path
+ validation + raw-logits resample)
+
+[TAG_GRAMMAR_BACKEND] common/sampling.cpp:448 used to hard-disable backend sampling
+for grammar requests, pushing every tool-call generation onto the CPU sampler
+(24.4 vs 32.0 t/s measured). Now the backend-sampled token is validated against
+the grammar with a single-token check (~us) and, on rejection, a full-vocab CPU
+resample runs mirroring the grammar_first=false rejection path:
+- llama_get_raw_logits_ith: raw full-vocab logits, bypassing the ~20 sampled
+  candidates that llama_get_logits_ith prefers in backend mode (the first
+  implementation read past the candidates buffer and produced garbage)
+- llama_sampler_chain_apply_cpu: apply all stages of a backend-initialized
+  chain on the CPU (chain_apply skips backend stages once offloaded)
+- llama_set_need_raw_logits: per-seq flag, forces the ~1 MB raw-logit download
+  for grammar sequences (the only residual cost, -2.8% vs no-grammar)
+Validated: temp-0 outputs byte-identical to the previous CPU path, grammar
+decode 24.4 -> 31.1 t/s (+28%), no-grammar unchanged.
+---
+ common/sampling.cpp             | 74 ++++++++++++++++++++++++++++++---
+ common/sampling.h               |  4 ++
+ include/llama.h                 | 14 +++++++
+ src/llama-context.cpp           | 23 ++++++++--
+ src/llama-context.h             | 13 ++++++
+ src/llama-sampler.cpp           | 13 ++++++
+ tools/server/server-context.cpp |  6 +++
+ 7 files changed, 138 insertions(+), 9 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 8c67e53b890..53be0fa72b8 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -168,6 +168,25 @@ struct common_sampler {
+         cur_p = { cur.data(), cur.size(), -1, false };
+     }
+ 
++    // [TAG_GRAMMAR_BACKEND] build cur_p from the FULL raw logits, bypassing the sampled
++    // candidates (used by the grammar rejection resample with backend sampling)
++    void set_raw_logits(struct llama_context * ctx, int idx) {
++        const auto * logits = llama_get_raw_logits_ith(ctx, idx);
++        GGML_ASSERT(logits != nullptr && "raw logits unavailable - grammar sequences must enable llama_set_need_raw_logits");
++
++        const llama_model * model = llama_get_model(ctx);
++        const llama_vocab * vocab = llama_model_get_vocab(model);
++
++        const int n_vocab = llama_vocab_n_tokens(vocab);
++
++        cur.resize(n_vocab);
++        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
++            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++        }
++
++        cur_p = { cur.data(), cur.size(), -1, false };
++    }
++
+     common_time_meas tm() {
+         return common_time_meas(t_total_us, params.no_perf);
+     }
+@@ -445,11 +464,12 @@ struct common_sampler * common_sampler_init(
+         llama_sampler_chain_add(chain, smpl);
+     }
+ 
+-    if (grmr && params.backend_sampling) {
+-        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
++    // [TAG_GRAMMAR_BACKEND] grammar no longer disables backend sampling: the backend token
++    // is validated against the grammar in common_sampler_sample (single-token check, ~us) and
++    // a full-vocab CPU resample runs on rejection, mirroring the grammar_first=false rejection
++    // path (the server always passes grammar_first=false). grammar_first=true + backend is
++    // rejected by GGML_ASSERT in common_sampler_sample.
+ 
+-        params.backend_sampling = false;
+-    }
+ 
+     if (rbudget && params.backend_sampling) {
+         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+@@ -632,6 +652,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
+     return gsmpl->chain;
+ }
+ 
++bool common_sampler_has_grammar(const struct common_sampler * gsmpl) {
++    // [TAG_GRAMMAR_BACKEND]
++    return gsmpl && gsmpl->grmr != nullptr;
++}
++
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+     llama_synchronize(ctx);
+ 
+@@ -653,11 +678,48 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+         id = llama_get_sampled_token_ith(ctx, idx);
+ 
+         if (id != LLAMA_TOKEN_NULL) {
+-            LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
++            LOG_DBG("%s: Backend sampler selected token: '%d'.\n", __func__, id);
+ 
+-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
+             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+ 
++            if (gsmpl->grmr && grammar_should_apply(gsmpl)) {
++                // [TAG_GRAMMAR_BACKEND] fast path + rejection resample, mirroring the
++                // grammar_first=false flow below: the chain drew from the unmasked logits;
++                // validate the drawn token against the grammar with a single-token check.
++                GGML_ASSERT(!grammar_first && "grammar_first + backend sampling is not supported");
++
++                {
++                    llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
++                    llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
++
++                    llama_sampler_apply(grmr, &single_token_data_array);
++
++                    if (single_token_data_array.data[0].logit != -INFINITY) {
++                        for (size_t i = 0; i < cur_p.size; ++i) {
++                            if (cur_p.data[i].id == id) {
++                                cur_p.selected = i;
++                                break;
++                            }
++                        }
++
++                        return id;
++                    }
++                }
++
++                // rejected by the grammar -> full-vocab CPU resample (raw logits are
++                // downloaded for grammar sequences by the server via llama_set_need_raw_logits)
++                gsmpl->set_raw_logits(ctx, idx);
++
++                llama_sampler_apply(grmr, &cur_p);
++                // the chain is backend-initialized: run its stages on the CPU explicitly
++                // (the raw logits are pre-backend, so each stage applies exactly once)
++                llama_sampler_chain_apply_cpu(chain, &cur_p);
++
++                GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
++
++                return cur_p.data[cur_p.selected].id;
++            }
++
+             for (size_t i = 0; i < cur_p.size; ++i) {
+                 if (cur_p.data[i].id == id) {
+                     cur_p.selected = i;
+diff --git a/common/sampling.h b/common/sampling.h
+index 5f3273eae4b..63e11225eea 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -56,6 +56,10 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
+ // get the underlying llama_sampler_chain
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ 
++// [TAG_GRAMMAR_BACKEND] true if a grammar sampler is attached (and thus the raw logits
++// are needed host-side for the backend rejection resample)
++bool common_sampler_has_grammar(const struct common_sampler * gsmpl);
++
+ // extended sampling implementation:
+ //
+ // - set logits
+diff --git a/include/llama.h b/include/llama.h
+index a88c815121e..09cc08a3480 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1067,6 +1067,10 @@ extern "C" {
+     // returns NULL for invalid ids.
+     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+ 
++    // [TAG_GRAMMAR_BACKEND] the RAW full-vocab logits of output i, bypassing the sampled
++    // candidates that llama_get_logits_ith prefers when a backend sampler produced them
++    LLAMA_API float * llama_get_raw_logits_ith(struct llama_context * ctx, int32_t i);
++
+     // Get all output token embeddings.
+     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
+     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
+@@ -1357,6 +1361,11 @@ extern "C" {
+     // note: prefer initializing the context with llama_context_params.samplers when possible
+     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+ 
++    // [TAG_GRAMMAR_BACKEND] [EXPERIMENTAL]
++    // force the raw logits of this sequence to be downloaded to the host each decode, even
++    // when its sampler chain runs on the backend (needed by grammar rejection resampling)
++    LLAMA_API void llama_set_need_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool need_raw);
++
+     // mirror of llama_sampler_i:
+     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
+     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
+@@ -1386,6 +1395,11 @@ extern "C" {
+     // the total number of samplers in the chain
+     LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+ 
++    // [TAG_GRAMMAR_BACKEND] apply ALL stages of a backend-initialized chain on the CPU,
++    // bypassing the backend skip in llama_sampler_apply. Valid on raw (pre-backend) logits:
++    // the backend graph and this CPU application each see the logits exactly once.
++    LLAMA_API void                   llama_sampler_chain_apply_cpu(struct llama_sampler * chain, llama_token_data_array * cur_p);
++
+     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
+     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 07a81abeaa2..b36a1d605cf 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1615,7 +1615,7 @@ static void copy_tensor_async_rows(
+     }
+ }
+ 
+-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
++static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers, const std::set<llama_seq_id> & need_raw) {
+     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+         if (!ubatch.output[i]) {
+             continue;
+@@ -1627,9 +1627,14 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+             if (samplers.find(seq_id) == samplers.end()) {
+                 return true;
+             }
++            // [TAG_GRAMMAR_BACKEND] grammar sequences need the raw logits host-side
++            // for the rejection resample even though the chain runs on the backend
++            if (need_raw.find(seq_id) != need_raw.end()) {
++                return true;
++            }
+         }
+     }
+-    return false; // all sequences use backend sampling
++    return false; // all sequences use backend sampling and none needs raw logits
+ }
+ 
+ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1860,7 +1865,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         }
+ 
+         // extract logits
+-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
++        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers, sampling.need_raw)) {
+             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+             GGML_ASSERT(backend_res != nullptr);
+             GGML_ASSERT(logits.data != nullptr);
+@@ -3758,6 +3763,13 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+     return res;
+ }
+ 
++float * llama_get_raw_logits_ith(llama_context * ctx, int32_t i) {
++    // [TAG_GRAMMAR_BACKEND] bypass the sampled candidates: raw full-vocab logits only
++    ctx->synchronize();
++
++    return ctx->get_logits_ith(i);
++}
++
+ float * llama_get_embeddings(llama_context * ctx) {
+     ctx->synchronize();
+ 
+@@ -3818,6 +3830,11 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
+     return ctx->set_sampler(seq_id, smpl);
+ }
+ 
++void llama_set_need_raw_logits(llama_context * ctx, llama_seq_id seq_id, bool need_raw) {
++    // [TAG_GRAMMAR_BACKEND]
++    ctx->set_need_raw_logits(seq_id, need_raw);
++}
++
+ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b56..3913cedaa39 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -253,6 +253,16 @@ public:
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
++    // [TAG_GRAMMAR_BACKEND] force raw-logit download for this sequence even when its sampler
++    // chain runs on the backend (grammar rejection resample reads them host-side)
++    void set_need_raw_logits(llama_seq_id seq_id, bool need_raw) {
++        if (need_raw) {
++            sampling.need_raw.insert(seq_id);
++        } else {
++            sampling.need_raw.erase(seq_id);
++        }
++    }
++
+ private:
+     llm_graph_params graph_params(
+                         llm_graph_result * res,
+@@ -307,6 +317,9 @@ private:
+     struct sampling_info {
+         // !samplers.empty() to check if any samplers are active
+         std::map<llama_seq_id, llama_sampler *> samplers;
++        // [TAG_GRAMMAR_BACKEND] sequences that need the raw logits downloaded even though the
++        // chain runs on the backend (grammar rejection resample reads them host-side)
++        std::set<llama_seq_id> need_raw;
+ 
+         buffer_view<float>       logits     = {nullptr, 0};
+         buffer_view<llama_token> sampled    = {nullptr, 0};
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index fb8e0e9b8fa..d2d95c88b18 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -700,6 +700,19 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
+     }
+ }
+ 
++void llama_sampler_chain_apply_cpu(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
++    // [TAG_GRAMMAR_BACKEND] like llama_sampler_chain_apply, but backend-initialized stages are
++    // applied on the CPU too (the caller must pass raw, pre-backend logits so that the
++    // backend graph and this CPU pass each apply the stages exactly once)
++    auto * chain = (llama_sampler_chain *) smpl->ctx;
++
++    for (auto & s : chain->samplers) {
++        if (s.ptr->iface->apply != nullptr) {
++            llama_sampler_apply(s.ptr, cur_p);
++        }
++    }
++}
++
+ static void llama_sampler_chain_reset(struct llama_sampler * smpl) {
+     auto * chain = (llama_sampler_chain *) smpl->ctx;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d54ad7c3f6d..98bef14456a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1710,6 +1710,12 @@ private:
+                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+             }
+ 
++            // [TAG_GRAMMAR_BACKEND] grammar sequences need the raw logits host-side for the
++            // rejection resample even though the chain runs on the backend (costs one
++            // ~1 MB download per token, only for grammar requests)
++            llama_set_need_raw_logits(ctx_tgt, slot.id,
++                    use_backend_sampling && common_sampler_has_grammar(slot.smpl.get()));
++
+             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
+             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
+         } else {
+-- 
+2.53.0
+

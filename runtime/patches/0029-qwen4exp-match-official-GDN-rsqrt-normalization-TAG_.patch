@@ -1,0 +1,48 @@
+From caf31815719f28c79e44d4430940e254cb957c91 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 5 Sep 2026 18:10:42 +0200
+Subject: [PATCH 29/54] qwen4exp: match official GDN rsqrt normalization
+ ([TAG_GDN_RSQRT])
+
+---
+ src/models/models.h     | 8 ++++++++
+ src/models/qwen4exp.cpp | 4 ++--
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/models/models.h b/src/models/models.h
+index 2604282843a..e2c81f7d525 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -10,6 +10,14 @@
+ 
+ class llama_memory_hybrid_idx_context;
+ 
++// Qwen/FlashQLA reference: x * rsqrt(sum(x^2) + eps).
++// Source: ggml-org/llama.cpp PR #28068.
++static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
++    const float n = x->ne[0];
++
++    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
++}
++
+ //
+ // base classes
+ //
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 6189e700278..f823b2fda4d 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1273,8 +1273,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+ 
+     const float eps_norm = hparams.f_norm_rms_eps;
+ 
+-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
++    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
++    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+ 
+     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
+     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+-- 
+2.53.0
+

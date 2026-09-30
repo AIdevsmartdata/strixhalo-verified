@@ -1,0 +1,53 @@
+From b047d19f511f204611e2c04764fc043d7e3c50e6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sun, 30 Aug 2026 07:55:32 +0200
+Subject: [PATCH 08/54] =?UTF-8?q?server:=20toggle=20MTP=20s=C3=A9lectif=20?=
+ =?UTF-8?q?sur=20temp<=3D0.01=20(code)=20+=20force=20backend-sampling=20of?=
+ =?UTF-8?q?f?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Le champ enable_thinking dans task_params (lu/écrit) provoquait une
+régression MTP 40->7 t/s inexpliquée (bisect en high). Toggle basé sur
+temp<=0.01 seul, sans champ ajouté.
+---
+ tools/server/server-context.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a91a103151d..d9385b06a8e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1700,6 +1700,9 @@ private:
+ 
+             bool use_backend_sampling = task.params.sampling.backend_sampling;
+ 
++            // le MTP sélectif désactive le backend-sampling (temp 0 = code)
++            use_backend_sampling &= !(task.params.sampling.temp <= 0.01f);
++
+             // TODO: getting pre sampling logits is not yet supported with backend sampling
+             use_backend_sampling &= !need_pre_sample_logits;
+ 
+@@ -2889,6 +2892,9 @@ private:
+ 
+                 const int n_draft_max = slot.get_n_draft_max();
+ 
++                // MTP sélectif : drafter uniquement en temp 0 (code), jamais en reasoning temp>0
++                const bool use_mtp = slot.task->params.sampling.temp <= 0.01f;
++
+                 if (n_draft_max > 0) {
+                     GGML_ASSERT(slot.can_speculate());
+ 
+@@ -2897,7 +2903,7 @@ private:
+                         if (use_ckpt_tgt) {
+                             GGML_ASSERT(!slot.spec_ckpt.empty());
+                         }
+-                    } else {
++                    } else if (use_mtp) {
+                         GGML_ASSERT(slot.spec_i_batch.empty());
+ 
+                         slot.spec_ckpt.update_pos(
+-- 
+2.53.0
+

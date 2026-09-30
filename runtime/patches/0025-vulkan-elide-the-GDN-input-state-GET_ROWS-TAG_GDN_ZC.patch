@@ -1,0 +1,571 @@
+From 7e76d9ae4e36193e25a7761e874fa86544ed8414 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Fri, 4 Sep 2026 16:15:59 +0200
+Subject: [PATCH 25/54] vulkan: elide the GDN input-state GET_ROWS
+ ([TAG_GDN_ZC] input side)
+
+The GDN state gather (GET_ROWS on the recurrent ring, ~780 us/token on the 125B
+decode profile) is pure plumbing: the kernel can read the ring row directly.
+
+Same backend-fusion philosophy as the write side: a prepare pass detects, by
+dependency, a GDN whose state input is a contiguous GET_ROWS(ring, I32 index)
+walked back through RESHAPE/VIEW ops, with a single-entry index (single seq) and
+single-token decode. The GET_ROWS node is skipped; the kernel reads the ring row
+data_idx[seq] * state_row_stride and an extra binding carries the index vector.
+
+Safety: restricted to n_seq_tokens == 1 && n_seqs == 1. The kernel writes only
+ring row "head" (slot 0, n_written = 1); the read row is idx*mem_size + src0.
+Either the rows differ, or they are the same row of the only sequence, in which
+case every read/write of an element belongs to one workgroup which loads its
+slice into registers before storing - no cross-workgroup hazard. The ring read
+(and the index vector) are declared in the sync bookkeeping so prior writes
+(rs_z zeroing, rollback CPY) still complete before the gather-free read.
+
+Disabled under GGML_VULKAN_CHECK_RESULTS (the per-node checker would compare
+against a never-computed gather) and under GGML_VK_DISABLE_GDN_CACHE_FUSION.
+
+Shader: binding 8 (I32 indices), push constants use_fused_state/state_row_stride;
+the legacy path binds a dummy and never reads them.
+
+Tests: 5 new GATED_DELTA_NET_ZC cases reproduce the production gather pattern,
+including the read-row == write-row aliasing case (K=1 and K=4) and a disjoint
+rollback row. 11/11 ZC cases pass CPU vs Vulkan with both fusions active,
+11/11 with fusion disabled, 36/36 legacy unchanged.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 224 +++++++++++++++++-
+ .../vulkan-shaders/gated_delta_net.comp       |  15 +-
+ tests/test-backend-ops.cpp                    |  71 +++++-
+ 3 files changed, 290 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index c260279e958..ef8bb6e8250 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1887,6 +1887,8 @@ struct vk_op_gated_delta_net_push_constants {
+     uint32_t use_fused_cache;
+     uint32_t cache_slot_stride;
+     uint32_t cache_seq_stride;
++    uint32_t use_fused_state;
++    uint32_t state_row_stride;
+ };
+ 
+ struct vk_op_ssm_scan_push_constants {
+@@ -2434,6 +2436,13 @@ struct ggml_backend_vk_context {
+     const ggml_tensor * fused_gdn_cache_dst {};
+     std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_cache_dst;
+     std::unordered_set<const ggml_tensor *>                      gdn_cache_skip;
++    // Input-side fusion: the GDN reads its state straight from the recurrent ring,
++    // eliding the GET_ROWS gather. Maps the GDN node to {ring, indices} and holds
++    // the GET_ROWS nodes to skip.
++    const ggml_tensor * fused_gdn_state_read {};   // ring read by the current node
++    const ggml_tensor * fused_gdn_state_idx  {};   // index vector read by the current node
++    std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, const ggml_tensor *>> gdn_state_fused;
++    std::unordered_set<const ggml_tensor *>                      gdn_state_skip;
+ 
+     // for GGML_VK_PERF_LOGGER
+     std::unique_ptr<vk_perf_logger> perf_logger;
+@@ -6365,7 +6374,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             for (uint32_t kda = 0; kda < 2; kda++) {
+                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
+-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
++                    gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
+                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+             }
+         }
+@@ -13391,7 +13400,8 @@ static void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context&
+ 
+ static void ggml_vk_gated_delta_net(
+         ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst,
+-        const ggml_tensor * fused_cache_dst) {
++        const ggml_tensor * fused_cache_dst,
++        const ggml_tensor * fused_state_ring, const ggml_tensor * fused_state_idx) {
+     const ggml_tensor * src_q     = dst->src[0];
+     const ggml_tensor * src_v     = dst->src[2];
+     const ggml_tensor * src_beta  = dst->src[4];
+@@ -13446,6 +13456,20 @@ static void ggml_vk_gated_delta_net(
+         cache_buf = ggml_vk_tensor_subbuffer(ctx, fused_cache_dst);
+     }
+ 
++    uint32_t use_fused_state = 0;
++    uint32_t state_row_stride = 0;
++    vk_subbuffer state_buf = src_buf[5];
++    vk_subbuffer idx_buf    = src_buf[5]; // valid dummy binding in the legacy path
++    if (fused_state_ring) {
++        GGML_ASSERT(fused_state_idx != nullptr);
++        GGML_ASSERT(fused_state_ring->type == GGML_TYPE_F32);
++        GGML_ASSERT(fused_state_idx->type == GGML_TYPE_I32);
++        use_fused_state = 1;
++        state_row_stride = (uint32_t)(fused_state_ring->nb[1] / sizeof(float));
++        state_buf = ggml_vk_tensor_subbuffer(ctx, fused_state_ring);
++        idx_buf   = ggml_vk_tensor_subbuffer(ctx, fused_state_idx);
++    }
++
+     const vk_op_gated_delta_net_push_constants pc = {
+         H, n_tokens, n_seqs, s_off,
+         sq1, sq2, sq3,
+@@ -13454,11 +13478,12 @@ static void ggml_vk_gated_delta_net(
+         neq1, rq3,
+         scale,
+         K,
+-        use_fused_cache, cache_slot_stride, cache_seq_stride
++        use_fused_cache, cache_slot_stride, cache_seq_stride,
++        use_fused_state, state_row_stride
+     };
+ 
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, cache_buf},
++        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], state_buf, dst_buf, cache_buf, idx_buf},
+         pc, { H, n_seqs, S_v });
+ }
+ 
+@@ -16067,6 +16092,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+                 need_sync = true;
+             }
+         }
++        // [TAG_GDN_ZC] chemin d'entrée fusionné : le noyau lit le ring (et le vecteur
++        // d'indices) — ordonner contre les écritures précédentes du même buffer
++        // (rs_z, CPY rollback).
++        if (!need_sync && ctx->fused_gdn_state_read) {
++            if (overlaps_unsynced(ctx->fused_gdn_state_read, ctx->unsynced_nodes_written)) {
++                need_sync = true;
++            }
++        }
+ 
+         if (need_sync) {
+             if (vk_enable_sync_logger) {
+@@ -16100,6 +16133,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         if (ctx->fused_gdn_cache_dst) {
+             ctx->unsynced_nodes_written.push_back(ctx->fused_gdn_cache_dst);
+         }
++        // [TAG_GDN_ZC] mémoriser les lectures du ring et des indices pour la suite
++        if (ctx->fused_gdn_state_read) {
++            ctx->unsynced_nodes_read.push_back(ctx->fused_gdn_state_read);
++            if (ctx->fused_gdn_state_idx) {
++                ctx->unsynced_nodes_read.push_back(ctx->fused_gdn_state_idx);
++            }
++        }
+     }
+     if (vk_enable_sync_logger) {
+         for (int i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+@@ -16478,10 +16518,19 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+ 
+-    case GGML_OP_GATED_DELTA_NET:
+-        ggml_vk_gated_delta_net(ctx, compute_ctx, node, ctx->fused_gdn_cache_dst);
++    case GGML_OP_GATED_DELTA_NET: {
++        const ggml_tensor * fused_state_ring = nullptr;
++        const ggml_tensor * fused_state_idx  = nullptr;
++        auto gdn_it = ctx->gdn_state_fused.find(node);
++        if (gdn_it != ctx->gdn_state_fused.end()) {
++            fused_state_ring = gdn_it->second.first;
++            fused_state_idx  = gdn_it->second.second;
++        }
++        ggml_vk_gated_delta_net(ctx, compute_ctx, node, ctx->fused_gdn_cache_dst,
++                                fused_state_ring, fused_state_idx);
+ 
+         break;
++    }
+ 
+     case GGML_OP_SSM_SCAN:
+         ggml_vk_ssm_scan(ctx, compute_ctx, node);
+@@ -17953,6 +18002,151 @@ static void ggml_vk_prepare_gdn_cache_fusion(ggml_backend_vk_context * ctx, ggml
+     }
+ }
+ 
++// [TAG_GDN_ZC] Input-side fusion: elide the GET_ROWS that gathers the GDN input
++// state from the recurrent ring, and have the kernel read the ring row directly
++// (row index taken from the runtime I32 vector).
++//
++// Restricted to single-sequence decode (n_seq_tokens == 1 && n_seqs == 1): the
++// kernel writes only ring row "head" (slot 0), and it reads row
++// "idx*mem_size + src0". Either the rows differ, or they are the same row of the
++// one and only sequence, in which case the reads and writes belong to the same
++// workgroup and are ordered sequentially inside it. No cross-workgroup hazard.
++static void ggml_vk_prepare_gdn_state_fusion(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
++    ctx->gdn_state_fused.clear();
++    ctx->gdn_state_skip.clear();
++
++#if defined(GGML_VULKAN_CHECK_RESULTS)
++    // The checker recomputes every node against the CPU; an elided gather would
++    // leave the GDN's state input never computed and produce false mismatches.
++    return;
++#endif
++    if (ctx->device->disable_fusion || ctx->device->disable_gdn_cache_fusion) {
++        return;
++    }
++
++    static bool dbg_init = false;
++    static bool dbg = false;
++    if (!dbg_init) {
++        dbg_init = true;
++        dbg = getenv("GGML_VK_DEBUG_GDN_CACHE") != nullptr;
++    }
++
++    struct chain_t {
++        const ggml_tensor * gdn;
++        const ggml_tensor * getrows;
++        std::vector<const ggml_tensor *> views; // chain nodes between gather and GDN
++    };
++    std::vector<chain_t> chains;
++
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * gdn = cgraph->nodes[i];
++        if (gdn->op != GGML_OP_GATED_DELTA_NET) {
++            continue;
++        }
++        const ggml_tensor * src_v = gdn->src[2];
++        if (!src_v || src_v->ne[2] != 1 || src_v->ne[3] != 1) {
++            continue; // decode, single sequence only
++        }
++
++        // walk back through view/reshape ops to the state producer
++        chain_t chain { gdn, nullptr, {} };
++        const ggml_tensor * t = gdn->src[5];
++        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
++                    t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) {
++            chain.views.push_back(t);
++            t = t->view_src;
++        }
++        if (!t || t->op != GGML_OP_GET_ROWS) {
++            continue;
++        }
++        chain.getrows = t;
++
++        const ggml_tensor * ring = chain.getrows->src[0];
++        const ggml_tensor * idx  = chain.getrows->src[1];
++        if (!ring || !idx) {
++            continue;
++        }
++        // ring: contiguous 2D F32 [D, n_rows]
++        if (ring->type != GGML_TYPE_F32 || ring->ne[2] != 1 || ring->ne[3] != 1 ||
++            ring->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, ring->ne[0])) {
++            continue;
++        }
++        // index vector: I32 with a single entry (n_seqs == 1)
++        if (idx->type != GGML_TYPE_I32 || idx->ne[0] != 1 ||
++            idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) {
++            continue;
++        }
++        // gathered output: contiguous 2D F32 [D, 1]
++        if (chain.getrows->type != GGML_TYPE_F32 ||
++            chain.getrows->ne[1] != 1 || chain.getrows->ne[2] != 1 || chain.getrows->ne[3] != 1 ||
++            chain.getrows->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, chain.getrows->ne[0])) {
++            continue;
++        }
++        if (ring->ne[0] != chain.getrows->ne[0]) {
++            continue;
++        }
++        // GDN state geometry must match [S_v, S_v, H, 1]
++        const int64_t S_v = src_v->ne[0];
++        const int64_t H   = src_v->ne[1];
++        if (gdn->src[5]->ne[0] != S_v || gdn->src[5]->ne[1] != S_v ||
++            gdn->src[5]->ne[2] != H   || gdn->src[5]->ne[3] != 1) {
++            continue;
++        }
++
++        chains.push_back(chain);
++    }
++    if (chains.empty()) {
++        return;
++    }
++
++    // The gathered state (and its view chain) must feed this GDN and nothing else.
++    auto const &is_chain_link = [&](const ggml_tensor * t, const chain_t *& owner) -> bool {
++        for (const auto & c : chains) {
++            if (t == c.getrows || std::find(c.views.begin(), c.views.end(), t) != c.views.end()) {
++                owner = &c;
++                return true;
++            }
++        }
++        return false;
++    };
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * n = cgraph->nodes[i];
++        for (uint32_t j = 0; j < GGML_MAX_SRC; j++) {
++            const ggml_tensor * src = n->src[j];
++            if (!src) {
++                continue;
++            }
++            const chain_t * owner = nullptr;
++            if (!is_chain_link(src, owner)) {
++                continue;
++            }
++            // allowed: the chain itself (view -> its view_src) and the GDN head
++            const bool chain_edge =
++                (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW ||
++                 n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) &&
++                std::find(owner->views.begin(), owner->views.end(), n) != owner->views.end();
++            const bool gdn_edge = n == owner->gdn && j == 5;
++            if (!chain_edge && !gdn_edge) {
++                if (dbg) {
++                    fprintf(stderr, "[GDN_CACHE] state gather has an extra consumer, fusion disabled\n");
++                }
++                ctx->gdn_state_fused.clear();
++                ctx->gdn_state_skip.clear();
++                return;
++            }
++        }
++    }
++
++    for (const auto & c : chains) {
++        ctx->gdn_state_fused[c.gdn] = { c.getrows->src[0], c.getrows->src[1] };
++        ctx->gdn_state_skip.insert(c.getrows);
++    }
++    if (dbg) {
++        fprintf(stderr, "[GDN_CACHE] %zu state GET_ROWS elided (graph of %d nodes)\n",
++                ctx->gdn_state_skip.size(), cgraph->n_nodes);
++    }
++}
++
+ 
+ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+@@ -18096,6 +18290,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+     // [TAG_GDN_ZC] repérer les CPY de cache récurrent éliminables pour ce graphe
+     ggml_vk_prepare_gdn_cache_fusion(ctx, cgraph);
++    // [TAG_GDN_ZC] idem pour les GET_ROWS d'état en entrée du GDN
++    ggml_vk_prepare_gdn_state_fusion(ctx, cgraph);
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         if (first_node_in_batch) {
+@@ -18106,6 +18302,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         if (ctx->gdn_cache_skip.count(cgraph->nodes[i])) {
+             continue;
+         }
++        // [TAG_GDN_ZC] ce GET_ROWS d'état est lu directement par le noyau GDN : ne pas l'exécuter
++        if (ctx->gdn_state_skip.count(cgraph->nodes[i])) {
++            continue;
++        }
+ 
+         {
+             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
+@@ -18134,6 +18334,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
+         ctx->fused_gdn_cache_dst = nullptr;
++        ctx->fused_gdn_state_read = nullptr;
++        ctx->fused_gdn_state_idx  = nullptr;
+         {
+             // [TAG_GDN_ZC] si ce nœud est un GDN dont le CPY de cache est éliminé,
+             // le noyau écrit lui-même la tranche de cache.
+@@ -18141,6 +18343,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             if (gdn_it != ctx->gdn_cache_dst.end()) {
+                 ctx->fused_gdn_cache_dst = gdn_it->second;
+             }
++            // idem pour le GET_ROWS d'état en entrée : le noyau lit le ring.
++            auto sit = ctx->gdn_state_fused.find(cgraph->nodes[i]);
++            if (sit != ctx->gdn_state_fused.end()) {
++                ctx->fused_gdn_state_read = sit->second.first;
++                ctx->fused_gdn_state_idx  = sit->second.second;
++            }
+         }
+         const char *fusion_string {};
+         if (!ctx->device->disable_fusion) {
+@@ -18361,6 +18569,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+                 ctx->fused_topk_moe_scale = false;
+                 ctx->fused_gdn_cache_dst = nullptr;
++                ctx->fused_gdn_state_read = nullptr;
++                ctx->fused_gdn_state_idx  = nullptr;
+             }
+         }
+ 
+@@ -18405,6 +18615,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->num_additional_fused_ops = 0;
+         ctx->fused_ops_write_mask = 0;
+         ctx->fused_gdn_cache_dst = nullptr;
++        ctx->fused_gdn_state_read = nullptr;
++        ctx->fused_gdn_state_idx  = nullptr;
+     }
+ 
+     ctx->last_total_flops = total_flops;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index 1bcbb57bcc2..9acf900294c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -35,6 +35,8 @@ layout(push_constant) uniform Parameters {
+     uint use_fused_cache;
+     uint cache_slot_stride;
+     uint cache_seq_stride;
++    uint use_fused_state;
++    uint state_row_stride;
+ };
+ 
+ layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+@@ -47,6 +49,9 @@ layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+ // Binding 7 is the CPY destination recognized by the backend graph fusion.
+ // It aliases DstBuf in the legacy path and is never written there.
+ layout(binding = 7)           buffer CacheBuf { FLOAT_TYPE data_cache[]; };
++// Binding 8 is the I32 row-index vector of the elided GET_ROWS (input-side fusion).
++// Unused in the legacy path.
++layout(binding = 8) readonly  buffer IdxBuf   { int data_idx[]; };
+ 
+ #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
+ shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+@@ -109,7 +114,15 @@ void main() {
+ 
+     const uint state_size = S_V * S_V;
+     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
+-    const uint state_in_base       = (seq_id * H + head_id) * state_size;
++    // Fused input path: the GET_ROWS gather is elided; read the recurrent ring
++    // row given by the runtime index instead. Row layout is head-major, so the
++    // (head, col, row) addressing inside the row is unchanged.
++    uint state_in_base;
++    if (use_fused_state == 1u) {
++        state_in_base = uint(data_idx[seq_id]) * state_row_stride + head_id * state_size;
++    } else {
++        state_in_base = (seq_id * H + head_id) * state_size;
++    }
+     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
+     const uint state_out_base      = (seq_id * H + head_id) * state_size;
+     const uint state_size_per_snap = state_size * H * n_seqs;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index dcf1990fb4d..1765998825f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4396,26 +4396,31 @@ struct test_gated_delta_net : public test_case {
+     const bool    kda;
+     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+     const bool    cache_fusion;
++    const bool    state_getrows; // gather the input state from the ring (production pattern)
++    const int64_t rs_idx_value; // row index the I32 gather vector points at
+ 
+     std::string vars() override {
+-        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, cache_fusion);
++        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, cache_fusion)
++            + "," + VAR_TO_STR(state_getrows) + "," + VAR_TO_STR(rs_idx_value);
+     }
+ 
+     // The graph output of a cache-fusion case is the CPY result, so the default op name
+     // would hide these cases. Expose them under a dedicated op name.
+     std::string op_desc(ggml_tensor * t) override {
+-        return cache_fusion ? "GATED_DELTA_NET_ZC" : ggml_op_desc(t);
++        return (cache_fusion || state_getrows) ? "GATED_DELTA_NET_ZC" : ggml_op_desc(t);
+     }
+ 
+     // The cache-fusion pattern only exists when GDN and CPY are computed in the same
+     // graph, so these cases must not be split into one-node sub-graphs.
+-    bool run_whole_graph() override { return cache_fusion; }
++    bool run_whole_graph() override { return cache_fusion || state_getrows; }
+ 
+     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
+             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool cache_fusion = false)
++            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool cache_fusion = false,
++            bool state_getrows = false, int64_t rs_idx_value = 0)
+         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), cache_fusion(cache_fusion) {}
++          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), cache_fusion(cache_fusion),
++          state_getrows(state_getrows), rs_idx_value(rs_idx_value) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * q;
+@@ -4437,14 +4442,40 @@ struct test_gated_delta_net : public test_case {
+         const int64_t g_ne0 = kda ? head_size : 1;
+         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
+         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+         ggml_set_name(g,     "g");
+         ggml_set_name(beta,  "beta");
+-        ggml_set_name(state, "state");
++        ggml_tensor * state = nullptr;
++        if (!state_getrows) {
++            // plain state tensor (legacy pattern); in gather mode the state comes
++            // from the ring and this tensor would never be allocated.
++            state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
++            ggml_set_name(state, "state");
++        }
+         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+         q = ggml_l2_norm(ctx, q, 1e-6f);
+         k = ggml_l2_norm(ctx, k, 1e-6f);
+-        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
++
++        // state_getrows reproduces the production input pattern:
++        //   GET_ROWS(ring, s_copy_main) -> RESHAPE_4D -> GDN state input.
++        // A backend may elide the gather by reading the ring row directly.
++        const int64_t D         = head_size * head_size * head_count * v_repeat;
++        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
++        const int64_t mem_size  = n_seqs + 2;
++        const int64_t kv_head    = 1;
++
++        ggml_tensor * ring = nullptr;
++        ggml_tensor * s_in = state;
++        if (state_getrows) {
++            GGML_ASSERT(n_seqs == 1); // input-side fusion is single-sequence only
++            ring = ggml_new_tensor_2d(ctx, type, D, mem_size * K); // size*(1 + n_rs_seq) rows
++            ggml_set_name(ring, "rs_ring");
++            ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++            ggml_set_name(idx, "rs_idx");
++            ggml_tensor * states = ggml_get_rows(ctx, ggml_reshape_2d(ctx, ring, D, mem_size * K), idx);
++            s_in = ggml_reshape_4d(ctx, states, head_size, head_size, head_count * v_repeat, n_seqs);
++        }
++
++        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, s_in, K);
+         if (!cache_fusion) {
+             return out;
+         }
+@@ -4453,10 +4484,6 @@ struct test_gated_delta_net : public test_case {
+ 
+         // Reproduce llama-memory's original GDN -> snapshot-tail VIEW -> CPY graph.
+         // CPU executes the CPY; Vulkan should write this destination in GDN and elide it.
+-        const int64_t D = head_size * head_size * head_count * v_repeat;
+-        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+-        const int64_t mem_size = n_seqs + 2;
+-        const int64_t kv_head = 1;
+         const int64_t attn_score_elems = head_size * head_count * v_repeat * n_seq_tokens * n_seqs;
+         const int64_t state_size_per_snap = D * n_seqs;
+ 
+@@ -4464,7 +4491,9 @@ struct test_gated_delta_net : public test_case {
+                 ggml_row_size(type, D),
+                 ggml_row_size(type, state_size_per_snap),
+                 ggml_row_size(type, attn_score_elems));
+-        ggml_tensor * ring = ggml_new_tensor_2d(ctx, type, D, mem_size * n_written);
++        if (!ring) {
++            ring = ggml_new_tensor_2d(ctx, type, D, mem_size * n_written);
++        }
+         ggml_tensor * dst = ggml_view_3d(ctx, ring, D, n_seqs, n_written,
+                 ring->nb[1], mem_size * ring->nb[1], kv_head * ring->nb[1]);
+         ggml_tensor * copied = ggml_cpy(ctx, src, dst);
+@@ -4485,6 +4514,10 @@ struct test_gated_delta_net : public test_case {
+                 init_tensor_uniform(t, 0.0f, 1.0f);
+             } else if (strcmp(t->name, "v") == 0) {
+                 init_tensor_uniform(t, -0.3f, 5.0f);
++            } else if (t->type == GGML_TYPE_I32 && strcmp(t->name, "rs_idx") == 0) {
++                // deterministic ring row for the gather (rs_idx_value)
++                const int32_t v = (int32_t) rs_idx_value;
++                ggml_backend_tensor_set(t, &v, 0, sizeof(v));
+             } else {
+                 init_tensor_uniform(t);
+             }
+@@ -10154,6 +10187,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 1, true)); // K=1   TG
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16,  64, 1, 2, 1, false, false, 1, true)); // K=1   TG n_seqs=2
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 4, true)); // K=4   TG (keep path)
++    // input-side fusion: state gathered from the ring (GET_ROWS -> RESHAPE -> GDN)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 1, 1, false, false, 1, false, true, 1)); // gather only, read row == kv_head
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 1, 1, false, false, 1, true, true, 1)); // both fusions, read row == write row (aliasing)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 1, true, true, 0)); // both fusions, disjoint rows
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 1, 1, false, false, 4, true, true, 1)); // keep path, aliasing
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 1, 1, false, false, 4, true, true, 10)); // keep path, rollback row (disjoint)
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 4, 1, 1, false, false, 4, true)); // K=4   PP-4
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 8, 2, 1, false, false, 4, true)); // K=4   PP-8 n_seqs=2
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8,  32, 4, 2, 2, false, true,  4, true)); // KDA + v_repeat, K=4
+@@ -10604,6 +10643,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 1, true)); // K=1 TG
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16,  64, 1, 2, 1, false, false, 1, true)); // K=1 TG, n_seqs=2
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 4, true)); // K=4 TG (keep path)
++    // input-side fusion: state gathered from the ring (GET_ROWS -> RESHAPE -> GDN)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 1, 1, false, false, 1, false, true, 1)); // gather only, read row == kv_head
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 1, 1, false, false, 1, true, true, 1)); // both fusions, read row == write row (aliasing)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 1, true, true, 0)); // both fusions, disjoint rows
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 1, 1, false, false, 4, true, true, 1)); // keep path, aliasing
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 1, 1, false, false, 4, true, true, 10)); // keep path, rollback row (disjoint)
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 4, 1, 1, false, false, 4, true)); // K=4 PP-4
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 8, 2, 1, false, false, 4, true)); // K=4 PP-8, n_seqs=2
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8,  32, 4, 2, 2, false, true,  4, true)); // KDA + v_repeat
+-- 
+2.53.0
+

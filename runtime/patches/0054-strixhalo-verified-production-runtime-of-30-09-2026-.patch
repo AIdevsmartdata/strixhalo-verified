@@ -1,0 +1,724 @@
+From 41150455ac74b7566b5a1025a0c46ef92b691b71 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?=
+ <kevin.remondiere@gmail.com>
+Date: Wed, 30 Sep 2026 21:48:01 +0200
+Subject: [PATCH 54/54] strixhalo-verified: production runtime of 30/09/2026
+ (agent loop speed + state correctness)
+
+- recurrent state: per-slot rollback planes (upstream #28123) and host-side zeroing of the
+  state row of a new sequence (the Vulkan graph optimizer ordered the read before the zero fill)
+- MTP drafting hygiene: reset of the pending hidden state at sequence start (upstream #28333),
+  draft stops at end-of-generation, per-request draft parameters, reuse of an identical context
+  checkpoint instead of reading the state back again
+- Vulkan: streaming loads (MOVNTDQA) for CPU reads of device memory (GGML_VK_STREAM_READ=0
+  disables them)
+- sampling: grammar fast path (rejection sampling with a single-token check before any
+  full-vocabulary grammar pass; LLAMA_GRAMMAR_FASTPATH=0 disables it)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WdTYzTHTL3CWzrp46giMJC
+---
+ common/sampling.cpp                  | 77 +++++++++++++++++++++++++-
+ common/speculative.cpp               | 81 +++++++++++++++++++++++++--
+ common/speculative.h                 | 11 ++++
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 83 ++++++++++++++++++++++++++--
+ src/llama-memory-recurrent.cpp       | 22 ++++++++
+ src/models/qwen4exp.cpp              | 32 +++++++----
+ tools/server/server-common.cpp       |  6 ++
+ tools/server/server-common.h         |  7 +++
+ tools/server/server-context.cpp      | 38 +++++++++++++
+ tools/server/server-schema.cpp       | 17 +++++-
+ tools/server/server-task.h           |  6 ++
+ 11 files changed, 355 insertions(+), 25 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index a3ad633a86a..fc300fce224 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -10,6 +10,7 @@
+ #include "ggml.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
+ #include <climits>
+ #include <cmath>
+@@ -663,6 +664,34 @@ bool common_sampler_has_grammar(const struct common_sampler * gsmpl) {
+     return gsmpl && gsmpl->grmr != nullptr;
+ }
+ 
++// [TAG_GRAMMAR_FASTPATH] grammar rejection sampling on the unconstrained draw: get the
++// token the chain would pick without the grammar, check it alone, touch the full vocab
++// only when the grammar rejects. LLAMA_GRAMMAR_FASTPATH=0 restores the old behavior.
++static const bool g_grammar_fastpath = [] () {
++    const char * val = getenv("LLAMA_GRAMMAR_FASTPATH");
++    return val == nullptr || atoi(val) != 0;
++}();
++
++static std::atomic<uint64_t> g_grammar_fastpath_single{0};
++static std::atomic<uint64_t> g_grammar_fastpath_full{0};
++
++static void grammar_fastpath_count(const bool full_vocab) {
++    if (!g_grammar_fastpath) {
++        return;
++    }
++
++    (full_vocab ? g_grammar_fastpath_full : g_grammar_fastpath_single)
++        .fetch_add(1, std::memory_order_relaxed);
++
++    const uint64_t n_single = g_grammar_fastpath_single.load(std::memory_order_relaxed);
++    const uint64_t n_full   = g_grammar_fastpath_full.load(std::memory_order_relaxed);
++
++    if ((n_single + n_full) % 2000 == 0) {
++        LOG_INF("%s: grammar fastpath: %llu positions resolved by single-token check, %llu full-vocab resamples\n",
++                __func__, (unsigned long long) n_single, (unsigned long long) n_full);
++    }
++}
++
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+     llama_synchronize(ctx);
+ 
+@@ -742,12 +771,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+                             }
+                         }
+ 
++                        grammar_fastpath_count(false);
+                         return id;
+                     }
+                 }
+ 
+                 // rejected by the grammar -> full-vocab CPU resample (raw logits are
+                 // downloaded for grammar sequences by the server via llama_set_need_raw_logits)
++                grammar_fastpath_count(true);
+                 gsmpl->set_raw_logits(ctx, idx);
+ 
+                 // [TAG_CONSTRAINT_REJECT] the pending backend draw was made against the
+@@ -799,6 +830,40 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+                 (llama_get_sampled_candidates_ith(ctx, idx) != nullptr ||
+                  llama_get_sampled_logits_ith(ctx, idx) != nullptr) &&
+                 llama_get_raw_logits_ith(ctx, idx) != nullptr) {
++            // [TAG_GRAMMAR_FASTPATH] rejection sampling instead of masking the whole
++            // vocabulary: draw what the chain would pick without the grammar and test that
++            // one token. Skip when forcing (the forced token must win) and when
++            // grammar_first (callers expect the constrained distribution in cur_p after).
++            if (g_grammar_fastpath && grammar_pending && !forcing && !grammar_first) {
++                // mirrors the set_logits branch selection: candidates are post-backend-prefix,
++                // raw logits are pre-backend
++                const bool has_backend_cands =
++                    llama_get_sampled_probs_ith(ctx, idx) != nullptr ||
++                    llama_get_sampled_logits_ith(ctx, idx) != nullptr;
++
++                gsmpl->set_logits(ctx, idx);
++
++                if (has_backend_cands) {
++                    llama_sampler_apply(chain, &cur_p);
++                } else {
++                    llama_sampler_chain_apply_cpu(chain, &cur_p);
++                }
++
++                if (cur_p.selected != -1) {
++                    llama_token_data       single_token_data       = { cur_p.data[cur_p.selected].id, 1.0f, 0.0f };
++                    llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
++
++                    llama_sampler_apply(grmr, &single_token_data_array);
++
++                    if (single_token_data_array.data[0].logit != -INFINITY) {
++                        grammar_fastpath_count(false);
++                        return single_token_data.id;
++                    }
++                }
++
++                grammar_fastpath_count(true);
++            }
++
+             gsmpl->set_raw_logits(ctx, idx);
+ 
+             if (rbudget) {
+@@ -870,6 +935,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+     std::vector<llama_token> result;
+     result.reserve(idxs.size());
+ 
++    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
++
+     size_t i = 0;
+     for (; i < draft.size(); i++) {
+         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+@@ -878,7 +945,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+ 
+         result.push_back(id);
+ 
+-        if (draft[i] != id) {
++        // do not accept draft tokens after an EOG - they are not output but would stay in the context
++        // (upstream d280808f5 / #29638). A trailing EOG (last draft token) is still accepted.
++        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+             break;
+         }
+     }
+@@ -907,6 +976,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
+     std::vector<llama_token> result;
+     result.reserve(idxs.size());
+ 
++    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
++
+     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+     size_t i = 0;
+     for (; i < draft.size(); ++i) {
+@@ -938,6 +1009,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
+         if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
+             common_sampler_accept(gsmpl, draft[i], true);
+             result.push_back(draft[i]);
++            // [local] same EOG stop as the greedy verifier above (fork-only probabilistic path)
++            if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
++                break;
++            }
+             continue;
+         }
+ 
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index f587f75812c..b4b1ab5c309 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -222,6 +222,35 @@ struct common_speculative_impl {
+         return n;
+     }
+ 
++    // [TAG_SPEC_REQ] effective draft parameters of one sequence: the boot values unless the
++    // request provided an override (negative = not provided). a request n_max can only lower
++    // the boot value, because the recurrent-state rollback slots (n_rs_seq) are sized from the
++    // boot n_max. the values used are written back to dp.*_used for reporting.
++    struct draft_req_eff {
++        float   p_min;
++        int32_t n_max;
++        int32_t n_min;
++    };
++
++    static draft_req_eff resolve_draft_req(common_speculative_draft_params & dp, float p_min_boot, int32_t n_max_boot, int32_t n_min_boot) {
++        draft_req_eff eff = { p_min_boot, n_max_boot, n_min_boot };
++        if (dp.n_max_req > 0) {
++            // note: the bound by dp.n_max (remaining context / n_predict budget) is applied after
++            // the draft by common_speculative_draft(), exactly as for the boot value
++            eff.n_max = std::max(1, std::min(dp.n_max_req, n_max_boot));
++        }
++        if (dp.p_min >= 0.0f) {
++            eff.p_min = dp.p_min;
++        }
++        if (dp.n_min >= 0) {
++            eff.n_min = std::min(dp.n_min, eff.n_max);
++        }
++        dp.p_min_used = eff.p_min;
++        dp.n_max_used = eff.n_max;
++        dp.n_min_used = eff.n_min;
++        return eff;
++    }
++
+     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {
+         // start optimistic so a predictable prefix is not throttled from step one
+         acc_ema.assign(n_seq, acc_ema_init);
+@@ -373,6 +402,22 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+             return;
+         }
+ 
++        // [TAG_SPEC_REQ] effective per-sequence draft parameters (boot values unless overridden by the request)
++        std::vector<float>   p_min_eff(n_seq, params.p_min);
++        std::vector<int32_t> n_max_eff(n_seq, params.n_max);
++        std::vector<int32_t> n_min_eff(n_seq, params.n_min);
++
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            auto & dp = dparams[seq_id];
++            if (!dp.drafting) {
++                continue;
++            }
++            const auto eff = resolve_draft_req(dp, params.p_min, params.n_max, params.n_min);
++            p_min_eff[seq_id] = eff.p_min;
++            n_max_eff[seq_id] = eff.n_max;
++            n_min_eff[seq_id] = eff.n_min;
++        }
++
+         int i = 0;
+ 
+         while (n_drafting > 0) {
+@@ -387,7 +432,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+ 
+                 auto * smpl = smpls[seq_id].get();
+ 
+-                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
++                const int32_t n_draft_eff = adaptive_n_draft(seq_id, n_max_eff[seq_id], n_min_eff[seq_id]);
+ 
+                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                 ++i_batch;
+@@ -404,7 +449,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+                 const llama_token id = cur_p->data[0].id;
+ 
+                 // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
++                if (cur_p->data[0].p < p_min_eff[seq_id]) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+ 
+@@ -447,7 +492,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+                 continue;
+             }
+ 
+-            if (dp.result->size() < (size_t) params.n_min) {
++            // [TAG_SPEC_REQ] n_min_used == n_min_eff of this sequence (== params.n_min without a request override)
++            if (dp.result->size() < (size_t) dp.n_min_used) {
+                 dp.result->clear();
+             }
+         }
+@@ -1630,6 +1676,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     continue;
+                 }
+ 
++                // [TAG_MTP_CARRIER_RESET] (amont PR #28333) : au debut d'une sequence (pos 0) le porteur h
++                // herite de la requete precedente est perime -> le remettre a zero, sinon deux requetes
++                // identiques ne brouillonnent pas pareil selon l'historique du serveur
++                if (batch_in.pos[i_batch_beg[seq_id]] == 0) {
++                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
++                }
++
+                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+             }
+ 
+@@ -1718,6 +1771,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+         }
+ 
++        // [TAG_SPEC_REQ] effective per-sequence draft parameters (boot values unless overridden by the request)
++        std::vector<float>   p_min_eff(n_seq, params.p_min);
++        std::vector<int32_t> n_max_eff(n_seq, params.n_max);
++        std::vector<int32_t> n_min_eff(n_seq, params.n_min);
++
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            auto & dp = dparams[seq_id];
++            if (!dp.drafting) {
++                continue;
++            }
++            const auto eff = resolve_draft_req(dp, params.p_min, params.n_max, params.n_min);
++            p_min_eff[seq_id] = eff.p_min;
++            n_max_eff[seq_id] = eff.n_max;
++            n_min_eff[seq_id] = eff.n_min;
++        }
++
+         int i = 0;
+ 
+         while (n_drafting > 0) {
+@@ -1757,7 +1826,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 // MTP drafts sequentially, so a shorter draft saves draft passes
+                 // as well as target verification work.
+-                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
++                const int32_t n_draft_eff = adaptive_n_draft(seq_id, n_max_eff[seq_id], n_min_eff[seq_id]);
+ 
+                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+@@ -1774,7 +1843,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 const llama_token id = cur_p->data[0].id;
+ 
+                 // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
++                if (cur_p->data[0].p < p_min_eff[seq_id]) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+ 
+@@ -1835,7 +1904,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 continue;
+             }
+ 
+-            if (dp.result->size() < (size_t) params.n_min) {
++            if (dp.result->size() < (size_t) n_min_eff[seq_id]) {
+                 dp.result->clear();
+             }
+         }
+diff --git a/common/speculative.h b/common/speculative.h
+index f7dd6526737..3e1bda75aeb 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -71,6 +71,17 @@ struct common_speculative_draft_params {
+ 
+     float temperature = 0.0f;
+     uint32_t seed = LLAMA_DEFAULT_SEED;
++
++    // [TAG_SPEC_REQ] optional per-request overrides (negative = not provided, use the boot values)
++    // only honoured by the draft-mtp implementation
++    float   p_min     = -1.0f; // minimum probability of a draft token
++    int32_t n_max_req = -1;    // max draft length, clamped to the boot n_max (RS state is sized at boot); n_max above still applies
++    int32_t n_min     = -1;    // min draft length
++
++    // [TAG_SPEC_REQ] output: the values effectively used by the last draft() call (draft-mtp only, -1 = not set)
++    float   p_min_used = -1.0f;
++    int32_t n_max_used = -1;
++    int32_t n_min_used = -1;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index ba3f0e95047..b32e9321b73 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -9753,6 +9753,79 @@ static size_t ggml_vk_align_size(size_t width, size_t align) {
+     return CEIL_DIV(width, align) * align;
+ }
+ 
++// CPU reads from device memory. On amdgpu a buffer that lands in the VRAM domain (the BIOS carve-out) is mapped
++// write-combined: a plain memcpy reads it at ~0.4 GB/s, MOVNTDQA streaming loads at 4-13 GB/s (RADV, Strix Halo).
++// On a cached mapping a streaming load is an ordinary load, so every bulk read from device memory goes through here.
++// GGML_VK_STREAM_READ=0 restores memcpy.
++#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
++#define GGML_VK_HAVE_STREAM_READ 1
++__attribute__((target("avx512f")))
++static void ggml_vk_stream_read_avx512(uint8_t * dst, const uint8_t * src, size_t n_blocks) {
++    for (size_t i = 0; i < n_blocks; i++) {
++        _mm512_storeu_si512(dst + 64 * i, _mm512_stream_load_si512((void *) (src + 64 * i)));
++    }
++}
++
++__attribute__((target("avx2")))
++static void ggml_vk_stream_read_avx2(uint8_t * dst, const uint8_t * src, size_t n_blocks) {
++    for (size_t i = 0; i < n_blocks; i++) {
++        const __m256i a = _mm256_stream_load_si256((const __m256i *) (src + 64 * i));
++        const __m256i b = _mm256_stream_load_si256((const __m256i *) (src + 64 * i + 32));
++        _mm256_storeu_si256((__m256i *) (dst + 64 * i), a);
++        _mm256_storeu_si256((__m256i *) (dst + 64 * i + 32), b);
++    }
++}
++
++__attribute__((target("sse4.1")))
++static void ggml_vk_stream_read_sse41(uint8_t * dst, const uint8_t * src, size_t n_blocks) {
++    for (size_t i = 0; i < n_blocks; i++) {
++        for (size_t k = 0; k < 64; k += 16) {
++            _mm_storeu_si128((__m128i *) (dst + 64 * i + k), _mm_stream_load_si128((__m128i *) (src + 64 * i + k)));
++        }
++    }
++}
++#endif
++
++static void ggml_vk_memcpy_from_device(void * dst, const void * src, size_t size) {
++#ifdef GGML_VK_HAVE_STREAM_READ
++    static const int isa = [] {
++        const char * e = getenv("GGML_VK_STREAM_READ");
++        if (e != nullptr && atoi(e) == 0) {
++            return 0;
++        }
++        __builtin_cpu_init();
++        if (__builtin_cpu_supports("avx512f")) {
++            return 3;
++        }
++        if (__builtin_cpu_supports("avx2")) {
++            return 2;
++        }
++        return __builtin_cpu_supports("sse4.1") ? 1 : 0;
++    }();
++
++    if (isa != 0 && size >= 1024) {
++        const uint8_t * s = (const uint8_t *) src;
++        uint8_t * d = (uint8_t *) dst;
++
++        // a streaming load needs an aligned source
++        const size_t head = (64 - ((uintptr_t) s & 63)) & 63;
++        memcpy(d, s, head);
++
++        const size_t n_blocks = (size - head) / 64;
++        switch (isa) {
++            case 3:  ggml_vk_stream_read_avx512(d + head, s + head, n_blocks); break;
++            case 2:  ggml_vk_stream_read_avx2  (d + head, s + head, n_blocks); break;
++            default: ggml_vk_stream_read_sse41 (d + head, s + head, n_blocks); break;
++        }
++
++        const size_t done = head + 64 * n_blocks;
++        memcpy(d + done, s + done, size - done);
++        return;
++    }
++#endif
++    memcpy(dst, src, size);
++}
++
+ static void deferred_memcpy(void * dst, const void * src, size_t size, std::vector<vk_staging_memcpy>* memcpys = nullptr) {
+     if (memcpys == nullptr) {
+         memcpy(dst, src, size);
+@@ -10113,10 +10186,10 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
+         ggml_vk_queue_command_pools_cleanup(src->device);
+ 
+         if (width == spitch && width == dpitch) {
+-            memcpy(dst, (const uint8_t *) src->ptr + offset, width * height);
++            ggml_vk_memcpy_from_device(dst, (const uint8_t *) src->ptr + offset, width * height);
+         } else {
+             for (size_t i = 0; i < height; i++) {
+-                memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width);
++                ggml_vk_memcpy_from_device((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width);
+             }
+         }
+     } else {
+@@ -10134,7 +10207,7 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
+         ggml_vk_queue_command_pools_cleanup(src->device);
+ 
+         for (auto& cpy : subctx->out_memcpys) {
+-            memcpy(cpy.dst, cpy.src, cpy.n);
++            ggml_vk_memcpy_from_device(cpy.dst, cpy.src, cpy.n);
+         }
+     }
+ }
+@@ -18450,7 +18523,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
+     if (tensor_idx == subctx->exit_tensor_idx) {
+         // Do staging buffer copies
+         for (auto& cpy : subctx->out_memcpys) {
+-            memcpy(cpy.dst, cpy.src, cpy.n);
++            ggml_vk_memcpy_from_device(cpy.dst, cpy.src, cpy.n);
+         }
+         subctx->in_memcpys.clear();
+         subctx->out_memcpys.clear();
+@@ -19089,7 +19162,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+ 
+     if (do_transfer) {
+         for (auto& cpy : compute_ctx->out_memcpys) {
+-            memcpy(cpy.dst, cpy.src, cpy.n);
++            ggml_vk_memcpy_from_device(cpy.dst, cpy.src, cpy.n);
+         }
+         ctx->compute_ctx.reset();
+     }
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 57919accf09..1c9395f4604 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <map>
+@@ -1249,6 +1250,15 @@ bool llama_memory_recurrent_context::next() {
+     return true;
+ }
+ 
++// clear one state row on the host
++static void rs_clear_row(const std::vector<ggml_tensor *> & tensors, int32_t row) {
++    for (ggml_tensor * t : tensors) {
++        if (t != nullptr) {
++            ggml_backend_tensor_memset(t, 0, (size_t) row * t->nb[1], t->nb[1]);
++        }
++    }
++}
++
+ bool llama_memory_recurrent_context::apply() {
+     assert(!llama_memory_status_is_fail(status));
+ 
+@@ -1262,6 +1272,18 @@ bool llama_memory_recurrent_context::apply() {
+ 
+     mem->find_slot(ubatches[i_next]);
+ 
++    // the graph also clears the row of a new sequence, but a backend that reorders nodes can run the read first
++    // LLAMA_RS_HOST_ZERO=0 disables this (A/B)
++    static const bool host_zero = [] {
++        const char * e = getenv("LLAMA_RS_HOST_ZERO");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    if (host_zero && mem->rs_z >= 0) {
++        rs_clear_row(mem->r_l, mem->rs_z);
++        rs_clear_row(mem->s_l, mem->rs_z);
++        rs_clear_row(mem->p_l, mem->rs_z);
++    }
++
+     return true;
+ }
+ 
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 4eb235e61ca..273f3e20917 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2854,22 +2854,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+ 
+     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+ 
+-    // keep the last state_cols columns for the next ubatch
++    // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
++    // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
+     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
++    const uint32_t mem_size = mctx_cur->get_size();
+ 
+-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+-            state_cols, channels, n_seqs,
+-            conv_input->nb[1], conv_input->nb[2],
+-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
++    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+ 
+-    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+-            state_cols * channels, n_seqs,
+-            conv_states_all->nb[1],
+-            kv_head * row_size);
++    for (int64_t slot = 0; slot < n_slots; ++slot) {
++        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+ 
+-    // [TAG_ZC_TRANCHE0] le CPY gère les src strides — le cont intermédiaire était une copie
+-    // purement redondante (une par couche GDN/PLE par token, ~2,4 Mo inutiles)
+-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
++        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
++                state_cols, channels, n_seqs,
++                conv_input->nb[1], conv_input->nb[2],
++                ggml_row_size(conv_input->type, s_idx));
++
++        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
++                state_cols * channels, n_seqs,
++                conv_states_all->nb[1],
++                (slot * mem_size + kv_head) * row_size);
++
++        // [TAG_ZC_TRANCHE0] le CPY gère les src strides — le cont intermédiaire était une copie
++        // purement redondante (une par couche GDN/PLE par token, ~2,4 Mo inutiles)
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
++    }
+ 
+     return conv_input;
+ }
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 7997d4016a6..6fe1cedc1db 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -82,6 +82,12 @@ json server_slot_stats::to_json() const {
+     if (n_draft_tokens > 0) {
+         base["draft_n"]          = n_draft_tokens;
+         base["draft_n_accepted"] = n_draft_accepted;
++        // [TAG_SPEC_REQ]
++        base["draft_n_steps"]      = n_draft_verif_steps;
++        base["draft_p_min"]        = draft_p_min_used;
++        base["draft_n_max"]        = draft_n_max_used;
++        base["draft_n_min"]        = draft_n_min_used;
++        base["draft_req_override"] = draft_req_override;
+     }
+ 
+     return base;
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index f8ea82ef4cf..caedabebd5d 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -353,6 +353,13 @@ struct server_slot_stats {
+     uint64_t n_draft_accepted    = 0;
+     uint64_t n_draft_verif_steps = 0;
+ 
++    // [TAG_SPEC_REQ] draft parameters effectively used by the last draft pass of this request
++    // (-1 = no draft-mtp pass yet), and whether any of them came from the request
++    float   draft_p_min_used   = -1.0f;
++    int32_t draft_n_max_used   = -1;
++    int32_t draft_n_min_used   = -1;
++    bool    draft_req_override = false;
++
+     // these are absolute timestamps (in us)
+     // note: must be signed - they are subtracted before the later ones are set
+     int64_t t_start       = 0;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 15e0f2294fc..8ee5390d0ef 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -651,6 +651,11 @@ struct server_slot {
+             SLT_INF(*this,
+                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
+                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
++            // [TAG_SPEC_REQ]
++            SLT_INF(*this,
++                    "    draft params = p_min %.3f, n_max %d, n_min %d (%s), verif steps = %d\n",
++                    stats.draft_p_min_used, stats.draft_n_max_used, stats.draft_n_min_used,
++                    stats.draft_req_override ? "request" : "boot", n_draft_verif_steps);
+             SLT_TRC(*this,
+                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+         }
+@@ -2239,6 +2244,24 @@ private:
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+         const int id_task = slot.task->id;
+ 
++        // the state at this position is already saved: keep that checkpoint instead of reading the state back again
++        // LLAMA_SERVER_CKPT_KEEP=0 restores the old behavior (A/B)
++        static const bool ckpt_keep = [] {
++            const char * e = getenv("LLAMA_SERVER_CKPT_KEEP");
++            return e == nullptr || atoi(e) != 0;
++        }();
++        if (ckpt_keep) {
++            const int64_t n_tokens_ckpt = slot.prompt.n_tokens() - n_tokens_cur;
++            for (auto & c : slot.prompt.checkpoints) {
++                if (c.n_tokens == n_tokens_ckpt && c.pos_min == pos_min && c.pos_max == pos_max) {
++                    c.id_task = id_task;
++                    SLT_TRC(slot, "kept existing context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
++                            c.pos_min, c.pos_max, c.n_tokens, (float) c.size() / 1024 / 1024);
++                    return;
++                }
++            }
++        }
++
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+         // created by the current task
+         int64_t last = -1;
+@@ -2927,6 +2950,10 @@ private:
+                             /* .dists    = */ &slot.spec_dists,
+                             /* .temperature = */ slot.task->params.sampling.temp,
+                             /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
++                            // [TAG_SPEC_REQ] per-request overrides (negative = boot values)
++                            /* .p_min     = */ slot.task->params.spec_req_p_min,
++                            /* .n_max_req = */ slot.task->params.spec_req_n_max,
++                            /* .n_min     = */ slot.task->params.spec_req_n_min,
+                         };
+ 
+                         drafting.push_back(&slot);
+@@ -2940,6 +2967,17 @@ private:
+             queue_tasks.yield_to_queue([&]() {
+                 common_speculative_draft(spec.get());
+             });
++
++            // [TAG_SPEC_REQ] record the draft parameters effectively used, for the timings
++            for (auto * pslot : drafting) {
++                const auto & dp = common_speculative_get_draft_params(spec.get(), pslot->id);
++                if (dp.n_max_used >= 0) {
++                    pslot->stats.draft_p_min_used   = dp.p_min_used;
++                    pslot->stats.draft_n_max_used   = dp.n_max_used;
++                    pslot->stats.draft_n_min_used   = dp.n_min_used;
++                    pslot->stats.draft_req_override = dp.p_min >= 0.0f || dp.n_max_req > 0 || dp.n_min >= 0;
++                }
++            }
+         }
+ 
+         // make checkpoints if needed
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 64b9251295c..09adb3b9611 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -194,7 +194,22 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     // Speculative decoding params
+     //
+ 
+-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
++    // [TAG_SPEC_REQ] per-request draft parameters (draft-mtp only). they are stored apart from
++    // params.speculative (which stays equal to the boot configuration) and are only applied when
++    // present in the request. n_max is clamped to the boot value when the draft is generated.
++    add((new field_num("speculative.n_max", params.spec_req_n_max))
++        ->set_hard_limits(1, INT32_MAX)
++        ->set_desc("Maximum number of tokens to draft for this request (clamped to the server --spec-draft-n-max)"));
++
++    add((new field_num("speculative.n_min", params.spec_req_n_min))
++        ->set_hard_limits(0, INT32_MAX)
++        ->set_desc("Minimum number of draft tokens to use for this request"));
++
++    add((new field_num("speculative.p_min", params.spec_req_p_min))
++        ->set_hard_limits(0.0f, 1.0f)
++        ->set_desc("Minimum probability for draft tokens for this request (0 = greedy)"));
++
++    // TODO: to keep things simple, we disable the other speculative parameter adjustments for now
+ #if 0
+     // TODO: for now, be able to adjust only the draft-model based speculative parameters
+     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 9c99143f8e1..b6607b1d49f 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -78,6 +78,12 @@ struct task_params {
+     struct common_params_sampling sampling;
+     struct common_params_speculative speculative;
+ 
++    // [TAG_SPEC_REQ] per-request draft overrides (negative = not provided, boot values are used)
++    // JSON fields: "speculative.p_min", "speculative.n_max", "speculative.n_min"
++    float   spec_req_p_min = -1.0f;
++    int32_t spec_req_n_max = -1;
++    int32_t spec_req_n_min = -1;
++
+     // response formatting
+     bool               verbose  = false;
+     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;
+-- 
+2.53.0
+

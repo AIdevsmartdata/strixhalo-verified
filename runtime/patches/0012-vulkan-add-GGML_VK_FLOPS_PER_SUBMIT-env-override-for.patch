@@ -1,0 +1,44 @@
+From 4b0afdcbbd779d864414e527e130c1065a59fc03 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Tue, 1 Sep 2026 13:31:25 +0200
+Subject: [PATCH 12/54] vulkan: add GGML_VK_FLOPS_PER_SUBMIT env override for
+ submit granularity
+
+Diagnostic knob for latency-bound decode on unified-memory iGPUs.
+Neutral by default (keeps the flops/40 heuristic).
+
+Measured on Strix Halo (gfx1151, 20 CU, Qwen3.8-Flash-Next 125B-A6B):
+  default                          31.72 t/s
+  FLOPS_PER_SUBMIT=0               31.41 t/s
+  FLOPS=0 + MAX_NODES=100000       27.64 t/s
+  MAX_NODES=100000                 31.10 t/s
+=> the default heuristic is optimal; submit count is NOT the decode bottleneck.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 49241140cfb..8097374ba50 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -17887,6 +17887,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     }
+     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+ 
++    // [TAG_SUBMIT_TUNE] override the submit granularity for latency-bound decode.
++    // GGML_VK_FLOPS_PER_SUBMIT=0 disables intra-graph flushes entirely (one submit per graph).
++    // Rationale: on unified-memory iGPUs the decode graph is latency-bound, not compute-bound;
++    // the default heuristic (total_flops/40) forces ~40 submits per token for no benefit.
++    {
++        static const char * e = getenv("GGML_VK_FLOPS_PER_SUBMIT");
++        if (e) {
++            flops_per_submit = strtoull(e, nullptr, 10);
++        }
++    }
++
+     auto const submit_after = [&](int start, int end) {
+         if (ctx->device->serialize_submissions) {
+             try {
+-- 
+2.53.0
+

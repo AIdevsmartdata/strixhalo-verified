@@ -1,0 +1,266 @@
+From 95487bcfb36b63ccbed67f06ae0322636f55b106 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sun, 6 Sep 2026 15:20:32 +0200
+Subject: [PATCH 33/54] prod: env-gated speculative checkpoint ON_DEVICE +
+ HC_NORM_DIRECT opt-in
+
+- LLAMA_SPEC_CHECKPOINT_ON_DEVICE=1 : checkpoint speculatif stocke sur GPU
+  (le seul transport qui rend MTP rentable en xhigh/agentic, +33% wall agentique
+  06/09, N3/P75, acceptance 0.87). OFF par defaut.
+- LLAMA_HC_NORM_DIRECT=1 : gate opt-in RMS norm direct hc_combine, OFF par defaut.
+- Source du binaire de prod build-router (sha a740d190) depuis 06/09.
+---
+ src/models/qwen4exp.cpp         |  21 +++++-
+ tests/test-bf16-f32-exact.cpp   | 114 ++++++++++++++++++++++++++++++++
+ tools/server/server-context.cpp |  31 +++++++--
+ 3 files changed, 157 insertions(+), 9 deletions(-)
+ create mode 100644 tests/test-bf16-f32-exact.cpp
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index f823b2fda4d..fce59092d19 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdlib>
+ #include <random>
+ 
+ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+@@ -323,9 +324,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+ 
+     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
+     // the converter folded each gamma to (1 + w)
+-    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+-    xn = ggml_mul(ctx0, xn, w_norm);
++    static const bool direct_norm = [] {
++        const char * value = std::getenv("LLAMA_HC_NORM_DIRECT");
++        return value && std::atoi(value) == 1;
++    }();
++    ggml_tensor * xn;
++    if (direct_norm && w_norm->type == GGML_TYPE_F32 && ggml_is_contiguous(w_norm)) {
++        // [TAG_HC_NORM_DIRECT] Keep RMS_NORM and MUL adjacent for backend fusion.
++        // Move only the reshape; each stream still has its own RMS and gamma.
++        ggml_tensor * gamma = ggml_reshape_3d(ctx0, w_norm, n_embd, hc, 1);
++        ggml_build_forward_expand(gf, gamma);
++        xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), gamma);
++        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
++    } else {
++        xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
++        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
++        xn = ggml_mul(ctx0, xn, w_norm);
++    }
+     cb(xn, "hc_norm", il);
+ 
+     // [TAG_HC_SCALE_FOLD] folded GGUF: w_norm porte le ×1/hc, donc xn est déjà scalé et
+diff --git a/tests/test-bf16-f32-exact.cpp b/tests/test-bf16-f32-exact.cpp
+new file mode 100644
+index 00000000000..41881212c28
+--- /dev/null
++++ b/tests/test-bf16-f32-exact.cpp
+@@ -0,0 +1,114 @@
++// [TAG_ROUTER_BF16_EXACT] Test op-level byte-exactness: BF16 weights (widened values)
++// vs F32 weights on the Vulkan backend, matvec (decode) and matmul (prefill) paths.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include <cstdio>
++#include <cstring>
++#include <cstdint>
++#include <random>
++#include <vector>
++
++struct Case { int k, m, n; };
++
++int main() {
++    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++    if (!dev) {
++        // Strix Halo: le Radeon 8060S est un iGPU (uma:1) -> classe IGPU, pas GPU.
++        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
++    }
++    if (!dev) {
++        // dernier recours: premier device non-CPU enregistre
++        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++            ggml_backend_dev_t d = ggml_backend_dev_get(i);
++            if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) { dev = d; break; }
++        }
++    }
++    if (!dev) { printf("NO_GPU_DEVICE\n"); return 1; }
++    printf("DEVICE=%s\n", ggml_backend_dev_name(dev));
++    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
++    if (!backend) { printf("BACKEND_INIT_FAIL\n"); return 1; }
++    printf("BACKEND=%s\n", ggml_backend_name(backend));
++
++    const std::vector<Case> cases = {
++        {2560, 512, 1},    // router decode (dmmv)
++        {2560, 512, 8},     // dmmv multi-col
++        {2560, 512, 512},  // prefill batch
++        {2560, 512, 2048}, // prefill full ubatch
++        {2561, 512, 1},    // odd k (dmmv OOB tail)
++        {2561, 512, 512},  // odd k matrix (unaligned)
++        {2559, 512, 3},    // n<4, k%4!=0 (dmmv scalar tail)
++        {2560, 513, 1},    // odd m (partial NUM_ROWS group)
++    };
++
++    ggml_init_params params = { ggml_tensor_overhead() * 64 + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(params);
++    if (!ctx) { printf("CTX_FAIL\n"); return 1; }
++
++    std::vector<ggml_tensor *> w_f32, w_bf16, xs, outs_f32, outs_bf16;
++    for (const Case & c : cases) {
++        ggml_tensor * wf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  c.k, c.m);
++        ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, c.k, c.m);
++        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  c.k, c.n);
++        outs_f32.push_back(ggml_mul_mat(ctx, wf, x));
++        outs_bf16.push_back(ggml_mul_mat(ctx, wb, x));
++        w_f32.push_back(wf); w_bf16.push_back(wb); xs.push_back(x);
++    }
++
++    ggml_backend_buffer * buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (!buf) { printf("ALLOC_FAIL\n"); return 1; }
++
++    std::mt19937 rng(424242);
++    for (size_t i = 0; i < cases.size(); ++i) {
++        const Case & c = cases[i];
++        // Weights: random bf16 bit patterns (no NaN/Inf exponents), widened exactly by shift.
++        std::vector<uint16_t> h(c.k * c.m);
++        for (auto & v : h) {
++            do { v = (uint16_t)(rng() & 0xffff); } while (((v >> 7) & 0xff) == 0xff);
++        }
++        std::vector<uint32_t> wf(c.k * c.m);
++        for (size_t j = 0; j < h.size(); ++j) wf[j] = ((uint32_t)h[j]) << 16;
++        std::vector<float> x(c.k * c.n);
++        for (auto & v : x) {
++            uint32_t u;
++            do { u = rng(); } while (((u >> 23) & 0xff) == 0xff);
++            memcpy(&v, &u, 4);
++        }
++        ggml_backend_tensor_set(w_f32[i], wf.data(), 0, wf.size() * 4);
++        ggml_backend_tensor_set(w_bf16[i], h.data(), 0, h.size() * 2);
++        ggml_backend_tensor_set(xs[i], x.data(), 0, x.size() * 4);
++    }
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    for (size_t i = 0; i < cases.size(); ++i) {
++        ggml_build_forward_expand(gf, outs_f32[i]);
++        ggml_build_forward_expand(gf, outs_bf16[i]);
++    }
++    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { printf("COMPUTE_FAIL\n"); return 1; }
++    ggml_backend_synchronize(backend);
++
++    int failures = 0;
++    for (size_t i = 0; i < cases.size(); ++i) {
++        const Case & c = cases[i];
++        std::vector<float> a(c.m * c.n), b(c.m * c.n);
++        ggml_backend_tensor_get(outs_f32[i], a.data(), 0, a.size() * 4);
++        ggml_backend_tensor_get(outs_bf16[i], b.data(), 0, b.size() * 4);
++        size_t diff = SIZE_MAX;
++        for (size_t j = 0; j < a.size(); ++j) {
++            uint32_t ua, ub; memcpy(&ua, &a[j], 4); memcpy(&ub, &b[j], 4);
++            if (ua != ub) { diff = j; break; }
++        }
++        if (diff == SIZE_MAX) {
++            printf("CASE_PASS k=%d m=%d n=%d\n", c.k, c.m, c.n);
++        } else {
++            uint32_t ua, ub; memcpy(&ua, &a[diff], 4); memcpy(&ub, &b[diff], 4);
++            printf("CASE_FAIL k=%d m=%d n=%d idx=%zu f32=%08x bf16=%08x\n", c.k, c.m, c.n, diff, ua, ub);
++            ++failures;
++        }
++    }
++    printf(failures ? "ROUTER_BF16_EXACT_KO (%d)\n" : "ROUTER_BF16_EXACT_PASS\n", failures);
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++    ggml_backend_free(backend);
++    return failures ? 1 : 0;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 10f48af44e4..fb0be21ba7f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -20,6 +20,7 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cinttypes>
++#include <cstdlib>
+ #include <exception>
+ #include <memory>
+ #include <filesystem>
+@@ -37,6 +38,24 @@
+ 
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
++// [TAG_SPEC_CHECKPOINT_ON_DEVICE] Experimental, default-off transport switch.
++// Only the single live speculative checkpoint uses device storage. Historical
++// prompt checkpoints must remain host-backed: device storage is per sequence,
++// not per checkpoint. Keep save/restore flags identical for the whole process.
++// Reference: https://github.com/JayToltTech/llama.cpp/pull/1
++static llama_state_seq_flags speculative_checkpoint_flags() {
++    static const llama_state_seq_flags flags = []() -> llama_state_seq_flags {
++        const char * value = std::getenv("LLAMA_SPEC_CHECKPOINT_ON_DEVICE");
++        const bool on_device = value && value[0] == '1' && value[1] == '\0';
++        const llama_state_seq_flags result = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
++                (on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : 0);
++        LOG_INF("speculative checkpoint transport: ON_DEVICE=%d (flags=%u)\n",
++                int(on_device), unsigned(result));
++        return result;
++    }();
++    return flags;
++}
++
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (params.embedding ||
+             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+@@ -2873,7 +2892,7 @@ private:
+                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+ 
+                         if (use_ckpt_dft) {
+-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, speculative_checkpoint_flags());
+                         }
+ 
+                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+@@ -2915,7 +2934,7 @@ private:
+ 
+             if (ctx_dft) {
+                 if (use_ckpt_dft) {
+-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    ckpt.load_dft(ctx_dft, slot.id, speculative_checkpoint_flags());
+                 }
+ 
+                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+@@ -2934,7 +2953,7 @@ private:
+                 if (use_ckpt_tgt) {
+                     //const int64_t t_start = ggml_time_us();
+ 
+-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    ckpt.update_tgt(ctx_tgt, slot.id, speculative_checkpoint_flags());
+ 
+                     //const int64_t t_total = ggml_time_us() - t_start;
+                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+@@ -2946,7 +2965,7 @@ private:
+                 }
+ 
+                 if (use_ckpt_dft) {
+-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    ckpt.update_dft(ctx_dft, slot.id, speculative_checkpoint_flags());
+                 }
+             }
+         });
+@@ -3809,10 +3828,10 @@ private:
+ 
+                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+ 
+-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                        ckpt.load_tgt(slot.ctx_tgt, slot.id, speculative_checkpoint_flags());
+ 
+                         if (slot.ctx_dft) {
+-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                            ckpt.load_dft(slot.ctx_dft, slot.id, speculative_checkpoint_flags());
+                         }
+ 
+                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+-- 
+2.53.0
+

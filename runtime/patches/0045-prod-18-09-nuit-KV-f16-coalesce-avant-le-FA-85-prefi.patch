@@ -1,0 +1,2663 @@
+From f7ebbf8e550b55a7667e8984ea56c30838b0dcf9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 19 Sep 2026 01:32:36 +0200
+Subject: [PATCH 45/54] prod 18/09 nuit : KV f16 coalesce avant le FA (+85%
+ prefill) + etat deploye
+
+[TAG_FA_F16_CONTIG] Le cache KV f16 est stocke entrelace par token ([HS, NH, KV] :
+nb[1] = HS*NH*2), donc le noeud FA saute 1 Ko par position KV la ou il n'utilise que
+HS*2 octets -> 4x de lignes de cache pour rien. La taxe mesuree sur l'UMA de Strix Halo
+(PR amont #25494) est de 3,2x en bande passante, d'ou le -36% de prefill du KV f16.
+
+- nouveau shader fa_kv_contig_f16.comp : copie pure [HS,NH,KV] -> [HS,KV,NH] (grid-stride)
+- pipeline fa_kv_contig_f16 + reutilisation du scratch prealloc_x du chemin q8_0
+- is_dense_kv_view() remplace is_dense_kv_cache() : ce dernier exige nb[3] == nb[1]*ne[1],
+  faux pour une vue du cache prealloue (ne[3]==1 -> le stride nb[3] n'est jamais indexe).
+  C'est aussi pourquoi le chemin q8_0 dequant_transpose ne s'activait jamais.
+- gate GGML_VK_FA_KV_CONTIG=1, prefill seulement (neq1 >= 64)
+
+Mesure 64k, 3 bras encadres, meme binaire : 244,0 / 449,8 / 244,3 tok/s (derive 0,1%),
+SHA bit-a-bit identique. Prod : 452,7 tok/s, RETR 14k 4/4, zebra 2/2, pi+read PASS.
+
+Egalement dans cet etat de prod : D1/D2 GET_ROWS_RAW, D4 (tete MTP tronquee),
+QSA compresse (cles de bloc), D3, D9 (DPM high), KV f16 tronc / q8_0 draft, -b/-ub 16384,
+fix TOP_K radix (NHIST/UNROLL), debug perf-logger, softmax_rows=1 du q8_1.
+---
+ ggml/include/ggml.h                           |  11 +
+ ggml/src/ggml-cpu/ggml-cpu.c                  |   5 +
+ ggml/src/ggml-cpu/ops.cpp                     |  46 ++
+ ggml/src/ggml-cpu/ops.h                       |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 429 ++++++++++++++--
+ .../vulkan-shaders/fa_kv_contig_f16.comp      |  44 ++
+ .../vulkan-shaders/mul_mat_vec_base.glsl      |  17 +-
+ .../vulkan-shaders/mul_mat_vec_iface.glsl     |   3 +
+ .../vulkan-shaders/topk_radix.comp            |  68 ++-
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  12 +
+ ggml/src/ggml.c                               |  32 +-
+ src/llama-memory-hybrid-idx.cpp               | 300 +++++++++++-
+ src/llama-memory-hybrid-idx.h                 |  19 +-
+ src/models/qwen4exp.cpp                       | 462 ++++++++++++++++--
+ tests/test-backend-ops.cpp                    | 313 ++++++++++++
+ 15 files changed, 1662 insertions(+), 100 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/fa_kv_contig_f16.comp
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index d3819c7b54f..2d5c0abcc5c 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -542,6 +542,7 @@ extern "C" {
+         GGML_OP_PERMUTE,
+         GGML_OP_TRANSPOSE,
+         GGML_OP_GET_ROWS,
++        GGML_OP_GET_ROWS_RAW,
+         GGML_OP_GET_ROWS_BACK,
+         GGML_OP_SET_ROWS,
+         GGML_OP_DIAG,
+@@ -1692,6 +1693,16 @@ extern "C" {
+             struct ggml_tensor  * a,  // data
+             struct ggml_tensor  * b); // row indices
+ 
++    // gather brut : la ligne source est recopiee telle quelle (aucune arithmetique), donc le type de
++    // la sortie est celui de la source. Sert a garder un KV quantifie (q8_0) tel quel jusqu'au flash
++    // attention au lieu de le dequantizer en F32 puis de le caster en F16 : 8x moins d'octets ecrits
++    // et 2 noyaux en moins par tenseur. Requiert des lignes contigues et une largeur de ligne multiple
++    // de 2 octets ; les backends peuvent ne supporter qu'une partie des types sources.
++    GGML_API struct ggml_tensor * ggml_get_rows_raw(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,  // data
++            struct ggml_tensor  * b); // row indices
++
+     GGML_API struct ggml_tensor * ggml_get_rows_back(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 808c70596be..3e8dd47920a 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2065,6 +2065,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_get_rows(params, tensor);
+             } break;
++        case GGML_OP_GET_ROWS_RAW:
++            {
++                ggml_compute_forward_get_rows_raw(params, tensor);
++            } break;
+         case GGML_OP_GET_ROWS_BACK:
+             {
+                 ggml_compute_forward_get_rows_back(params, tensor);
+@@ -2534,6 +2538,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+                 n_tasks = n_threads;
+             } break;
+         case GGML_OP_GET_ROWS:
++        case GGML_OP_GET_ROWS_RAW:
+         case GGML_OP_SET_ROWS:
+             {
+                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index df3aaf6bec7..708ca6d9063 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -5040,6 +5040,52 @@ static void ggml_compute_forward_get_rows_f32(
+     }
+ }
+ 
++// gather brut : la ligne source est recopiee telle quelle (bloc a bloc), sans aucune arithmetique.
++// C'est la reference du chemin quantifie conserve (q8_0 -> q8_0) : les blocs copies sont
++// bit-identiques a la source, il n'y a donc rien a arrondir.
++void ggml_compute_forward_get_rows_raw(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++
++    GGML_TENSOR_BINARY_OP_LOCALS
++
++    assert(ne0  == ne00);
++    assert(ne02 == ne11);
++    assert(src0->type == dst->type);
++    assert(src0->nb[0] == ggml_type_size(src0->type));
++    assert(nb0  == ggml_type_size(dst->type));
++
++    const size_t row_size = ggml_row_size(src0->type, ne00);
++    const int64_t nr = ggml_nelements(src1);
++    assert(ggml_nrows(dst) == nr);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    // rows per thread
++    const int dr = (nr + nth - 1)/nth;
++
++    // row range for this thread
++    const int ir0 = dr*ith;
++    const int ir1 = MIN(ir0 + dr, nr);
++
++    for (int64_t i = ir0; i < ir1; ++i) {
++        const int64_t i12 = i/(ne11*ne10);
++        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
++        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
++        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
++
++        GGML_ASSERT(i01 >= 0 && i01 < ne01);
++
++        memcpy((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3,
++               (char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03,
++               row_size);
++    }
++}
++
+ void ggml_compute_forward_get_rows(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 4c1642a6760..c2cef631a10 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -54,6 +54,7 @@ void ggml_compute_forward_set(const struct ggml_compute_params * params, struct
+ void ggml_compute_forward_cpy(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_cont(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_get_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_get_rows_raw(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_get_rows_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_set_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_diag(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 8fcb51ce0c2..93f5e77d141 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -942,17 +942,24 @@ struct vk_device_struct {
+ 
+     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
++    vk_pipeline pipeline_fa_kv_contig_f16;                     // [TAG_FA_F16_CONTIG] copie+transpose du KV f16 (prefill)
+     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_max];
+     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_max];
+     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+ 
+     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols_max];
++    // [TAG_HC_MATVEC_B1] NUM_ROWS (constante de specialisation #1) effectivement utilisee par type :
++    // 0 = valeur par defaut du fork (rm_iq pour f32, 2*rm_stdq_int pour q8_1) => grille inchangee.
++    uint32_t dmmv_num_rows[GGML_TYPE_COUNT] = {};
+     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+ 
+     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
+     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
+     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
++    // [TAG_QSA_RAW_GATHER] gather brut : copies indexees sans arithmetique (le type de sortie est
++    // celui de la source). Indexe par la source ; deux variantes de largeur de mot (4 et 2 octets).
++    vk_pipeline pipeline_get_rows_raw[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_get_rows_back_f32;
+     vk_pipeline pipeline_acc_f32;
+     vk_pipeline pipeline_set_f32;
+@@ -1325,6 +1332,11 @@ struct vk_mat_mat_push_constants {
+ #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
+ #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
+ #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
++// [TAG_HC_SILU_EPILOGUE] cf. mul_mat_vec_iface.glsl
++#define MAT_VEC_FUSION_FLAGS_SILU 0x10
++
++// [TAG_HC_SILU_EPILOGUE] definie plus bas, pres de ggml_vk_can_fuse (utilisee par le DMMV)
++static bool ggml_vk_fuse_mmv_silu_enabled();
+ 
+ struct vk_mat_vec_push_constants {
+     uint32_t ncols;
+@@ -4630,6 +4642,25 @@ static uint32_t dmmv_splitk_wg_factor(const vk_device & device) {
+ 
+ // [TAG_DMMV_SPLITK_AMD] env GGML_VK_DMMV_SPLITK_AMD = max_m gate for split-k (wide WG) matvecs on AMD
+ // (0 or absent = off, N = apply when num_cols==1 && m <= N && k >= 2048).
++
++// [TAG_HC_MATVEC_SPLITK_COLS] env GGML_VK_DMMV_SPLITK_AMD_COLS = max num_cols for the SPLITK path.
++// Default 1 = stock behavior (SPLITK never used for multi-token/multi-column matvecs).
++// N>1 lets the narrow-output matvecs of the HC machinery (m=320 k=10240, n=2..4) use the
++// 8-subgroup workgroup: parallelism per workgroup x8, serial k iterations /8.
++// Pourquoi c'est sur: les pipelines SPLITK sont deja crees pour tous les num_cols
++// (boucle ggml_vk_load_shaders : [DMMV_WG_SIZE_COUNT][type][mul_mat_vec_max_cols]) et le shader
++// (reduce_result / tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE]) est generique en NUM_COLS ; seule la
++// selection les ecartait. NON byte-exact : la somme inter-sous-groupes est un ordre different.
++static uint32_t dmmv_splitk_amd_cols() {
++    static const uint32_t v = [] {
++        const char * e = getenv("GGML_VK_DMMV_SPLITK_AMD_COLS");
++        int n = e ? atoi(e) : 1;
++        if (n < 1)  n = 1;
++        if (n > (int) mul_mat_vec_max_cols) n = (int) mul_mat_vec_max_cols;
++        return (uint32_t) n;
++    }();
++    return v;
++}
+ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+ 
+@@ -5908,6 +5939,34 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         rm_stdq_int = 2;
+     }
+     uint32_t rm_iq = 2 * rm_kq;
++    // [TAG_HC_MATVEC_B1] GGML_VK_DMMV_NUM_ROWS=<1..8> : surcharge NUM_ROWS pour la famille
++    // ROCmFP4/ROCMFPX uniquement. Byte-exact : l'ordre d'accumulation d'une ligne de sortie ne
++    // depend pas de NUM_ROWS (seul le nombre de lignes traitees par workgroup change).
++    // Absent/0 = comportement actuel inchange (rm_iq / 2*rm_stdq_int).
++    const int32_t dmmv_rows_ov = [] {
++        const char * e = getenv("GGML_VK_DMMV_NUM_ROWS");
++        return e ? atoi(e) : 0;
++    }();
++    auto rows_iq = [&](ggml_type t, uint32_t def) -> uint32_t {
++        uint32_t v = def;
++        switch (t) {
++            case GGML_TYPE_Q4_0_ROCMFP4:
++            case GGML_TYPE_Q4_0_ROCMFP4_FAST:
++            case GGML_TYPE_Q3_0_ROCMFPX:
++            case GGML_TYPE_Q6_0_ROCMFPX:
++            case GGML_TYPE_Q8_0_ROCMFPX:
++                if (dmmv_rows_ov >= 1 && dmmv_rows_ov <= 8) {
++                    v = (uint32_t) dmmv_rows_ov;
++                    // 0 reste = "pas de surcharge" : la grille de dispatch garde groups_x = ne01
++                    // (comportement historique exact) et les pipelines gardent leurs valeurs par defaut.
++                    device->dmmv_num_rows[t] = v;
++                }
++                break;
++            default:
++                break;
++        }
++        return v;
++    };
+ 
+     // GGML_VK_MMVQ_ROWS: output rows per workgroup in the vec-id matvec (2/4/8).
+     // Larger amortizes the B_Q8_1 re-read across more rows + more loads in flight.
+@@ -5987,11 +6046,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ3_S][i],   "mul_mat_vec_iq3_s_f32_f32",   arr_dmmv_iq3_s_f32_f32_len[reduc16],   arr_dmmv_iq3_s_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ4_XS][i],  "mul_mat_vec_iq4_xs_f32_f32",  arr_dmmv_iq4_xs_f32_f32_len[reduc16],  arr_dmmv_iq4_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f32_f32",  arr_dmmv_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i],  "mul_mat_vec_rocmfp4_f32_f32",  arr_dmmv_rocmfp4_f32_f32_len[reduc16],  arr_dmmv_rocmfp4_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i],  "mul_mat_vec_rocmfp4_fast_f32_f32",  arr_dmmv_rocmfp4_fast_f32_f32_len[reduc16],  arr_dmmv_rocmfp4_fast_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp3_f32_f32",  arr_dmmv_rocmfpx_fp3_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp3_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q6_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp6_f32_f32",  arr_dmmv_rocmfpx_fp6_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp6_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp8_f32_f32",  arr_dmmv_rocmfpx_fp8_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp8_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i],  "mul_mat_vec_rocmfp4_f32_f32",  arr_dmmv_rocmfp4_f32_f32_len[reduc16],  arr_dmmv_rocmfp4_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q4_0_ROCMFP4, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i],  "mul_mat_vec_rocmfp4_fast_f32_f32",  arr_dmmv_rocmfp4_fast_f32_f32_len[reduc16],  arr_dmmv_rocmfp4_fast_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp3_f32_f32",  arr_dmmv_rocmfpx_fp3_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp3_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q3_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q3_0_ROCMFPX, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q6_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp6_f32_f32",  arr_dmmv_rocmfpx_fp6_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp6_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q6_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q6_0_ROCMFPX, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp8_f32_f32",  arr_dmmv_rocmfpx_fp8_f32_f32_len[reduc16],  arr_dmmv_rocmfpx_fp8_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q8_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q8_0_ROCMFPX, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f32_f32",   OCP_DMMV_LEN(arr_dmmv_mxfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_mxfp4_f32_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f32_f32",   OCP_DMMV_LEN(arr_dmmv_nvfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_nvfp4_f32_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+ 
+@@ -6020,11 +6079,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ3_S][i],   "mul_mat_vec_iq3_s_f16_f32",   arr_dmmv_iq3_s_f16_f32_len[reduc16],   arr_dmmv_iq3_s_f16_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ4_XS][i],  "mul_mat_vec_iq4_xs_f16_f32",  arr_dmmv_iq4_xs_f16_f32_len[reduc16],  arr_dmmv_iq4_xs_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f16_f32",  arr_dmmv_iq4_nl_f16_f32_len[reduc16],  arr_dmmv_iq4_nl_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i],  "mul_mat_vec_rocmfp4_f16_f32",  arr_dmmv_rocmfp4_f16_f32_len[reduc16],  arr_dmmv_rocmfp4_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i],  "mul_mat_vec_rocmfp4_fast_f16_f32",  arr_dmmv_rocmfp4_fast_f16_f32_len[reduc16],  arr_dmmv_rocmfp4_fast_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q3_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp3_f16_f32",  arr_dmmv_rocmfpx_fp3_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp3_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q6_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp6_f16_f32",  arr_dmmv_rocmfpx_fp6_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp6_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp8_f16_f32",  arr_dmmv_rocmfpx_fp8_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp8_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i],  "mul_mat_vec_rocmfp4_f16_f32",  arr_dmmv_rocmfp4_f16_f32_len[reduc16],  arr_dmmv_rocmfp4_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q4_0_ROCMFP4, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i],  "mul_mat_vec_rocmfp4_fast_f16_f32",  arr_dmmv_rocmfp4_fast_f16_f32_len[reduc16],  arr_dmmv_rocmfp4_fast_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q3_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp3_f16_f32",  arr_dmmv_rocmfpx_fp3_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp3_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q3_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q3_0_ROCMFPX, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q6_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp6_f16_f32",  arr_dmmv_rocmfpx_fp6_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp6_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q6_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q6_0_ROCMFPX, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i],  "mul_mat_vec_rocmfpx_fp8_f16_f32",  arr_dmmv_rocmfpx_fp8_f16_f32_len[reduc16],  arr_dmmv_rocmfpx_fp8_f16_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q8_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q8_0_ROCMFPX, rm_iq), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f16_f32",   OCP_DMMV_LEN(arr_dmmv_mxfp4_f16_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_mxfp4_f16_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f16_f32",   OCP_DMMV_LEN(arr_dmmv_nvfp4_f16_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_nvfp4_f16_f32, reduc16), "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+ 
+@@ -6042,13 +6101,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_MXFP4][i], "mul_mat_vec_mxfp4_q8_1_f32", arr_dmmv_mxfp4_q8_1_f32_len[reduc], arr_dmmv_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 if (device->coalesced_loads) {
+-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i], "mul_mat_vec_rocmfp4_q8_1_f32_coalesced", arr_dmmv_rocmfp4_q8_1_f32_coalesced_len[reduc], arr_dmmv_rocmfp4_q8_1_f32_coalesced_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i], "mul_mat_vec_rocmfp4_fast_q8_1_f32_coalesced", arr_dmmv_rocmfp4_fast_q8_1_f32_coalesced_len[reduc], arr_dmmv_rocmfp4_fast_q8_1_f32_coalesced_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i], "mul_mat_vec_rocmfp4_q8_1_f32_coalesced", arr_dmmv_rocmfp4_q8_1_f32_coalesced_len[reduc], arr_dmmv_rocmfp4_q8_1_f32_coalesced_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4, 2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rows_iq(GGML_TYPE_Q4_0_ROCMFP4, 2*rm_stdq_int), i+1}, 1, true, use_subgroups, subgroup_size_int);
++                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i], "mul_mat_vec_rocmfp4_fast_q8_1_f32_coalesced", arr_dmmv_rocmfp4_fast_q8_1_f32_coalesced_len[reduc], arr_dmmv_rocmfp4_fast_q8_1_f32_coalesced_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, 2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, 2*rm_stdq_int), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 } else {
+-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i], "mul_mat_vec_rocmfp4_q8_1_f32", arr_dmmv_rocmfp4_q8_1_f32_len[reduc], arr_dmmv_rocmfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i], "mul_mat_vec_rocmfp4_fast_q8_1_f32", arr_dmmv_rocmfp4_fast_q8_1_f32_len[reduc], arr_dmmv_rocmfp4_fast_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i], "mul_mat_vec_rocmfp4_q8_1_f32", arr_dmmv_rocmfp4_q8_1_f32_len[reduc], arr_dmmv_rocmfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4, 2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rows_iq(GGML_TYPE_Q4_0_ROCMFP4, 2*rm_stdq_int), i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i], "mul_mat_vec_rocmfp4_fast_q8_1_f32", arr_dmmv_rocmfp4_fast_q8_1_f32_len[reduc], arr_dmmv_rocmfp4_fast_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, 2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, 2*rm_stdq_int), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 }
+-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i], "mul_mat_vec_rocmfpx_fp8_q8_1_f32", arr_dmmv_rocmfpx_fp8_q8_1_f32_len[reduc], arr_dmmv_rocmfpx_fp8_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i], "mul_mat_vec_rocmfpx_fp8_q8_1_f32", arr_dmmv_rocmfpx_fp8_q8_1_f32_len[reduc], arr_dmmv_rocmfpx_fp8_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows_iq(GGML_TYPE_Q8_0_ROCMFPX, 2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rows_iq(GGML_TYPE_Q8_0_ROCMFPX, 2*rm_stdq_int), i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+@@ -6088,11 +6147,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ3_S],   "mul_mat_vec_id_iq3_s_f32",   arr_dmmv_id_iq3_s_f32_f32_len[reduc16],   arr_dmmv_id_iq3_s_f32_f32_data[reduc16],   "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_XS],  "mul_mat_vec_id_iq4_xs_f32",  arr_dmmv_id_iq4_xs_f32_f32_len[reduc16],  arr_dmmv_id_iq4_xs_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_IQ4_NL],  "mul_mat_vec_id_iq4_nl_f32",  arr_dmmv_id_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_id_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0_ROCMFP4],  "mul_mat_vec_id_rocmfp4_f32",  arr_dmmv_id_rocmfp4_f32_f32_len[reduc16],  arr_dmmv_id_rocmfp4_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST],  "mul_mat_vec_id_rocmfp4_fast_f32",  arr_dmmv_id_rocmfp4_fast_f32_f32_len[reduc16],  arr_dmmv_id_rocmfp4_fast_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q3_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp3_f32",  arr_dmmv_id_rocmfpx_fp3_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp3_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q6_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp6_f32",  arr_dmmv_id_rocmfpx_fp6_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp6_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q8_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp8_f32",  arr_dmmv_id_rocmfpx_fp8_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp8_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0_ROCMFP4],  "mul_mat_vec_id_rocmfp4_f32",  arr_dmmv_id_rocmfp4_f32_f32_len[reduc16],  arr_dmmv_id_rocmfp4_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q4_0_ROCMFP4, rm_iq)}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST],  "mul_mat_vec_id_rocmfp4_fast_f32",  arr_dmmv_id_rocmfp4_fast_f32_f32_len[reduc16],  arr_dmmv_id_rocmfp4_fast_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q4_0_ROCMFP4_FAST, rm_iq)}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q3_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp3_f32",  arr_dmmv_id_rocmfpx_fp3_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp3_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rows_iq(GGML_TYPE_Q3_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q3_0_ROCMFPX, rm_iq)}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q6_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp6_f32",  arr_dmmv_id_rocmfpx_fp6_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp6_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rows_iq(GGML_TYPE_Q6_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q6_0_ROCMFPX, rm_iq)}, 1, true, use_subgroups16, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q8_0_ROCMFPX],  "mul_mat_vec_id_rocmfpx_fp8_f32",  arr_dmmv_id_rocmfpx_fp8_f32_f32_len[reduc16],  arr_dmmv_id_rocmfpx_fp8_f32_f32_data[reduc16],  "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rows_iq(GGML_TYPE_Q8_0_ROCMFPX, rm_iq), 1, 1}, {wg_size_subgroup16, rows_iq(GGML_TYPE_Q8_0_ROCMFPX, rm_iq)}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_MXFP4],   "mul_mat_vec_id_mxfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_mxfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_mxfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_NVFP4],   "mul_mat_vec_id_nvfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_nvfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_nvfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
+ 
+@@ -6116,7 +6175,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4], "mul_mat_vec_id_rocmfp4_q8_1_f32", arr_dmmv_id_rocmfp4_q8_1_f32_len[reduc], arr_dmmv_id_rocmfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {mmvq_rows, 1, 1}, {wg_size_subgroup_int, mmvq_rows}, 1, true, use_subgroups, subgroup_size_int);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST], "mul_mat_vec_id_rocmfp4_fast_q8_1_f32", arr_dmmv_id_rocmfp4_fast_q8_1_f32_len[reduc], arr_dmmv_id_rocmfp4_fast_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {mmvq_rows, 1, 1}, {wg_size_subgroup_int, mmvq_rows}, 1, true, use_subgroups, subgroup_size_int);
+             }
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q8_0_ROCMFPX], "mul_mat_vec_id_rocmfpx_fp8_q8_1_f32", arr_dmmv_id_rocmfpx_fp8_q8_1_f32_len[reduc], arr_dmmv_id_rocmfpx_fp8_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q8_0_ROCMFPX], "mul_mat_vec_id_rocmfpx_fp8_q8_1_f32", arr_dmmv_id_rocmfpx_fp8_q8_1_f32_len[reduc], arr_dmmv_id_rocmfpx_fp8_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rows_iq(GGML_TYPE_Q8_0_ROCMFPX, 2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rows_iq(GGML_TYPE_Q8_0_ROCMFPX, 2*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_K], "mul_mat_vec_id_q2_k_q8_1_f32", arr_dmmv_id_q2_k_q8_1_f32_len[reduc], arr_dmmv_id_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q3_K], "mul_mat_vec_id_q3_k_q8_1_f32", arr_dmmv_id_q3_k_q8_1_f32_len[reduc], arr_dmmv_id_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
+@@ -6149,6 +6208,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q5_1], "dequant_q5_1", dequant_q5_1_len, dequant_q5_1_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0], "dequant_q8_0", dequant_q8_0_len, dequant_q8_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q8_0], "dequant_q8_0_transpose", dequant_q8_0_transpose_len, dequant_q8_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_fa_kv_contig_f16, "fa_kv_contig_f16", fa_kv_contig_f16_len, fa_kv_contig_f16_data, "main", 2, 5 * sizeof(uint32_t), {256, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q2_K], "dequant_q2_k", dequant_q2_k_len, dequant_q2_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ2_0], "dequant_tq2_0", dequant_tq2_0_len, dequant_tq2_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q3_K], "dequant_q3_k", dequant_q3_k_len, dequant_q3_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
+@@ -6207,6 +6267,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_NVFP4],   "get_rows_nvfp4",   get_rows_nvfp4_len,   get_rows_nvfp4_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_I32],     "get_rows_i32",     get_rows_i32_len,     get_rows_i32_data,     "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+ 
++    // [TAG_QSA_RAW_GATHER] gather brut : get_rows.comp est deja parametrable A_TYPE/D_TYPE ; avec
++    // A_TYPE == D_TYPE il devient une simple copie indexee de la ligne (aucune dequantisation).
++    // Le mot copie fait 4 octets (uint) pour les sources quantifiees, 2 octets (float16_t) pour une
++    // source F16 de faible largeur (masque du QSA). wg_denoms = taille du workgroup (512) et non
++    // 1024 comme les pipelines ci-dessus (qui font 2 elements par thread) : sinon la couverture de la
++    // ligne est tronquee au-dela de 512 mots (cf. ggml_vk_dispatch_pipeline).
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows_raw[GGML_TYPE_Q8_0], "get_rows_raw_32", get_rows_raw_32_len, get_rows_raw_32_data, "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_get_rows_raw[GGML_TYPE_F16 ], "get_rows_raw_16", get_rows_raw_16_len, get_rows_raw_16_data, "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
++
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_F32 ], "get_rows_f32_f32",  get_rows_f32_f32_len,  get_rows_f32_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_F16 ], "get_rows_f16_f32",  get_rows_f16_f32_len,  get_rows_f16_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_BF16], "get_rows_bf16_f32", get_rows_bf16_f32_len, get_rows_bf16_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
+@@ -6572,7 +6641,27 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     }
+     {
+         const uint32_t RADIX_WG = std::min<uint32_t>(1024, 1u << device->max_workgroup_size_log2);
+-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_f32_len, topk_radix_f32_data, "main", 2, sizeof(vk_op_topk_push_constants), {RADIX_WG, 1, 1}, {RADIX_WG}, 1, true);
++        // [TAG_TOPK_RADIX_BANKS] nombre d'histogrammes partiels du noyau top_k radix.
++        // Defaut 1 = comportement d'origine (un seul histogramme, ~1000 conflits/bac).
++        // La somme etant faite avant la marche des bacs, le RESULTAT est bit-identique
++        // quelle que soit la valeur : c'est une pure optimisation d'occupation.
++        uint32_t topk_nhist = 1;
++        uint32_t topk_unroll = 1;
++        if (const char * env_unroll = getenv("GGML_VK_TOPK_UNROLL")) {
++            const int v = atoi(env_unroll);
++            if (v >= 1 && v <= 16) {
++                topk_unroll = (uint32_t) v;
++            }
++            GGML_LOG_INFO("ggml_vulkan: GGML_VK_TOPK_UNROLL=%d (deroulement de la boucle de comptage)\n", v);
++        }
++        if (const char * env_nhist = getenv("GGML_VK_TOPK_NHIST")) {
++            const int v = atoi(env_nhist);
++            if (v > 0 && v <= 32) {
++                topk_nhist = (uint32_t) v;
++            }
++            GGML_LOG_INFO("ggml_vulkan: GGML_VK_TOPK_NHIST=%d (%u banques d'histogrammes, top_k radix)\n", v, topk_nhist);
++        }
++        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_f32_len, topk_radix_f32_data, "main", 2, sizeof(vk_op_topk_push_constants), {RADIX_WG, 1, 1}, {RADIX_WG, topk_nhist, topk_unroll}, 1, true);
+     }
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+@@ -8742,7 +8831,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         // [TAG_DMMV_SPLITK_AMD] wide-WG split-k for n=1 matvecs: small m / large k.
+         // More lanes in flight per output row, fewer serial k iterations.
+         // Strict num_cols==1 protects prefill; k >= 2048 keeps tiny-k shapes on LARGE/SUBGROUP.
+-        dmmv_splitk_amd_max_m() > 0 && ctx->device->vendor_id == VK_VENDOR_ID_AMD && num_cols == 1 &&
++        dmmv_splitk_amd_max_m() > 0 && ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
++        num_cols <= dmmv_splitk_amd_cols() &&
+         m <= (uint32_t) dmmv_splitk_amd_max_m() && k >= 2048) {
+         dmmv_wg = DMMV_WG_SIZE_SPLITK;
+     } else if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL
+@@ -10737,10 +10827,14 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+ 
+     const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+ 
+-    uint32_t groups_x = ne01;
++    // [TAG_HC_MATVEC_B1] la grille x est en unites de NUM_ROWS (le shader calcule
++    // first_row = NUM_ROWS * (WGID.x + NumWorkGroups.x * WGID.z)). Surcharge absente =>
++    // groups_x = ne01 exactement comme avant (les WG en trop sortent immediatement).
++    const uint32_t dmmv_rows = ctx->device->dmmv_num_rows[src0->type];
++    uint32_t groups_x = dmmv_rows > 0 ? (uint32_t) CEIL_DIV(ne01, dmmv_rows) : ne01;
+     uint32_t groups_z = 1;
+ 
+-    if (ne01 > max_groups_x) {
++    if (groups_x > max_groups_x) {
+         groups_z = 64;
+         groups_x = CEIL_DIV(groups_x, groups_z);
+     }
+@@ -10748,7 +10842,14 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     uint32_t fusion_flags = 0;
+ 
+     vk_subbuffer d_F0 = d_D;
+-    if (ctx->num_additional_fused_ops > 0) {
++    if (ctx->num_additional_fused_ops > 0 && cgraph->nodes[node_idx + 1]->op == GGML_OP_UNARY) {
++        // [TAG_HC_SILU_EPILOGUE] pas de buffer supplementaire : la SILU est appliquee sur
++        // l'accumulateur f32 du matvec par l'epilogue (mv_silu). Le noeud UNARY est elide.
++        GGML_ASSERT(ggml_vk_fuse_mmv_silu_enabled());
++        GGML_ASSERT(ggml_get_unary_op(cgraph->nodes[node_idx + 1]) == GGML_UNARY_OP_SILU);
++        GGML_ASSERT(dst->type == GGML_TYPE_F32);
++        fusion_flags |= MAT_VEC_FUSION_FLAGS_SILU;
++    } else if (ctx->num_additional_fused_ops > 0) {
+         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
+ 
+@@ -11661,10 +11762,14 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
+ 
+     const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+ 
+-    uint32_t groups_x = ne01;
++    // [TAG_HC_MATVEC_B1] la grille x est en unites de NUM_ROWS (le shader calcule
++    // first_row = NUM_ROWS * (WGID.x + NumWorkGroups.x * WGID.z)). Surcharge absente =>
++    // groups_x = ne01 exactement comme avant (les WG en trop sortent immediatement).
++    const uint32_t dmmv_rows = ctx->device->dmmv_num_rows[src0->type];
++    uint32_t groups_x = dmmv_rows > 0 ? (uint32_t) CEIL_DIV(ne01, dmmv_rows) : ne01;
+     uint32_t groups_z = 1;
+ 
+-    if (ne01 > max_groups_x) {
++    if (groups_x > max_groups_x) {
+         groups_z = 64;
+         groups_x = CEIL_DIV(groups_x, groups_z);
+     }
+@@ -11725,6 +11830,25 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
+     ggml_tensor * src0 = dst->src[0];
+     ggml_tensor * src2 = dst->src[2];
+     const bool type_ok = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
++
++    // [TAG_MMID_PATH] Comparaison VEC-ID vs TUILE (coopmat) pour le MoE au decodage MTP.
++    // Le choix par defaut est `src2->ne[1] <= 8` -> VEC-ID pour notre batch MTP (n = 7).
++    // Le chemin tuile n'avait JAMAIS ete compare : l'A/B du 16/09 croyait forcer les variantes
++    // s/m/l via GGML_VK_MMID_PIPE, variable qui n'existe pas, et le vrai nom (MMID_FORCE_PIPE)
++    // ne s'applique qu'au chemin tuile -- jamais atteint pour n <= 8. Les deux bras etaient donc
++    // identiques, et la conclusion « la variante de pipeline ne change rien » ne portait sur rien.
++    //   GGML_VK_MMID_FORCE_VEC=1   -> toujours VEC-ID
++    //   GGML_VK_MMID_FORCE_TILED=1 -> jamais VEC-ID (donc tuile : ce que fait le prefill)
++    static const int mmid_force = [] {
++        const char * v = getenv("GGML_VK_MMID_FORCE_VEC");
++        const char * t = getenv("GGML_VK_MMID_FORCE_TILED");
++        if (v != nullptr && atoll(v) != 0) return 1;
++        if (t != nullptr && atoll(t) != 0) return -1;
++        return 0;
++    }();
++    if (mmid_force > 0) return type_ok;
++    if (mmid_force < 0) return false;
++
+     // density gate (issue #25356, validated on gfx1151/RADV by two independent impls):
+     // the fixed `n_tokens <= 8` heuristic causes a throughput cliff at n_tokens=9 on
+     // many-expert MoE (512 experts / top-10): token-expert overlap is ~0 at B=12, so the
+@@ -11943,8 +12067,55 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+                                 // Intel Xe1 regresses, see PR 25494
+                                 (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
+                                  (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+-    const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
+-    const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
++    // [TAG_FA_F16_CONTIG] Meme scratch que le chemin quantifie, mais pour un KV f16.
++    // Le cache f16 est stocke [HS, NH, KV] : pas d'une position KV = HS*NH*2 octets (1 Ko
++    // pour HS=256/NH=2) au lieu de HS*2. Le FA lit donc 4x plus de lignes de cache que
++    // necessaire, et sur l'UMA de Strix Halo le cout mesure de cet ecart est une taxe de
++    // 3,2x en bande passante (sequentiel 73 Go/s, 256 o contigus 70, les memes a stride
++    // 1 Ko : 22 Go/s). C'est ce qui faisait perdre ~35 % de prefill au KV f16 face au q8_0,
++    // dont le scratch de dequant ecrivait deja des lignes contigues par tete.
++    // Copie PURE (aucune arithmetique) -> resultat attendu bit-a-bit identique.
++    // Prefill uniquement (neq1 >= 64) et activation par GGML_VK_FA_KV_CONTIG=1 pour l'A/B.
++    static const bool fa_kv_contig_env = [] {
++        const char * e = getenv("GGML_VK_FA_KV_CONTIG");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    // NB : is_dense_kv_cache() exige en plus nb[3] == nb[1]*ne[1]. C'est faux pour une VUE
++    // du cache prealloue (ne[1] = longueur utilisee, nb[3] = stride du cache complet), et
++    // comme ne[3] == 1 ce stride n'est JAMAIS utilise pour l'indexation. On teste donc
++    // directement les seules proprietes qui comptent : nb[0] element, nb[2] une tete,
++    // nb[1] = NH tetes par token (layout entrelace), et ne[3] == 1 (la copie n'indexe pas
++    // de dimension sequence).
++    auto is_dense_kv_view = [](const ggml_tensor * t) {
++        return t->nb[0] == ggml_type_size(t->type) &&
++               t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
++               t->nb[1] == t->nb[2] * t->ne[2] &&
++               t->ne[3] == 1;
++    };
++    const bool use_f16_contig = fa_kv_contig_env && !k_quant && !v_quant &&
++                                k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
++                                neq1 >= 64 && is_dense_kv_view(k) && is_dense_kv_view(v) &&
++                                (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
++                                (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
++                                ctx->device->pipeline_fa_kv_contig_f16 != nullptr &&
++                                !ctx->device->coopmat2;
++    const bool use_scratch_kv = use_dequant_kv || use_f16_contig;
++
++    if (fa_kv_contig_env && neq1 >= 8) {
++        static int dbg_n = 0;
++        if (dbg_n++ < 6) {
++            fprintf(stderr, "[FA_CONTIG] neq1=%u KV=%u k_type=%d nb=[%zu %zu %zu %zu] ne=[%lld %lld %lld] "
++                            "densek=%d densev=%d kq=%d vq=%d cm2=%d pipe=%d nel=%lld -> use=%d\n",
++                    neq1, nek1, (int)k->type, (size_t)k->nb[0], (size_t)k->nb[1], (size_t)k->nb[2], (size_t)k->nb[3],
++                    (long long)k->ne[0], (long long)k->ne[1], (long long)k->ne[2],
++                    (int)is_dense_kv_cache(k), (int)is_dense_kv_cache(v), (int)k_quant, (int)v_quant,
++                    (int)ctx->device->coopmat2, (int)(ctx->device->pipeline_fa_kv_contig_f16 != nullptr),
++                    (long long)ggml_nelements(k), (int)use_f16_contig);
++        }
++    }
++
++    const ggml_type k_type_eff = use_scratch_kv ? GGML_TYPE_F16 : k->type;
++    const ggml_type v_type_eff = use_scratch_kv ? GGML_TYPE_F16 : v->type;
+ 
+     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
+     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
+@@ -11977,7 +12148,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+ 
+     uint32_t nbk2_eff = (uint32_t)nbk2, nbk3_eff = (uint32_t)nbk3;
+     uint32_t nbv2_eff = (uint32_t)nbv2, nbv3_eff = (uint32_t)nbv3;
+-    if (use_dequant_kv) {
++    if (use_scratch_kv) {
+         k_stride = HSK;
+         v_stride = HSV;
+         nbk2_eff = (uint32_t)((uint64_t)HSK * KV * sizeof(ggml_fp16_t));
+@@ -12130,7 +12301,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
+ 
+-    if (use_dequant_kv) {
++    if (use_scratch_kv) {
+         const uint64_t fp = sizeof(ggml_fp16_t);
+         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
+         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * fp;
+@@ -12138,8 +12309,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+             ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
+             ggml_vk_preallocate_buffers(ctx, subctx);
+         }
+-        vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
+-        vk_pipeline tr_v = ctx->device->pipeline_dequant_transpose[v->type];
++        vk_pipeline tr_k = use_dequant_kv ? ctx->device->pipeline_dequant_transpose[k->type]
++                                          : ctx->device->pipeline_fa_kv_contig_f16;
++        vk_pipeline tr_v = use_dequant_kv ? ctx->device->pipeline_dequant_transpose[v->type]
++                                          : ctx->device->pipeline_fa_kv_contig_f16;
+         ggml_pipeline_request_descriptor_sets(ctx, tr_k, 1);
+         ggml_pipeline_request_descriptor_sets(ctx, tr_v, 1);
+         if (ctx->prealloc_x_need_sync) {
+@@ -12149,10 +12322,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+         vk_subbuffer v_dst = vk_subbuffer{ ctx->prealloc_x, k_f16_sz, v_f16_sz };
+         const uint32_t k_nel = (uint32_t)ggml_nelements(k);
+         const uint32_t v_nel = (uint32_t)ggml_nelements(v);
++        // le shader quantifie traite 128 elements par workgroup (il borne via p.nel) ;
++        // la copie f16 fait un element par thread avec une boucle grid-stride.
++        const uint32_t wg_k = use_dequant_kv ? k_nel : std::min<uint32_t>(CEIL_DIV(k_nel, 256), 32768);
++        const uint32_t wg_v = use_dequant_kv ? v_nel : std::min<uint32_t>(CEIL_DIV(v_nel, 256), 32768);
+         { const std::vector<uint32_t> pc = { (uint32_t)HSK, (uint32_t)nek2, (uint32_t)KV, 0, k_nel };
+-          ggml_vk_dispatch_pipeline(ctx, subctx, tr_k, { k_buf, k_dst }, pc, { k_nel, 1, 1 }); }
++          ggml_vk_dispatch_pipeline(ctx, subctx, tr_k, { k_buf, k_dst }, pc, { wg_k, 1, 1 }); }
+         { const std::vector<uint32_t> pc = { (uint32_t)HSV, (uint32_t)nev2, (uint32_t)KV, 0, v_nel };
+-          ggml_vk_dispatch_pipeline(ctx, subctx, tr_v, { v_buf, v_dst }, pc, { v_nel, 1, 1 }); }
++          ggml_vk_dispatch_pipeline(ctx, subctx, tr_v, { v_buf, v_dst }, pc, { wg_v, 1, 1 }); }
+         ggml_vk_sync_buffers(ctx, subctx);
+         k_buf = k_dst;
+         v_buf = v_dst;
+@@ -12231,7 +12408,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+                                     pc, { workgroups_x, workgroups_y, workgroups_z });
+     }
+ 
+-    if (use_dequant_kv) {
++    if (use_scratch_kv) {
+         ctx->prealloc_x_need_sync = true;
+     }
+ }
+@@ -12285,6 +12462,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             return ctx->device->pipeline_get_rows_f32[src0->type];
+         }
+         return nullptr;
++    case GGML_OP_GET_ROWS_RAW:
++        GGML_ASSERT(src1->type == GGML_TYPE_I32);
++        GGML_ASSERT(src0->type == dst->type);
++        return ctx->device->pipeline_get_rows_raw[src0->type];
+     case GGML_OP_GET_ROWS_BACK:
+         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) {
+             return ctx->device->pipeline_get_rows_back_f32;
+@@ -13068,7 +13249,10 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
+     const uint32_t b_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+     const uint32_t d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
+ 
+-    GGML_ASSERT(dst->op != GGML_OP_GET_ROWS || (a_offset == 0 && b_offset == 0 && d_offset == 0));
++    // [TAG_QSA_RAW_GATHER] le gather brut se comporte comme GET_ROWS de ce point de vue : les offsets
++    // sont exprimes dans l'unite de la copie, donc ils doivent etre nuls (le reste de la plomberie divise
++    // par la taille du type, ce qui n'a pas de sens pour une copie brute de blocs).
++    GGML_ASSERT((dst->op != GGML_OP_GET_ROWS && dst->op != GGML_OP_GET_ROWS_RAW) || (a_offset == 0 && b_offset == 0 && d_offset == 0));
+ 
+     p.misalign_offsets = (a_offset << 16) | (b_offset << 8) | d_offset;
+ 
+@@ -13109,6 +13293,17 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
+     GGML_UNUSED(src3);
+ }
+ 
++// [TAG_QSA_RAW_GATHER] Largeur du mot copie par le gather brut : 4 octets pour une source quantifiee
++// (les blocs font 34 octets pour q8_0, la ligne se lit donc en mots de 4 octets), 2 octets pour une
++// source F16 de faible largeur (les lignes du masque QSA font 1 element = 2 octets). 0 = non supporte.
++static uint32_t ggml_vk_get_rows_raw_word_size(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_Q8_0: return 4;
++        case GGML_TYPE_F16:  return 2;
++        default:             return 0;
++    }
++}
++
+ template<typename PC>
+ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc, vk_pipeline pipeline_override = nullptr) {
+     VK_LOG_DEBUG("ggml_vk_op_f32((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
+@@ -13123,7 +13318,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+     }
+     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
+     std::cerr << "), " << ggml_op_name(op) << ")");
+-    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_CONCAT || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
++    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_GET_ROWS_RAW || op == GGML_OP_CPY || op == GGML_OP_CONCAT || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
+     GGML_ASSERT(dst->buffer != nullptr);
+     const uint64_t ne00 = src0->ne[0];
+     const uint64_t ne01 = src0->ne[1];
+@@ -13240,6 +13435,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+         elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+         break;
++    case GGML_OP_GET_ROWS_RAW:
++        // un thread par mot de la ligne ; la largeur du mot depend de la source (cf. ggml_vk_get_rows_raw)
++        elements = { (uint32_t)(ggml_row_size(src0->type, ne00) / ggml_vk_get_rows_raw_word_size(src0->type)), (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
++        elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
++        elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
++        break;
+     case GGML_OP_GET_ROWS_BACK:
+         elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], 1 };
+         elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+@@ -13536,6 +13737,32 @@ static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx,
+     });
+ }
+ 
++// [TAG_QSA_RAW_GATHER] Gather brut : la ligne source est recopiee telle quelle (aucune dequantisation),
++// le type de la sortie est celui de la source. get_rows.comp est reutilise avec A_TYPE == D_TYPE et une
++// largeur de mot de 4 octets (source quantifiee) ou 2 octets (source F16) : tous les strides passes au
++// shader sont donc exprimes EN MOTS et non en elements.
++static void ggml_vk_get_rows_raw(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    const uint32_t word = ggml_vk_get_rows_raw_word_size(src0->type);
++    GGML_ASSERT(word != 0 && dst->type == src0->type);
++
++    const uint32_t src1_type_size = ggml_type_size(src1->type);
++
++    GGML_ASSERT(ggml_row_size(src0->type, src0->ne[0]) % word == 0);
++    // nb[0] n'est pas utilise par le shader (l'indexation dans la ligne se fait en mots) : pour q8_0 il
++    // vaut 34, non divisible par la largeur du mot, et c'est normal.
++    GGML_ASSERT(src0->nb[1] % word == 0 && src0->nb[2] % word == 0 && src0->nb[3] % word == 0);
++    GGML_ASSERT(dst->nb[1] % word == 0 && dst->nb[2] % word == 0 && dst->nb[3] % word == 0);
++
++    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS_RAW, {
++        (uint32_t)ggml_nelements(src0),
++        (uint32_t)(ggml_row_size(src0->type, src0->ne[0]) / word), (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3], (uint32_t)(src0->nb[0] / word), (uint32_t)(src0->nb[1] / word), (uint32_t)(src0->nb[2] / word), (uint32_t)(src0->nb[3] / word),
++        (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2], (uint32_t)src1->ne[3], (uint32_t)(src1->nb[0] / src1_type_size), (uint32_t)(src1->nb[1] / src1_type_size), (uint32_t)(src1->nb[2] / src1_type_size), (uint32_t)(src1->nb[3] / src1_type_size),
++        (uint32_t)(ggml_row_size(dst->type, dst->ne[0]) / word), (uint32_t)dst->ne[1], (uint32_t)dst->ne[2], (uint32_t)dst->ne[3], (uint32_t)(dst->nb[0] / word), (uint32_t)(dst->nb[1] / word), (uint32_t)(dst->nb[2] / word), (uint32_t)(dst->nb[3] / word),
++        0,
++        0.0f, 0.0f, 0,
++    });
++}
++
+ static void ggml_vk_get_rows_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     const uint32_t src0_type_size = ggml_type_size(src0->type);
+     const uint32_t src1_type_size = ggml_type_size(src1->type);
+@@ -16972,6 +17199,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+     case GGML_OP_GET_ROWS:
+         ggml_vk_get_rows(ctx, compute_ctx, src0, src1, node);
+ 
++        break;
++    case GGML_OP_GET_ROWS_RAW:
++        ggml_vk_get_rows_raw(ctx, compute_ctx, src0, src1, node);
++
+         break;
+     case GGML_OP_GET_ROWS_BACK:
+         ggml_vk_get_rows_back(ctx, compute_ctx, src0, src1, node);
+@@ -18144,6 +18375,68 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
+            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
+ }
+ 
++// [TAG_HC_SILU_EPILOGUE] GGML_VK_FUSE_MMV_SILU=1 : fusion MUL_MAT + UNARY(SILU).
++// Le motif reel est celui de qwen4exp build_hc_mix : lo = silu(w_down * xn) (97x/token).
++// La SILU est calculee dans l'epilogue du matvec (fusion_flags, aucun dispatch supplementaire),
++// avec l'expression source identique a unary.comp:op_silu -> byte-exact.
++static bool ggml_vk_fuse_mmv_silu_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_VK_FUSE_MMV_SILU");
++        return e && atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++// Le matvec ecrit dans le tenseur du DERNIER noeud fusionne et indexe a plat (f32) : il faut donc
++// que la sortie de l'UNARY soit contigue, et que le MUL_MAT passe REELLEMENT par
++// ggml_vk_mul_mat_vec_q_f16 (branche "mul_mat_vec" de ggml_vk_mul_mat). Sinon la SILU serait
++// silencieusement perdue sur le chemin GEMM.
++static bool ggml_vk_can_fuse_mm_silu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
++    if (!ggml_vk_fuse_mmv_silu_enabled()) {
++        return false;
++    }
++    const ggml_tensor * mm = cgraph->nodes[node_idx];
++    const ggml_tensor * un = cgraph->nodes[node_idx + 1];
++
++    if (mm->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (ggml_get_unary_op(un) != GGML_UNARY_OP_SILU) {
++        return false;
++    }
++    if (mm->src[0] == nullptr || mm->src[1] == nullptr) {
++        return false;
++    }
++    if (!ggml_are_same_shape(mm, un) || !ggml_is_contiguous(un)) {
++        return false;
++    }
++    const ggml_tensor * src0 = mm->src[0];
++    const ggml_tensor * src1 = mm->src[1];
++
++    // memes conditions que la branche mul_mat_vec de ggml_vk_mul_mat
++    if (!(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
++          src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
++        return false;
++    }
++    if (!(mm->ne[1] == 1 || (mm->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1))) {
++        return false;
++    }
++    // exclut le split M, les chemins p021/nc et fwht
++    if (mm->ne[2] != 1 || mm->ne[3] != 1) {
++        return false;
++    }
++    // chemin needs_split (poids > maxStorageBufferRange) : ggml_vk_mul_mat_q_f16 ecrirait
++    // dst, donc la SILU serait perdue silencieusement.
++    if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
++        return false;
++    }
++    if (src0->type == GGML_TYPE_F16 &&
++        (!ggml_is_contiguous(src0) || ggml_is_permuted(src0) || ggml_is_permuted(src1))) {
++        return false;
++    }
++    return true;
++}
++
+ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
+     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
+         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
+@@ -18153,6 +18446,11 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
+         return false;
+     }
+ 
++    // [TAG_HC_SILU_EPILOGUE]
++    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_UNARY) {
++        return ggml_vk_can_fuse_mm_silu(ctx, cgraph, node_idx);
++    }
++
+     // GGML_VK_FUSE_UNARY_MUL=1: the delta-net path emits silu(x)*y as two nodes, so the silu
+     // result makes a full round trip through memory. That is the same shape the swiglu split
+     // already computes in one pass, so route the pair to the existing GLU pipeline.
+@@ -19664,6 +19962,26 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 fusion_string = "MUL_MAT_ADD";
+                 op_srcs_fused_elementwise[0] = false;
+                 op_srcs_fused_elementwise[1] = true;
++            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY })) {
++                // [TAG_HC_SILU_EPILOGUE] matvec + SILU absorbee dans l'epilogue du noyau
++                ctx->num_additional_fused_ops = 1;
++                fusion_string = "MUL_MAT_SILU";
++                op_srcs_fused_elementwise[0] = false;
++                op_srcs_fused_elementwise[1] = true;
++                // Preuve structurelle : compteur imprimé quand GGML_VK_FUSE_DIAG est actif.
++                static const bool silu_dbg = getenv("GGML_VK_FUSE_DIAG") != nullptr;
++                if (silu_dbg) {
++                    static uint64_t silu_fuse_n = 0;
++                    const ggml_tensor * un = cgraph->nodes[i + 1];
++                    if (silu_fuse_n < 6 || silu_fuse_n % 500 == 499) {
++                        fprintf(stderr, "[SILU_FUSE] n=%llu i=%d out=(%lld,%lld,%lld,%lld) A=%lldx%lld typeA=%s\n",
++                                (unsigned long long)silu_fuse_n, i,
++                                (long long)un->ne[0], (long long)un->ne[1], (long long)un->ne[2], (long long)un->ne[3],
++                                (long long)cgraph->nodes[i]->src[0]->ne[0], (long long)cgraph->nodes[i]->src[0]->ne[1],
++                                ggml_type_name(cgraph->nodes[i]->src[0]->type));
++                    }
++                    ++silu_fuse_n;
++                }
+             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
+                 ctx->num_additional_fused_ops = 2;
+                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
+@@ -20821,6 +21139,36 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+             }
+         case GGML_OP_GET_ROWS_BACK:
+             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
++        case GGML_OP_GET_ROWS_RAW:
++            {
++                // [TAG_QSA_RAW_GATHER] copie brute : le type de sortie est celui de la source, et les
++                // strides utilises doivent etre des multiples de la largeur du mot copie.
++                if (op->type != op->src[0]->type) {
++                    return false;
++                }
++                if (op->src[1]->type != GGML_TYPE_I32) {
++                    return false;
++                }
++                const uint32_t word = ggml_vk_get_rows_raw_word_size(op->src[0]->type);
++                if (word == 0) {
++                    return false;
++                }
++                if (op->src[0]->nb[0] != ggml_type_size(op->src[0]->type)) {
++                    return false;
++                }
++                if (ggml_row_size(op->src[0]->type, op->src[0]->ne[0]) % word != 0) {
++                    return false;
++                }
++                for (int i = 1; i < GGML_MAX_DIMS; ++i) {
++                    if (op->src[0]->nb[i] % word != 0) {
++                        return false;
++                    }
++                    if (op->nb[i] % word != 0) {
++                        return false;
++                    }
++                }
++                return true;
++            }
+         case GGML_OP_SET_ROWS:
+             {
+                 if ((op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) ||
+@@ -21225,6 +21573,9 @@ static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
+     switch (op->op) {
+         case GGML_OP_GET_ROWS:
+             return 0;
++        case GGML_OP_GET_ROWS_RAW:
++            // meme raison que GET_ROWS : la decision d'offload n'a pas de sens pour un gather
++            return 0;
+         case GGML_OP_MUL_MAT:
+             return op->ne[1];
+         case GGML_OP_MUL_MAT_ID:
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fa_kv_contig_f16.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fa_kv_contig_f16.comp
+new file mode 100644
+index 00000000000..20ef28132c3
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fa_kv_contig_f16.comp
+@@ -0,0 +1,44 @@
++#version 450
++
++// [TAG_FA_F16_CONTIG] Coalesce the f16 KV cache before the coopmat1 flash attention.
++//
++// The KV cache stores heads interleaved per token: for K, ne = [HS, KV, NH, NS] with
++// nb[1] = HS * NH * 2 bytes. Stepping one KV position for a fixed head therefore jumps
++// HS * NH * 2 bytes (1 KB for HS=256, NH=2) instead of HS * 2 (512 B), so every tile the
++// FA walks touches 4x more cache lines than it uses. On Strix Halo's unified LPDDR5X the
++// measured cost of that gap is a 3.2x bandwidth tax (sequential 73 GB/s, 256 B chunks
++// back-to-back 70 GB/s, the same chunks at 1 KB stride 22 GB/s), which is why the f16 KV
++// prefill lands ~35% below the q8_0 one (which never paid it: its dequant scratch already
++// writes per-head-contiguous rows).
++//
++// This shader is the f16 counterpart of the q8_0 dequant+transpose path: a pure copy that
++// reorders [HS, NH, KV, NS] into [HS, KV, NH, NS]. Values are bit-identical (no arithmetic),
++// so the FA result must be unchanged. Prefill only (the caller gates on n_tokens >= 64).
++//
++// Push constants (shared with the dequant shaders): M = HS, K = NH, stride_a = KV, nel = count.
++
++#include "dequant_head.glsl"
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly  buffer A {float16_t data_a[];};
++layout (binding = 1) writeonly buffer D {float16_t data_b[];};
++
++void main() {
++    const uint HS  = p.M;
++    const uint NH  = p.K;
++    const uint KVn = p.stride_a;
++    const uint n   = p.nel;
++
++    // grid-stride: the element count (HS*KV*NH) exceeds the max workgroup count at depth
++    const uint step = gl_WorkGroupSize.x * gl_NumWorkGroups.x;
++
++    for (uint e = gl_GlobalInvocationID.x; e < n; e += step) {
++        const uint hs = e % HS;
++        const uint nh = (e / HS) % NH;
++        const uint kv = (e / (HS * NH)) % KVn;
++        const uint ns = e / (HS * NH * KVn);
++
++        data_b[hs + HS * kv + HS * KVn * nh + HS * KVn * NH * ns] = data_a[e];
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl
+index 4aeda68c7f2..3de5ba3d363 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_base.glsl
+@@ -44,6 +44,17 @@ layout (push_constant) uniform parameter
+ uint expert_id;
+ #endif
+ 
++// [TAG_HC_SILU_EPILOGUE] SILU d'epilogue : expression source IDENTIQUE a unary.comp:op_silu
++// (x / (1.0f + exp(-x))) pour rester bit-a-bit egal au noeud UNARY separe, qui lit la sortie
++// f32 du matvec en memoire. Le noeud UNARY est elide (num_additional_fused_ops), la valeur
++// stockee est bit-identique : aucun arrondi n'est supprime.
++FLOAT_TYPE mv_silu(FLOAT_TYPE x) {
++    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SILU) == 0) {
++        return x;
++    }
++    return x / (1.0f + exp(-x));
++}
++
+ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
+ #ifdef MUL_MAT_ID
+     const uint expert_i0 = gl_WorkGroupID.y;
+@@ -121,7 +132,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t
+                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
+                 }
+ #endif
+-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
++                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(mv_silu(temp[j][n]));
+             }
+         }
+     }
+@@ -176,7 +187,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
+                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
+                 }
+ #endif
+-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
++                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(mv_silu(temp[j][n]));
+             }
+         }
+     }
+@@ -221,7 +232,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
+                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
+                 }
+ #endif
+-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
++                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(mv_silu(tmpsh[j][n][0]));
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
+index 65b959d2fdb..eefd002de65 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
+@@ -4,6 +4,9 @@
+ #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
+ #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
+ #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
++// [TAG_HC_SILU_EPILOGUE] la SILU de sortie du matvec est calculee dans le noyau
++// (qwen4exp hc_mix : lo = silu(w_down * xn)) au lieu d'un dispatch UNARY separe.
++#define MAT_VEC_FUSION_FLAGS_SILU 0x10
+ 
+ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+ #if defined(USE_COALESCED_LOADS)
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/topk_radix.comp b/ggml/src/ggml-vulkan/vulkan-shaders/topk_radix.comp
+index 37c355c5d37..29dc0a62175 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/topk_radix.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/topk_radix.comp
+@@ -12,6 +12,21 @@
+ 
+ layout(constant_id = 0) const int BLOCK_SIZE = 1024;
+ 
++// [TAG_TOPK_RADIX_BANKS] NHIST = nombre d'histogrammes PARTIELS dans la memoire partagee.
++// Le comptage se fait par atomicAdd : avec 1024 threads et 256 bacs, chaque bac subit
++// ~1000 conflits par passe (mesure : 80 us pour 258 ko = 3,1 Go/s, soit 1/60 du mur).
++// En echelonnant les banques par lane (bank = tid % NHIST) et en entrelacant l'adressage
++// (bin * NHIST + bank), on divise la contention par NHIST. La somme des NHIST compteurs
++// est faite AVANT la marche des bacs : le resultat est bit-identique a NHIST = 1.
++layout(constant_id = 1) const int NHIST = 1;
++
++// [TAG_TOPK_RADIX_UNROLL] nombre d'elements traites par iteration et par thread.
++// Mesure : 252 iterations/thread a ~825 cycles = latence DRAM avec UN SEUL chargement
++// en vol par thread (une seule CU, 16 warps). Les charges sont emises dans une boucle
++// separee de la boucle de traitement pour que le compilateur les mette toutes en vol.
++// Contenu des histogrammes inchange => resultat bit-identique.
++layout(constant_id = 2) const int UNROLL = 1;
++
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout (binding = 0) readonly  buffer A {float data_a[];};
+@@ -27,7 +42,7 @@ layout (push_constant) uniform parameter {
+     uint last_pass;
+ } p;
+ 
+-shared uint hist[256];
++shared uint hist[256 * NHIST];
+ shared uint sh_prefix;
+ shared uint sh_rank;
+ shared uint sh_greater;
+@@ -59,21 +74,60 @@ void main() {
+     uint pmask  = 0u;
+     uint rank   = p.k;
+ 
++    const uint nh   = uint(NHIST);
++    const uint bank = tid % nh;
++
+     for (int shift = 24; shift >= 0; shift -= 8) {
+-        if (tid < 256u) {
+-            hist[tid] = 0u;
++        for (uint i = tid; i < 256u * nh; i += wgs) {
++            hist[i] = 0u;
+         }
+         barrier();
+ 
+         // count only the elements that still match the prefix found so far
+-        for (uint col = tid; col < p.ncols_input; col += wgs) {
+-            const uint key = f2ui(data_a[base + col]);
+-            if ((key & pmask) == prefix) {
+-                atomicAdd(hist[(key >> shift) & 255u], 1u);
++        const uint nu   = uint(UNROLL);
++        const uint step = wgs * nu;
++        for (uint col0 = tid; col0 < p.ncols_input; col0 += step) {
++            if (col0 + (nu - 1u) * wgs < p.ncols_input) {
++                float vv[UNROLL];
++                uint  kk[UNROLL];
++                // (1) toutes les charges d'abord : elles partent en vol ensemble
++                for (uint u = 0u; u < nu; ++u) {
++                    vv[u] = data_a[base + col0 + u * wgs];
++                }
++                for (uint u = 0u; u < nu; ++u) {
++                    kk[u] = f2ui(vv[u]);
++                }
++                for (uint u = 0u; u < nu; ++u) {
++                    if ((kk[u] & pmask) == prefix) {
++                        atomicAdd(hist[((kk[u] >> shift) & 255u) * nh + bank], 1u);
++                    }
++                }
++            } else {
++                // queue de ligne : reprise du chemin scalaire
++                for (uint col = col0; col < p.ncols_input; col += wgs) {
++                    const uint key = f2ui(data_a[base + col]);
++                    if ((key & pmask) == prefix) {
++                        atomicAdd(hist[((key >> shift) & 255u) * nh + bank], 1u);
++                    }
++                }
++                break;
+             }
+         }
+         barrier();
+ 
++        // [TAG_TOPK_RADIX_BANKS] fusion des NHIST histogrammes partiels
++        uint acc = 0u;
++        if (tid < 256u) {
++            for (uint j = 0u; j < nh; ++j) {
++                acc += hist[tid * nh + j];
++            }
++        }
++        barrier();
++        if (tid < 256u) {
++            hist[tid] = acc;
++        }
++        barrier();
++
+         // walk the bins from the largest keys down to the one holding the k-th largest
+         if (tid == 0u) {
+             uint r   = rank;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index fff04c00c68..79045998c57 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -819,6 +819,16 @@ void process_shaders() {
+ 
+     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
+ 
++    // [TAG_QSA_RAW_GATHER] Gather brut : get_rows.comp avec A_TYPE == D_TYPE devient une copie indexee
++    // de la ligne, sans dequantisation. La largeur du mot copie choisit la variante : 4 octets (uint)
++    // pour une source quantifiee (blocs de 34 octets pour q8_0), 2 octets (uint16_t) pour une source
++    // F16 de faible largeur (lignes du masque QSA = 1 element). TEMP_TYPE est un ENTIER dans les deux
++    // cas : un type flottant 16 bits y serait une conversion (float16_t est d'ailleurs interdit comme
++    // variable locale en GLSL => la variante 16 bits ne compilerait pas). L'indexation etant en mots,
++    // la plomberie hote divise les strides et la largeur de ligne par cette largeur de mot.
++    string_to_spv("get_rows_raw_32", "get_rows.comp", {{"TEMP_TYPE", "uint"},     {"A_TYPE", "uint"},     {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
++    string_to_spv("get_rows_raw_16", "get_rows.comp", {{"TEMP_TYPE", "uint16_t"}, {"A_TYPE", "uint16_t"}, {"B_TYPE", "int"}, {"D_TYPE", "uint16_t"}});
++
+     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
+     string_to_spv("mul_mat_vec_p021_f16_f32",              "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
+     string_to_spv("mul_mat_vec_nc_f16_f32", "mul_mat_vec_nc.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
+@@ -851,6 +861,8 @@ void process_shaders() {
+     string_to_spv("cpy_i32_f32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
+ 
+     string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
++    // [TAG_FA_F16_CONTIG] copie+transpose du KV f16 pour le FA (layout per-head-contiguous)
++    string_to_spv("fa_kv_contig_f16", "fa_kv_contig_f16.comp", base_dict);
+     string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+     string_to_spv("cpy_transpose_02_16", "copy_transpose_02.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+     string_to_spv("cpy_transpose_02_32", "copy_transpose_02.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index ed86a0a4f86..222654001ee 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1084,6 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "PERMUTE",
+     "TRANSPOSE",
+     "GET_ROWS",
++    "GET_ROWS_RAW",
+     "GET_ROWS_BACK",
+     "SET_ROWS",
+     "DIAG",
+@@ -1152,7 +1153,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1199,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "permute(x)",
+     "transpose(x)",
+     "get_rows(x)",
++    "get_rows_raw(x)",
+     "get_rows_back(x)",
+     "set_rows(x)",
+     "diag(x)",
+@@ -1267,7 +1269,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -3976,6 +3978,31 @@ struct ggml_tensor * ggml_get_rows(
+     return result;
+ }
+ 
++// ggml_get_rows_raw
++
++// gather brut : la donnee source est recopiee telle quelle (aucune arithmetique), donc le type de la
++// sortie est celui de la source. Voir ggml.h.
++struct ggml_tensor * ggml_get_rows_raw(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b) {
++    GGML_ASSERT(a->ne[2] == b->ne[1]);
++    GGML_ASSERT(a->ne[3] == b->ne[2]);
++    GGML_ASSERT(b->ne[3] == 1);
++    GGML_ASSERT(b->type == GGML_TYPE_I32);
++    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
++    // la copie se fait par mots de 2 ou 4 octets : la largeur d'une ligne doit tomber juste
++    GGML_ASSERT(ggml_row_size(a->type, a->ne[0]) % 2 == 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
++
++    result->op     = GGML_OP_GET_ROWS_RAW;
++    result->src[0] = a;
++    result->src[1] = b;
++
++    return result;
++}
++
+ // ggml_get_rows_back
+ 
+ struct ggml_tensor * ggml_get_rows_back(
+@@ -7359,6 +7386,7 @@ void ggml_build_backward_expand(
+             // gradients in node->src[1] for one reason or another have no effect on output gradients
+             case GGML_OP_CPY:           // gradients in CPY target are irrelevant
+             case GGML_OP_GET_ROWS:      // row indices not differentiable
++            case GGML_OP_GET_ROWS_RAW:  // idem (copie brute de lignes)
+             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
+             case GGML_OP_ROPE:          // positions not differentiable
+                 ignore_src[1] = true;
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 93b468784a3..bfcff1b66ef 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -50,15 +50,33 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
+         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
+         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
++        // [TAG_QSA_CACHE_COMPRESSED] la dimension de V doit aussi suivre l'indexeur (128) : sinon
++        // le V du cache garde la dimension de tete de l'ATTENTION (256) et set_rows refuse d'y
++        // ecrire une cle d'indexeur. Meme reglage que llama_kv_cache_dsv4.
++        hparams_idx.n_embd_head_v_full = model.hparams.indexer_head_size;
++        hparams_idx.n_embd_head_v_swa  = model.hparams.indexer_head_size;
+ 
+         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
+         // K-shift must not rotate them while the stream copies in the same update still apply
+         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
+ 
+-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
++        // [TAG_QSA_CACHE_COMPRESSED] le V de ce cache n'est JAMAIS lu par l'attention (elle lit le
++        // cache principal) : il sert de stockage aux cles de bloc resumees, une par bloc, ecrites
++        // par l'ubatch qui ecrit la derniere position du bloc. F16 et non F32 : get_rows sur une
++        // source F32 avec des indices I32 n'utilise PAS un gather, il construit un one_hot et passe
++        // par mul_mat (des dizaines de Mo par couche, et un plantage) — c'est le chemin que le fork
++        // documente pour le cas F32+I32. F16 garde les noyaux de gather dedies, et reste plus fin
++        // que les cles q8_0 dont le resume est tire.
++        const char * cmp_env = getenv("LLAMA_QSA_CACHE_COMPRESSED");
++        const bool   cmp     = cmp_env != nullptr && atoll(cmp_env) != 0;
++
++        const ggml_type type_v_idx = cmp ? GGML_TYPE_F16 : type_v;
++
++        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells (block keys: %s)\n",
++                __func__, kv_size, cmp ? "f16 in V" : "pooled at read time");
+ 
+         return new llama_kv_cache(
+-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
++            model, hparams_idx, type_k, type_v_idx, v_trans, offload, unified,
+             kv_size, n_seq_max, n_pad, n_swa, swa_type,
+             nullptr, filter_idx, nullptr, nullptr, "idx_");
+     }()) {}
+@@ -271,6 +289,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
+         ggml_tensor * blk_cells,
+         ggml_tensor * blk_pos,
+         ggml_tensor * bias,
++        ggml_tensor * blk_ends,
+         const llama_ubatch * ubatch,
+         uint32_t ratio,
+         bool blk_bias) const {
+@@ -278,10 +297,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
+     GGML_ASSERT(get_mem_idx() != nullptr);
+ 
+     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+-
+     const int64_t n_kv     = cell_blk->ne[0];
+     const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+-    const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
++    // [TAG_QSA_CACHE_COMPRESSED] blk_cells et blk_pos ne servent qu'au pooling a la lecture : dans le
++    // chemin des cles de bloc resumees ils ne sont consommes par aucun noeud, donc ggml-alloc ne
++    // leur alloue pas de buffer (data == NULL). On les cree donc seulement quand ils servent, et on
++    // tolere ici un tenseur absent. blk_ends/blk_cells ne sont pas interchangeables pour n_blocks :
++    // il se deduit de n_kv, exactement comme dans build_qsa_top_k.
++    const int64_t n_blocks = (n_kv + (int64_t) ratio - 1)/(int64_t) ratio;
+     const int64_t n_tokens = ubatch->n_tokens;
+     const int64_t r        = ratio;
+ 
+@@ -289,14 +312,15 @@ void llama_memory_hybrid_idx::set_input_qsa(
+     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
+ 
+     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+-    int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
+-    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
++    int32_t * dst_blk_cells = blk_cells == nullptr ? nullptr : (int32_t *) blk_cells->data;
++    int32_t * dst_blk_pos   = blk_pos   == nullptr ? nullptr : (int32_t *) blk_pos->data;
+     float   * dst_bias      = (float   *) bias->data;
++    // [TAG_QSA_CACHE_COMPRESSED] cellule de fin de chaque bloc, pour la lecture des resumes
++    int32_t * dst_blk_ends  = blk_ends == nullptr ? nullptr : (int32_t *) blk_ends->data;
+ 
+     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
+     // from zero, so the bucket alone would pool two sequences into one block
+-    GGML_ASSERT(r <= 64);
+-    const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
++    GGML_ASSERT(r <= 64);    const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
+ 
+     // TODO: this runs per ubatch and is O(n_kv) per stream, about 865 us at 33k context. the cost
+     //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
+@@ -309,13 +333,16 @@ void llama_memory_hybrid_idx::set_input_qsa(
+     std::vector<uint64_t> grp_slots;
+     std::vector<int32_t>  grp_bid;
+     std::vector<int32_t>  bid_idx;
++    std::vector<int32_t>  bid_e;
+     std::vector<int32_t>  bid_cell;
+     std::vector<int32_t>  bid_slot0;
+ 
+     std::vector<int32_t> order;
+     std::vector<int32_t> rank;
+ 
+-    std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
++    if (dst_blk_pos != nullptr) {
++        std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
++    }
+ 
+     for (int64_t s = 0; s < n_ns; ++s) {
+         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
+@@ -323,13 +350,16 @@ void llama_memory_hybrid_idx::set_input_qsa(
+         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
+ 
+         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+-        int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
++        int32_t * cur_blk_cells = dst_blk_cells == nullptr ? nullptr : dst_blk_cells + s*(r*n_blocks);
+ 
+-        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
++        if (cur_blk_cells != nullptr) {
++            std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
++        }
+ 
+         bid_idx  .clear();
+         bid_cell .clear();
+         bid_slot0.clear();
++        bid_e    .clear();
+ 
+         int n_seq_present = 0;
+ 
+@@ -464,6 +494,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
+                 bid_idx  .push_back((int32_t) (pb*r));
+                 bid_cell .push_back(grp_first[g]);
+                 bid_slot0.push_back(grp_slot0[g]);
++                // [TAG_QSA_CACHE_COMPRESSED] cellule de fin de bloc (celle dont l'index modulo r
++                // vaut r-1), remplie dans la boucle sur les cellules ci-dessous. Elle sert a la
++                // lecture des resumes, qui n'a plus besoin de parcourir les membres.
++                bid_e    .push_back(-1);
+             }
+         }
+ 
+@@ -484,7 +518,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
+             }
+ 
+             for (int64_t sec = 0; sec < 4; ++sec) {
+-                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];
++                if (dst_blk_pos != nullptr) {
++                    dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = sec_pos[sec];
++                }
+             }
+         }
+ 
+@@ -501,12 +537,32 @@ void llama_memory_hybrid_idx::set_input_qsa(
+             if (blk_of[j] >= 0) {
+                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+ 
+-                cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
++                if (cur_blk_cells != nullptr) {
++                    cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
++                }
++
++                if (idx%r == r - 1) {
++                    bid_e[blk_of[j]] = (int32_t) j;
++                }
+             }
+ 
+             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+         }
+ 
++        // [TAG_QSA_CACHE_COMPRESSED] la cellule de fin de bloc (slot r-1) porte le resume du bloc,
++        // ecrit par l'ubatch qui ecrit cette position. Lue ici pour que le graphe n'ait qu'un
++        // gather a faire au scoring. Les blocs non resolus (groupes incomplets, bloc mort) n'ont
++        // pas de resume : la cellule 0 donne une valeur finie, jamais retenue (masque).
++        if (dst_blk_ends != nullptr) {
++            std::fill(dst_blk_ends + s*n_blocks, dst_blk_ends + (s + 1)*n_blocks, 0);
++
++            for (int32_t b = 0; b < n_bid; ++b) {
++                // le resume d'un bloc vit dans le slot V de sa cellule de fin ; sous le budget, le
++                // graphe ne lit pas cet indice et n'alloue donc pas blk_ends
++                dst_blk_ends[s*n_blocks + b] = bid_e[b];
++            }
++        }
++
+         for (int64_t ii = 0; ii < n_tps; ++ii) {
+             const int64_t      i      = s*n_tps + ii;
+             const llama_seq_id seq_id = ubatch->seq_id[i][0];
+@@ -584,10 +640,212 @@ void llama_memory_hybrid_idx::set_input_qsa(
+     }
+ }
+ 
++// [TAG_QSA_CACHE_COMPRESSED] cles de bloc resumees.
+ //
+-// llama_memory_hybrid_idx_context
++// Le pooling relisait tout le cache d'indexer a chaque pas pour re-moyenner des blocs dont le
++// contenu ne change plus (mesure : ~17 ms par pas de decodage a 64k, soit ~11 % du pas, domine
++// par l'overhead de lancement des milliers de micro-operations). Ici le resume est ecrit UNE fois,
++// par l'ubatch qui ecrit la derniere position du bloc, dans le slot V de sa cellule de fin — slot
++// que l'attention n'utilise jamais. Le resume suit donc la cellule : defrag, copies de sequence
++// et sauvegarde d'etat le deplacent exactement comme la cle brute associee.
+ //
++// Regle : une entree par token de l'ubatch. Un token qui est le dernier membre (rang\%r == r-1, ou
++// position\%r == r-1 hors image) d'un bloc complet ecrit le resume de ce bloc ; tout autre token
++// ecrit une valeur inoffensive dans le slot de sa propre cellule (elle n'est la fin d'aucun bloc
++// complet, donc jamais relue comme cle de bloc). Le nombre d'entrees est donc n_tokens, ce que le
++// graphe sait sans rien connaitre des cellules : les deux cotes ne peuvent pas diverger.
++void llama_memory_hybrid_idx::set_input_qsa_wr(
++        ggml_tensor * wr_members,
++        ggml_tensor * wr_cells,
++        ggml_tensor * wr_pos,
++        const llama_ubatch * ubatch,
++        uint32_t ratio) const {
++    GGML_ASSERT(ratio > 1);
++    GGML_ASSERT(wr_members != nullptr && wr_cells != nullptr && wr_pos != nullptr);
++    GGML_ASSERT(ggml_backend_buffer_is_host(wr_members->buffer));
++    GGML_ASSERT(ubatch->n_seqs == 1);
++    // une entree par token : le graphe dimensionne les listes sur n_tokens, donc le nombre
++    // d'entrees ne depend d'aucune decision prise ici (pas de desaccord possible entre les deux)
++    GGML_ASSERT(wr_cells->ne[0] == (int64_t) ubatch->n_tokens);
++
++    const int64_t r     = ratio;
++    const int64_t n_tok = ubatch->n_tokens;
++
++    int32_t * dst_members = (int32_t *) wr_members->data;
++    int64_t * dst_cells   = (int64_t *) wr_cells->data;
++    int32_t * dst_pos     = (int32_t *) wr_pos->data;
++
++    const llama_seq_id seq_id = ubatch->seq_id[0][0];
++    const auto &       cells  = get_mem_idx()->get_cells(seq_id);
++    const int64_t      n_kv   = (int64_t) cells.size();
++
++    // position -> cellule de cette sequence. les positions restent sous la fenetre de cellules
++    // (invariant verifie par l'assertion `oor` du chemin de selection), donc un tableau indexe par
++    // la position suffit et la recherche est directe.
++    std::vector<int32_t> pos2cell(n_kv, -1);
++    bool dup = false;
++
++    for (int64_t j = 0; j < n_kv; ++j) {
++        if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
++            continue;
++        }
++
++        const int64_t p = cells.pos_get(j);
++
++        if (p < 0 || p >= n_kv) {
++            continue;
++        }
++
++        // une position reprise (mrope d'image) : le cache classe alors ses cellules par rang
++        if (pos2cell[p] >= 0) {
++            dup = true;
++            continue;
++        }
++
++        pos2cell[p] = (int32_t) j;
++    }
++
++    // meme tri que le masque causal mrope : pos, puis ext.y, puis ext.x. les blocs se comptent
++    // alors en rangs et non en positions, exactement comme dans set_input_qsa.
++    std::vector<int32_t> cell_of_idx;   // rang -> cellule
++    std::vector<int32_t> rank;          // cellule -> rang
++
++    if (dup) {
++        cell_of_idx.reserve(n_kv);
++
++        for (int64_t j = 0; j < n_kv; ++j) {
++            if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
++                cell_of_idx.push_back((int32_t) j);
++            }
++        }
++
++        std::sort(cell_of_idx.begin(), cell_of_idx.end(), [&cells](int32_t a, int32_t b) {
++            const llama_pos pa = cells.pos_get(a);
++            const llama_pos pb = cells.pos_get(b);
++
++            if (pa != pb) {
++                return pa < pb;
++            }
++
++            const auto & ea = cells.ext_get(a);
++
++            return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
++        });
++
++        rank.assign(n_kv, -1);
++
++        for (int64_t k = 0; k < (int64_t) cell_of_idx.size(); ++k) {
++            rank[cell_of_idx[k]] = (int32_t) k;
++        }
++
++        static bool warned = false;
++
++        if (!warned) {
++            warned = true;
++            LLAMA_LOG_WARN("%s: positions dupliquees (image) : blocs d'index ranges par cellule\n", __func__);
++        }
++    }
++
++    auto idx_cell = [&](int64_t ic) -> int32_t {
++        if (ic < 0) {
++            return -1;
++        }
++
++        if (dup) {
++            return ic < (int64_t) cell_of_idx.size() ? cell_of_idx[ic] : -1;
++        }
++
++        return ic < n_kv ? pos2cell[ic] : -1;
++    };
+ 
++    for (int64_t i = 0; i < n_tok; ++i) {
++        const llama_pos q = ubatch->pos[i];
++        const int32_t  c = q >= 0 && q < n_kv ? pos2cell[q] : -1;
++
++        int32_t mem[64];   // r <= 64 dans le cache
++        int32_t sec[4] = { 0, 0, 0, 0 };
++
++        bool    full   = false;
++        int32_t target = -1;
++
++        if (c >= 0) {
++            const int64_t idx = dup ? rank[c] : (int64_t) cells.pos_get(c);
++
++            if (idx >= 0) {
++                const int64_t p0 = (idx/r)*r;
++
++                full = true;
++
++                for (int64_t k = 0; k < r; ++k) {
++                    mem[k] = idx_cell(p0 + k);
++
++                    if (mem[k] < 0) {
++                        full = false;
++                        break;
++                    }
++                }
++
++                // seul le dernier membre d'un bloc complet porte le resume
++                if (full && idx % r == r - 1) {
++                    target = mem[r - 1];
++
++                    for (int64_t k = 0; k < 4; ++k) {
++                        sec[k] = (int32_t) p0;
++                    }
++
++                    if (dup) {
++                        // hors chemin par position, la position de rope est celle du premier
++                        // membre du bloc (celle que le pooling utilisait)
++                        const int64_t cf = mem[0];
++
++                        sec[0] = (int32_t) cells.pos_get((uint32_t) cf);
++                        sec[1] = cells.ext_get((uint32_t) cf).y;
++                        sec[2] = cells.ext_get((uint32_t) cf).x;
++                        sec[3] = sec[0];
++                    }
++                }
++            }
++        }
++
++        if (target < 0) {
++            // ce token ne termine pas de bloc complet : ecrire une valeur finie dans le slot de sa
++            // propre cellule. Cette cellule n'est la fin d'aucun bloc complet (le bloc serait
++            // complet), donc ce resume n'est jamais relu comme cle de bloc.
++            if (i > 0 && c < 0) {
++                // position introuvable (ne devrait pas arriver) : repeter l'entree precedente
++                for (int64_t k = 0; k < r; ++k) {
++                    mem[k] = (int32_t) dst_members[(i - 1)*r + k];
++                }
++
++                target = (int32_t) dst_cells[i - 1];
++
++                for (int64_t k = 0; k < 4; ++k) {
++                    sec[k] = dst_pos[(i - 1)*4 + k];
++                }
++            } else {
++                target = c >= 0 ? c : 0;
++
++                for (int64_t k = 0; k < r; ++k) {
++                    mem[k] = target;
++                }
++            }
++        }
++
++        for (int64_t k = 0; k < r; ++k) {
++            dst_members[i*r + k] = mem[k];
++        }
++
++        dst_cells[i] = target;
++
++        for (int64_t k = 0; k < 4; ++k) {
++            dst_pos[i*4 + k] = sec[k];
++        }
++    }
++}
++
++//
++// llama_memory_hybrid_idx_context
++//
+ // streams in each ubatch's slot info, matching get_k/get_v's `ns`
+ static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
+     std::vector<uint32_t> res;
+@@ -670,10 +928,22 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+         ggml_tensor * blk_cells,
+         ggml_tensor * blk_pos,
+         ggml_tensor * bias,
++        ggml_tensor * blk_ends,
+         const llama_ubatch * ubatch,
+         uint32_t ratio,
+         bool blk_bias) const {
+     GGML_ASSERT(mem != nullptr);
+ 
+-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
++    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_ends, ubatch, ratio, blk_bias);
++}
++
++void llama_memory_hybrid_idx_context::set_input_qsa_wr(
++        ggml_tensor * wr_members,
++        ggml_tensor * wr_cells,
++        ggml_tensor * wr_pos,
++        const llama_ubatch * ubatch,
++        uint32_t ratio) const {
++    GGML_ASSERT(mem != nullptr);
++
++    mem->set_input_qsa_wr(wr_members, wr_cells, wr_pos, ubatch, ratio);
+ }
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index 705189e7eb5..5460a51d7fa 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -83,9 +83,17 @@ public:
+     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+     // the caller then adds the attention mask, the only part of the bias that varies within a block
++    // [TAG_QSA_CACHE_COMPRESSED] blk_ends : la cellule de fin de chaque bloc (le slot qui porte le
++    // resume) ; null quand le chemin des cles de bloc n'est pas arme
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+-                       bool blk_bias) const;
++                       ggml_tensor * bias, ggml_tensor * blk_ends, const llama_ubatch * ubatch,
++                       uint32_t ratio, bool blk_bias) const;
++
++    // [TAG_QSA_CACHE_COMPRESSED] listes d'ecriture des cles de bloc resumees : pour chaque bloc
++    // dont cet ubatch ecrit la derniere position, les cellules a moyenner, la cellule de fin (qui
++    // recoit le resume) et la position de rope du bloc. Autonome : ne depend que de l'ubatch.
++    void set_input_qsa_wr(ggml_tensor * wr_members, ggml_tensor * wr_cells, ggml_tensor * wr_pos,
++                          const llama_ubatch * ubatch, uint32_t ratio) const;
+ 
+ private:
+     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
+@@ -142,8 +150,11 @@ public:
+     uint32_t get_n_stream() const;
+ 
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+-                       bool blk_bias) const;
++                       ggml_tensor * bias, ggml_tensor * blk_ends, const llama_ubatch * ubatch,
++                       uint32_t ratio, bool blk_bias) const;
++
++    void set_input_qsa_wr(ggml_tensor * wr_members, ggml_tensor * wr_cells, ggml_tensor * wr_pos,
++                          const llama_ubatch * ubatch, uint32_t ratio) const;
+ 
+ private:
+     const llama_memory_hybrid_idx * mem = nullptr;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index b14c9e7fa36..8767790690e 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "ggml-backend.h"
+ #include "llama-impl.h"
+ #include "llama-memory-hybrid-idx.h"
+ #include "llama-memory-recurrent.h"
+@@ -7,8 +8,12 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdio>
+ #include <cstdlib>
++#include <map>
++#include <string>
+ #include <random>
++#include <vector>
+ 
+ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+@@ -662,6 +667,159 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
++    // ===================== D4 — tete de sortie du draft restreinte =====================
++    // La tete du draft MTP (output.weight, 248 320 lignes) est relue a CHAQUE pas de draft et
++    // pesait 4,2 % des operations de decodage. Deux modes :
++    //   "rows:N"        -> copie des N premieres lignes (contigues) + queue a -1e30
++    //   "ids:/chemin"   -> copie des lignes listees (int32) + RE-ETALEMENT des logits aux ids
++    //                      globaux (fill -1e30 + set_rows) : la selection peut donc venir de
++    //                      tokens FREQUENTS (VocabTrim/FR-Spec/TPE/NanoSpec) et non d'un prefixe
++    // Dans les deux cas t_logits reste a LARGEUR PLEINE : aucun id n'est remappe, l'echantillonneur
++    // et le backend-sampling sont inchanges, et le modele cible VERIFIE sur sa tete pleine -- le
++    // draft ne fait que proposer, donc la qualite ne peut pas en dependre.
++    //
++    // [TAG_D4_CTL] La selection courante est relue d'un FICHIER DE CONTROLE a chaque pas
++    // (LLAMA_MTP_HEAD_CTL=/tmp/xxx, contenu "off" | "rows:N" | "ids:/chemin"). Raison : mesure du
++    // 18/09, la reference est passee de 39,75 a 43,6 tok/s DANS LE MEME BANC (+10 % de derive), ce
++    // qui rend tout A/B par redemarrage non interpretable. Avec le fichier de controle, les bras
++    // sont ENTRELACES dans un seul process et la derive ne peut plus confondre les mesures.
++    static const char * mtp_head_ctl_path = std::getenv("LLAMA_MTP_HEAD_CTL");
++    static const char * mtp_head_ids_env  = std::getenv("LLAMA_MTP_HEAD_IDS");
++    static const int64_t mtp_head_rows_env = [] {
++        const char * e = std::getenv("LLAMA_MTP_HEAD_ROWS");
++        return e ? (int64_t) atoll(e) : (int64_t) 0;
++    }();
++    static const bool mtp_head_dbg = std::getenv("LLAMA_MTP_HEAD_DEBUG") != nullptr;
++
++    const int64_t n_out_rows = model.output->ne[1];
++
++    struct mtp_sel { ggml_tensor * w = nullptr; ggml_tensor * ids = nullptr; int64_t n = 0; };
++    static std::map<std::string, mtp_sel> mtp_cache;
++
++    auto mtp_dev = []() -> ggml_backend_dev_t {
++        // NB : notre iGPU Strix Halo s'enregistre en GGML_BACKEND_DEVICE_TYPE_IGPU (memoire hote),
++        // pas GPU -- chercher GPU en premier renvoyait NULL et la copie partait sur le CPU
++        // (mesure 18/09 : 196,9 Mo en buffer=CPU => matvec CPU, 258 ms/forward).
++        ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
++        if (d == nullptr) d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++        if (d == nullptr) d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        return d;
++    };
++    auto mtp_attach = [&](ggml_context * ctxp, const std::vector<int64_t> & shape, ggml_type type) -> ggml_tensor * {
++        ggml_tensor * t = shape.size() == 1 ? ggml_new_tensor_1d(ctxp, type, shape[0])
++                                            : ggml_new_tensor_2d(ctxp, type, shape[0], shape[1]);
++        ggml_backend_dev_t dev = mtp_dev();
++        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
++        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, t));
++        ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf));
++        return t;
++    };
++    auto mtp_build = [&](const std::string & spec) -> mtp_sel {
++        mtp_sel out;
++        const int64_t t0 = ggml_time_us();
++        ggml_init_params ip = { ggml_tensor_overhead() * 8 + 8192, nullptr, true };
++        ggml_context * ctxp = ggml_init(ip);
++        if (spec.rfind("rows:", 0) == 0) {
++            const int64_t n = (int64_t) atoll(spec.c_str() + 5);
++            if (n <= 0 || n >= n_out_rows) return out;
++            out.w = mtp_attach(ctxp, { model.output->ne[0], n }, model.output->type);
++            out.n = n;
++            const size_t nbytes = (size_t) out.w->nb[1] * (size_t) n;   // lignes [0,N) : contigues
++            std::vector<uint8_t> stage(nbytes);
++            ggml_backend_tensor_get(model.output, stage.data(), 0, nbytes);
++            ggml_backend_tensor_set(out.w, stage.data(), 0, nbytes);
++            fprintf(stderr, "[MTP_HEAD] rows=%lld nbytes=%.1f Mo copie=%.1f s\n",
++                    (long long) n, (double) nbytes / 1048576.0, (ggml_time_us() - t0) / 1e6);
++        } else if (spec.rfind("ids:", 0) == 0) {
++            const char * path = spec.c_str() + 4;
++            std::vector<int32_t> raw;
++            FILE * f = fopen(path, "rb");
++            if (f != nullptr) {
++                fseek(f, 0, SEEK_END); const long fsz = ftell(f); fseek(f, 0, SEEK_SET);
++                if (fsz > 0 && fsz % 4 == 0) {
++                    raw.resize((size_t) fsz / 4);
++                    if (fread(raw.data(), 4, raw.size(), f) != raw.size()) raw.clear();
++                }
++                fclose(f);
++            }
++            std::vector<int32_t> ids;
++            {
++                std::vector<uint8_t> seen((size_t) n_out_rows, 0);
++                for (int32_t id : raw) {
++                    if (id >= 0 && id < n_out_rows && !seen[(size_t) id]) { seen[(size_t) id] = 1; ids.push_back(id); }
++                }
++            }
++            std::sort(ids.begin(), ids.end());
++            if (ids.empty()) { fprintf(stderr, "[MTP_HEAD_IDS] aucun id valide dans %s\n", path); return out; }
++            out.w   = mtp_attach(ctxp, { model.output->ne[0], (int64_t) ids.size() }, model.output->type);
++            out.ids = mtp_attach(ctxp, { (int64_t) ids.size() }, GGML_TYPE_I32);
++            out.n   = (int64_t) ids.size();
++            ggml_backend_tensor_set(out.ids, ids.data(), 0, (size_t) out.n * sizeof(int32_t));
++            const size_t row_bytes = model.output->nb[1];
++            std::vector<uint8_t> rbuf(row_bytes);
++            for (int64_t i = 0; i < out.n; ++i) {
++                ggml_backend_tensor_get(model.output, rbuf.data(), (size_t) ids[(size_t) i] * row_bytes, row_bytes);
++                ggml_backend_tensor_set(out.w, rbuf.data(), (size_t) i * row_bytes, row_bytes);
++            }
++            fprintf(stderr, "[MTP_HEAD_IDS] ids=%lld nbytes=%.1f Mo gather=%.1f s (%s)\n",
++                    (long long) out.n, (double) ((size_t) out.n * row_bytes) / 1048576.0,
++                    (ggml_time_us() - t0) / 1e6, path);
++        }
++        return out;
++    };
++
++    std::string mtp_spec = "off";
++    if (mtp_head_ctl_path != nullptr) {
++        FILE * cf = fopen(mtp_head_ctl_path, "r");
++        if (cf != nullptr) {
++            char buf[512] = {0};
++            if (fgets(buf, sizeof(buf), cf) != nullptr) {
++                std::string sline(buf);
++                while (!sline.empty() && (sline.back() == '\n' || sline.back() == '\r' || sline.back() == ' ')) sline.pop_back();
++                if (!sline.empty()) mtp_spec = sline;
++            }
++            fclose(cf);
++        }
++    } else if (mtp_head_ids_env != nullptr && *mtp_head_ids_env != '\0') {
++        mtp_spec = std::string("ids:") + mtp_head_ids_env;
++    } else if (mtp_head_rows_env > 0 && mtp_head_rows_env < n_out_rows) {
++        mtp_spec = "rows:" + std::to_string((long long) mtp_head_rows_env);
++    }
++
++    if (mtp_spec != "off") {
++        auto it = mtp_cache.find(mtp_spec);
++        if (it == mtp_cache.end()) {
++            mtp_sel built = mtp_build(mtp_spec);
++            it = mtp_cache.emplace(mtp_spec, built).first;
++        }
++        const mtp_sel & sel = it->second;
++        if (mtp_head_dbg) {
++            fprintf(stderr, "[MTP_HEAD] spec=%s -> n=%lld ids=%s\n", mtp_spec.c_str(),
++                    (long long) sel.n, sel.ids ? "oui" : "non");
++        }
++        if (sel.w != nullptr) {
++            if (sel.ids != nullptr) {
++                // liste d'ids : re-etale des logits aux positions globales (set_rows travaille sur ne[0],
++                // d'ou les deux transposes -- cout ~21 Mo/forward, ~0,1 ms a 200 Go/s)
++                ggml_tensor * sel_l = build_lora_mm(sel.w, cur, model.output_s);     // [n_sel, n_tok]
++                ggml_tensor * sel_t = ggml_cont(ctx0, ggml_transpose(ctx0, sel_l)); // [n_tok, n_sel]
++                ggml_tensor * full  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, sel_t->ne[0], n_out_rows);
++                full = ggml_fill(ctx0, full, -1e30f);
++                full = ggml_set_rows(ctx0, full, sel_t, sel.ids);                   // [n_tok, n_vocab]
++                cur  = ggml_cont(ctx0, ggml_transpose(ctx0, full));                 // [n_vocab, n_tok]
++            } else {
++                ggml_tensor * head = build_lora_mm(sel.w, cur, model.output_s);
++                ggml_tensor * tail = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_out_rows - sel.n, head->ne[1]);
++                tail = ggml_fill(ctx0, tail, -1e30f);
++                cur  = ggml_concat(ctx0, head, tail, 0);
++            }
++            cb(cur, "result_output", -1);
++            res->t_logits = cur;
++            ggml_build_forward_expand(gf, cur);
++            return;
++        }
++    }
++
+     cur = build_lora_mm(model.output, cur, model.output_s);
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+@@ -699,6 +857,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
+ 
+ // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
+ // one mean-pooled indexer key scores each block; set_input resolves the cache layout
++// [TAG_QSA_CACHE_COMPRESSED] chemin des cles de bloc resumees : opt-in, un seul flux, et pas
++// d'ubatch a positions 2D (une image peut faire classer les cellules par rang, les blocs ne
++// coincident alors plus avec les positions).
++static bool qsa_cache_compressed_enabled() {
++    static const bool en = [] {
++        const char * e = getenv("LLAMA_QSA_CACHE_COMPRESSED");
++        return e != nullptr && atoll(e) != 0;
++    }();
++
++    return en;
++}
++
+ class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
+ public:
+     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
+@@ -709,7 +879,13 @@ public:
+         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+         // [TAG_QSA_KEEPKEYS] entree reduite (ecriture des cles seules) : pas d'entrees de selection
+         if (cell_blk != nullptr) {
+-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_ends, ubatch, ratio, blk_bias);
++        }
++
++        // [TAG_QSA_CACHE_COMPRESSED] lists d'ecriture des cles de bloc (aussi sous le budget, ou
++        // seules les cles sont ecrites)
++        if (wr_cells != nullptr) {
++            mctx->set_input_qsa_wr(wr_members, wr_cells, wr_pos, ubatch, ratio);
+         }
+     }
+ 
+@@ -730,17 +906,44 @@ public:
+         res &= params.ubatch.n_tokens % n_stream == 0;
+ 
+         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
++        if (cmp) {
++            // [TAG_QSA_CACHE_COMPRESSED] une entree par token : le compte depend de l'ubatch, donc un
++            // graphe batî pour un autre nombre de tokens ne peut pas etre reutilise (ne jamais
++            // comparer un champ a lui-meme, piege du premier jet).
++            res &= n_stream == 1 && ratio > 1;
++            res &= wr_cells != nullptr ? wr_cells->ne[0] == params.ubatch.n_tokens
++                                       : params.ubatch.n_tokens == 0;
++        } else if (qsa_cache_compressed_enabled()) {
++            // le chemin est arme : un graphe non compresse ne doit pas etre reutilise ensuite, sinon
++            // plus aucun resume n'est ecrit
++            res &= !(n_stream == 1 && ratio > 1);
++        }
++        if (wr_cells != nullptr) {
++            res &= wr_n > 0;
++            res &= wr_members->ne[0] == (uint32_t) (wr_n*ratio);
++            res &= wr_pos->ne[0]     == (uint32_t) (4*wr_n);
++        }
+         if (cell_blk == nullptr) {
+             // [TAG_QSA_KEEPKEYS] cette entree ne porte que les k_idxs (elle ne selectionne pas)
+             return res;
+         }
+         res &= cell_blk->ne[0]  == n_kv;
+         res &= cell_blk->ne[1]  == n_stream;
+-        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+-        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
++        if (blk_cells != nullptr) {
++            res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
++            res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
++        }
+         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
+         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+ 
++        if (blk_ends != nullptr) {
++            res &= blk_cells == nullptr;   // les deux chemins de lecture s'excluent
++            res &= blk_ends->ne[0] == (uint32_t) n_blocks;
++            res &= blk_ends->ne[1] == (uint32_t) n_stream;
++        } else {
++            res &= blk_cells != nullptr;
++        }
++
+         return res;
+     }
+ 
+@@ -751,6 +954,17 @@ public:
+     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
+     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+ 
++    // [TAG_QSA_CACHE_COMPRESSED] blocs termines par cet ubatch : membres a moyenner, cellule cible,
++    // positions mrope. Remplis par set_input_qsa_wr ; nullptr = chemin historique (pooling au read).
++    ggml_tensor * wr_members = nullptr;  // I32 [ratio*n_wr]
++    ggml_tensor * wr_cells   = nullptr;  // I64 [n_wr]
++    ggml_tensor * wr_pos     = nullptr;  // I32 [4*n_wr]
++    int64_t       wr_n       = -1;       // nombre de blocs termines, pour can_reuse
++
++    // lecture des resumes : la cellule de fin de chaque bloc
++    ggml_tensor * blk_ends   = nullptr;  // I32 [n_blocks, n_stream]
++    bool          cmp        = false;    // ce jeu d'entrees porte le chemin des cles de bloc
++
+     const llama_memory_hybrid_idx_context * mctx;
+     const uint32_t ratio;
+ 
+@@ -812,7 +1026,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         const char * e = getenv("LLAMA_QSA_NOSEL_GUARD");
+         return e == nullptr || atoll(e) != 0;
+     }();
+-    const bool select = !(nosel_guard && n_kv <= (int64_t) hparams.indexer_top_k + r - 1);
++
++    // [TAG_QSA_SKIP_PREFILL_SEL] Au PREFILL (n_tokens > 16) la selection QSA ne sert a rien :
++    //  - le gather des cellules selectionnees est desactive a ce stade (qsa_gather_n_sel renvoie 0
++    //    des que n_tokens > 16), donc l'attention parcourt de toute facon tout le KV ;
++    //  - la selection n'y remplace que le masque causal par un masque top-k ;
++    //  - et son cout est mesure : `CONT` 7,1 % + `TOP_K` 0,6 % du prefill a 64k (audit 16/09),
++    //    soit exactement la penalite de -8/-9 % attribuee a QSA.
++    // Ce qui compte au prefill, c'est ECRIRE les cles d'indexer et les resumes de blocs, que le
++    // decode lira : ce chemin (`!select` + `write_keys`) existe deja et est celui utilise sous le
++    // budget (reference exacte). Sortir avant `build_qsa_top_k` les supprimerait -> decode aveugle.
++    // A/B dans le meme binaire : LLAMA_QSA_SKIP_PREFILL_SEL=1 active le saut ; absent = comportement
++    // historique (selection au prefill).
++    const bool skip_prefill_sel = [] {
++        const char * e = getenv("LLAMA_QSA_SKIP_PREFILL_SEL");
++        return e != nullptr && atoll(e) != 0;
++    }() && n_tokens > 16;
++
++    const bool select = !skip_prefill_sel && !(nosel_guard && n_kv <= (int64_t) hparams.indexer_top_k + r - 1);
+ 
+     // [TAG_QSA_KEEPKEYS] Sous le budget on reste sur le chemin dense (reference exacte), mais on
+     // ECRIT QUAND MEME les cles d'indexer. Sinon, des que la sequence depasse le budget, les
+@@ -844,8 +1075,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         fflush(stderr);
+     }
+ 
++    // [TAG_QSA_CACHE_COMPRESSED] Le pooling relisait tout le cache d'indexer a chaque pas pour
++    // re-moyenner des blocs dont le contenu ne change plus : ~17 ms par pas de decodage a 64k, soit
++    // ~11 % du pas, domine par l'overhead de lancement des milliers de micro-operations CONT/ADD.
++    // Ici le resume d'un bloc est calcule UNE fois, par l'ubatch qui ecrit sa derniere position, et
++    // stocke dans le slot V de la cellule de fin (le V du cache d'indexer n'est jamais lu par
++    // l'attention : elle lit le cache principal). La lecture ne fait plus qu'un gather.
++    //
++    // Le chemin est opt-in, ce qui permet l'A/B dans le meme binaire. Il est ecarte quand le
++    // nombre de flux n'est pas 1 (les listes d'ecriture sont ecrites par flux).
++    //
++    // Les listes portent UNE entree par token : le nombre ne depend donc d'aucune decision de
++    // l'hote, ce qui rend impossible un desaccord entre le graphe et set_input_qsa_wr (piege du
++    // premier jet : dimensionner sur les blocs termines exigeait des deux cotes un compte identique).
++    // L'hote choisit, entree par entree, entre "resume de bloc" et ecriture inoffensive.
++    static const bool qsa_cmp_env = qsa_cache_compressed_enabled();
++    const bool cmp = qsa_cmp_env && r > 1 && n_stream == 1;
++
++    // [D3] Cles de bloc contigues : les cellules de fin de bloc sont une progression arithmetique de
++    // pas r, car cellule = position dans le regime supporte (le noyau d'indexeur interdit tout
++    // depassement de la fenetre : assert "qsa: cell position runs past the cell window"). Un VIEW
++    // strided remplace donc le gather de blk_ends, avec des valeurs IDENTIQUES (SHA attendu invariant).
++    // Le bloc de queue incomplet reste masque par `bias`, comme aujourd'hui. A/B dans le meme binaire :
++    // LLAMA_QSA_BLK_VIEW=1 active le view ; absent = gather (comportement de reference).
++    // ATTENTION (piege du 15/09) : quand le view est actif, plus AUCUN noeud ne consomme blk_ends,
++    // donc ggml-alloc ne l'alloue pas -> set_input ecrirait dans NULL. On ne cree donc plus l'entree.
++    static const bool qsa_blk_view = [] {
++        const char * e = getenv("LLAMA_QSA_BLK_VIEW");
++        return e != nullptr && atoll(e) != 0;
++    }();
++
++    const int64_t n_wr = cmp ? n_tokens : 0;
++
++    if (qsa_dbg) {
++        static int64_t last_wr = -2;
++
++        if (last_wr != n_wr) {
++            last_wr = n_wr;
++            fprintf(stderr, "[QSA_DBG] cmp=%d n_wr=%lld select=%d n_kv=%lld il=%d\n",
++                    (int) cmp, (long long) n_wr, (int) select, (long long) n_kv, (int) il);
++            fflush(stderr);
++        }
++    }
++
+     // nothing above depends on the layer, so the layers sharing a ratio share one input set
+-    const uint32_t inp_key = (uint32_t) r | (select ? 0x10000u : 0u);
++    const uint32_t inp_key = (uint32_t) r | (select ? 0x10000u : 0u) |
++                             (cmp ? 0x20000u : 0u) | (cmp && n_wr > 0 ? 0x40000u : 0u) |
++                             (cmp && qsa_blk_view ? 0x80000u : 0u);
+     llm_graph_input_qsa * inp = nullptr;
+ 
+     const auto it = qsa_inps.find(inp_key);
+@@ -853,18 +1129,43 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         inp = it->second;
+     } else {
+         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
++        qsa->cmp = cmp;
+ 
+         qsa->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+         if (select) {
++            // [TAG_QSA_CACHE_COMPRESSED] blk_cells et blk_pos ne servent qu'au pooling a la lecture :
++            // dans le chemin des cles de bloc resumees, AUCUN noeud ne les consomme, donc ggml-alloc
++            // ne leur alloue pas de buffer et set_input ecrirait dans NULL (segfault constate).
+             qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+-            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+-            qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+             qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+ 
+             ggml_set_input(qsa->cell_blk);
+-            ggml_set_input(qsa->blk_cells);
+-            ggml_set_input(qsa->blk_pos);
+             ggml_set_input(qsa->bias);
++
++            if (!cmp) {
++                qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
++                qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
++
++                ggml_set_input(qsa->blk_cells);
++                ggml_set_input(qsa->blk_pos);
++            } else if (!qsa_blk_view) {
++                qsa->blk_ends = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
++
++                ggml_set_input(qsa->blk_ends);
++            }
++        }
++        // les listes d'ecriture ont un noeud consommateur dans TOUS les cas (sous le budget on
++        // n'ecrit que les cles) : un tenseur d'entree sans consommateur n'a pas de buffer et fait
++        // planter le backend au premier set_input
++        if (cmp && n_wr > 0) {
++            qsa->wr_members = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_wr, 1);
++            qsa->wr_cells   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_wr);
++            qsa->wr_pos     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_wr);
++            qsa->wr_n       = n_wr;
++
++            ggml_set_input(qsa->wr_members);
++            ggml_set_input(qsa->wr_cells);
++            ggml_set_input(qsa->wr_pos);
+         }
+ 
+         inp = qsa.get();
+@@ -879,22 +1180,54 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
+ 
+-    // sous le budget : cles ecrites, pas de selection -> attention dense (reference exacte)
+-    if (!select) {
+-        return nullptr;
++    // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
++    // sous le budget (pas de selection) le cache n'est lu que pour resumer les blocs termines
++    ggml_tensor * k_all = nullptr;
++    if (select || cmp) {
++        k_all = mctx_idx->get_k(ctx0, il);
++        if (qsa_dbg) { fprintf(stderr, "[QSA_DBG]   get_k -> %p\n", (void *) k_all); fflush(stderr); }
++        // [TAG_QSA_KEEPKEYS] graphe de RESERVE : le cache d'indexer n'a pas encore de tenseur k
++        // (get_k renvoie NULL). ggml_get_rows est implemente VIA ggml_mul_mat pour le cas F32+I32,
++        // d'ou un segfault a +0x1a de ggml_mul_mat si l'on ne verifie pas. C'est un bug preexistant
++        // (QSA + un contexte reserve assez grand) que ce garde ferme : on reste en dense.
++        if (k_all == nullptr) {
++            return nullptr;
++        }
++        k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
+     }
+ 
+-    // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
+-    ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
+-    if (qsa_dbg) { fprintf(stderr, "[QSA_DBG]   get_k -> %p\n", (void *) k_all); fflush(stderr); }
+-    // [TAG_QSA_KEEPKEYS] graphe de RESERVE : le cache d'indexer n'a pas encore de tenseur k
+-    // (get_k renvoie NULL). ggml_get_rows est implemente VIA ggml_mul_mat pour le cas F32+I32,
+-    // d'ou un segfault a +0x1a de ggml_mul_mat si l'on ne verifie pas. C'est un bug preexistant
+-    // (QSA + un contexte reserve assez grand) que ce garde ferme : on reste en dense.
+-    if (k_all == nullptr) {
++    // [TAG_QSA_CACHE_COMPRESSED] resume des blocs termines par cet ubatch : moyenne des cles
++    // brutes de ses `r` membres, puis norm et rope avec la position du premier token du bloc
++    // (exactement ce que le pooling faisait a la lecture). Le resultat est ecrit dans le slot V de
++    // la cellule de fin de bloc, que l'attention n'utilise jamais.
++    if (cmp && inp->wr_cells != nullptr && k_all != nullptr) {
++        const int64_t n_wr = inp->wr_n;
++
++        ggml_tensor * bm = ggml_get_rows(ctx0, k_all, inp->wr_members);
++        bm = ggml_reshape_3d(ctx0, bm, idx_dim, r, n_wr);
++
++        ggml_tensor * bsum = nullptr;
++        for (int64_t i = 0; i < r; ++i) {
++            ggml_tensor * slice = ggml_cont(ctx0,
++                    ggml_view_3d(ctx0, bm, idx_dim, n_wr, 1,
++                            bm->nb[2], bm->nb[3], i*bm->nb[1]));
++            bsum = bsum ? ggml_add(ctx0, bsum, slice) : slice;
++        }
++        bsum = ggml_scale(ctx0, bsum, 1.0f/(float) r);
++        bsum = ggml_reshape_3d(ctx0, bsum, idx_dim, 1, n_wr);
++        bsum = build_norm(bsum, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
++        bsum = ggml_rope_multi(ctx0, bsum, inp->wr_pos, nullptr,
++                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++        cb(bsum, "indexer_k_block", il);
++
++        ggml_build_forward_expand(gf, mctx_idx->cpy_v(ctx0, bsum, inp->wr_cells, il));
++    }
++
++    // sous le budget : cles ecrites, pas de selection -> attention dense (reference exacte)
++    if (!select) {
+         return nullptr;
+     }
+-    k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
+ 
+     // [TAG_QSA_BOUND] Le court-circuit du pooling (mesure borne haute LLAMA_QSA_SKIP_POOL) est
+     // retire : le chemin est le pooling reel.
+@@ -904,7 +1237,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // ggml_mul_mat du score recevait donc toujours un tenseur NULL -> segfault dans
+     // ggml_mul_mat (+0x1a) : QSA ne pouvait plus fonctionner du tout. Ne jamais redeclarer.
+     ggml_tensor * pooled = nullptr;
+-    {
++
++    if (cmp) {
++        // [TAG_QSA_CACHE_COMPRESSED] les resumes sont deja dans le cache : une seule lecture par
++        // bloc, plus de moyenne a refaire. blk_ends est un tableau ordinaire (les cellules de fin),
++        // donc la lecture reste un gather contigu.
++        ggml_tensor * v_all = mctx_idx->get_v(ctx0, il);
++        if (v_all == nullptr) {
++            return nullptr;
++        }
++        v_all = ggml_view_3d(ctx0, v_all, idx_dim, n_kv, n_stream, v_all->nb[2], v_all->nb[3], 0);
++
++        // [D3] Les resumes sont stockes dans le slot V de la cellule de FIN de chaque bloc : quand
++        // cellule = position (pas de depassement de fenetre), ces cellules sont espacees de r
++        // exactement, donc un view strided remplace le gather (valeurs identiques, SHA invariant).
++        if (qsa_blk_view) {
++            pooled = ggml_view_3d(ctx0, v_all, idx_dim, n_blocks, n_stream,
++                    (size_t) r * v_all->nb[1], v_all->nb[2], (size_t) (r - 1) * v_all->nb[1]);
++        } else {
++            pooled = ggml_get_rows(ctx0, v_all, inp->blk_ends);
++        }
++        cb(pooled, "indexer_k", il);
++    } else {
+         // gathers per stream: blk_cells row s indexes stream s's own cells
+         ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
+         members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+@@ -927,7 +1281,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+                 ext_factor, attn_factor, beta_fast, beta_slow);
+         pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+         cb(pooled, "indexer_k", il);
+-
+     }
+ 
+     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+@@ -1107,8 +1460,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gather(
+     ggml_tensor * v_rows = ggml_view_3d(ctx0, v, d_v*hkv, n_kv, ns, v->nb[2], v->nb[3], 0);
+ 
+     // note: get_rows always returns F32; a fused quant->F16 gather would halve this intermediate
+-    ggml_tensor * k_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, k_rows, idx), GGML_TYPE_F16);
+-    ggml_tensor * v_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, v_rows, idx), GGML_TYPE_F16);
++    //
++    // [TAG_QSA_SEL_F32] Le cast F32->F16 des cellules selectionnees pese LOURD au decodage : mesure
++    // du 16/09 a 64k, 6,5 ms par pas (CPY qsa_k_sel ~322 us x 12 couches + qsa_v_sel ~216 us x 12),
++    // soit 7,3 % du pas — parce qu'il lit le F32 (7 tokens x 2304 cellules x 256 dims = 16 Mo par
++    // couche) ET ecrit le F16. Le flash attention accepte un K/V F32 : garder le F32 supprime la
++    // passe de cast, au prix de 2x d'octets pour l'attention elle-meme (1,7 % du pas).
++    // LLAMA_QSA_SEL_F32=1 compare les deux dans le meme binaire ; defaut = comportement historique.
++    static const bool qsa_sel_f32 = [] {
++        const char * e = getenv("LLAMA_QSA_SEL_F32");
++        return e != nullptr && atoll(e) != 0;
++    }();
++
++    // [TAG_QSA_RAW_GATHER] Gather BRUT : les cellules selectionnees sont copiees avec le type de la
++    // cache (q8_0), sans dequantisation ni cast. Le gather ecrit alors 0,53 o/element au lieu de 4,25
++    // (F32) et les 3 noyaux de cast par couche disparaissent ; la dequantification n'est faite qu'une
++    // fois, par le flash attention, qui accepte deja un KV q8_0 (c'est ce que fait le chemin dense au
++    // prefill). LLAMA_QSA_RAW_GATHER=1 active ce chemin ; non defini = comportement actuel, bit pour bit.
++    static const bool qsa_raw_gather = [] {
++        const char * e = getenv("LLAMA_QSA_RAW_GATHER");
++        return e != nullptr && atoll(e) != 0;
++    }();
++
++    ggml_tensor * k_sel;
++    ggml_tensor * v_sel;
++
++    if (qsa_raw_gather) {
++        GGML_ASSERT(k_rows->type == v_rows->type);
++        k_sel = ggml_get_rows_raw(ctx0, k_rows, idx);
++        v_sel = ggml_get_rows_raw(ctx0, v_rows, idx);
++    } else {
++        k_sel = ggml_get_rows(ctx0, k_rows, idx);
++        v_sel = ggml_get_rows(ctx0, v_rows, idx);
++
++        if (!qsa_sel_f32) {
++            k_sel = ggml_cast(ctx0, k_sel, GGML_TYPE_F16);
++            v_sel = ggml_cast(ctx0, v_sel, GGML_TYPE_F16);
++        }
++    }
++
+     cb(k_sel, "qsa_k_sel", il);
+     cb(v_sel, "qsa_v_sel", il);
+ 
+@@ -1125,17 +1515,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gather(
+ 
+     // per-row visibility: gather each selected cell's original mask value (rows of size 1)
+     ggml_tensor * idx_w  = ggml_view_3d(ctx0, top_k, width, n_tps, ns, top_k->nb[1], top_k->nb[3], 0);
+-    ggml_tensor * m_sel  = ggml_get_rows(ctx0,
+-            ggml_reshape_4d(ctx0, kq_mask, 1, n_kv, n_tps, ns), idx_w);
++
++    // [TAG_QSA_RAW_GATHER] avec le gather brut le masque reste en F16 (il l'est deja dans la cache) :
++    // le gather etait le seul a le passer en F32, ce qui forcait un cast F32->F16 juste apres.
++    ggml_tensor * m_sel = qsa_raw_gather
++            ? ggml_get_rows_raw(ctx0, ggml_reshape_4d(ctx0, kq_mask, 1, n_kv, n_tps, ns), idx_w)
++            : ggml_get_rows    (ctx0, ggml_reshape_4d(ctx0, kq_mask, 1, n_kv, n_tps, ns), idx_w);
+ 
+     // the entries past `width` only pad n_sel for the kernel: mask them back out
+     if (width < n_sel) {
+-        ggml_tensor * m_pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_sel - width, n_tps, ns);
++        ggml_tensor * m_pad = ggml_new_tensor_4d(ctx0, qsa_raw_gather ? GGML_TYPE_F16 : GGML_TYPE_F32, 1, n_sel - width, n_tps, ns);
+         m_pad = ggml_fill(ctx0, m_pad, -INFINITY);
+         m_sel = ggml_concat(ctx0, m_sel, m_pad, 1);
+     }
+ 
+-    ggml_tensor * m = ggml_cast(ctx0, m_sel, GGML_TYPE_F16);
++    ggml_tensor * m = qsa_raw_gather ? m_sel : ggml_cast(ctx0, m_sel, GGML_TYPE_F16);
+     m = ggml_reshape_4d(ctx0, m, n_sel, 1, 1, nt);
+     cb(m, "qsa_kq_mask_sel", il);
+ 
+@@ -1146,7 +1540,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gather(
+             hparams.f_max_alibi_bias,
+             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+ 
+-    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
++    // [TAG_FA_F16ACC] La precision d'accumulation du FA est reglable SANS rebuild :
++    //   LLAMA_FA_F16ACC=1 -> on ne force plus F32, donc le backend choisit le pipeline `f16acc`
++    //   (ggml-vulkan.cpp l.8666 : (prec == GGML_PREC_DEFAULT && coopmat_acc_f16_support) ? f16acc : f32acc).
++    // Banc du 18/09 (batch 29) : -6 a -9 % sur le kernel FA (compute-bound), soit ~+3-4 % de prefill.
++    // Defaut = comportement historique (F32) => aucun effet tant que la variable n'est pas posee.
++    static const bool fa_f16acc = getenv("LLAMA_FA_F16ACC") != nullptr;
++    if (!fa_f16acc) {
++        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
++    }
+ 
+     // [d_v, n_head, 1, nt] -> [d_v*n_head, n_tokens], token order unchanged
+     cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8089b3aeee4..11bbc4e2e25 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -36,6 +36,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <random>
++#include <numeric>
+ #include <regex>
+ #include <set>
+ #include <sstream>
+@@ -2300,6 +2301,124 @@ struct test_get_rows : public test_case {
+     }
+ };
+ 
++// GGML_OP_GET_ROWS_RAW
++// [TAG_QSA_RAW_GATHER] Gather brut du chemin QSA au decodage : la sortie garde le type de la source
++// (q8_0) et la ligne est copiee telle quelle. Deux verifications, sur des formes reelles (512 dims,
++// 2304 puis 131072 lignes, indices NON contigus) :
++//   diff=false : la sortie comparee est le gather brut lui-meme (le banc dequantize les deux cotes) :
++//                l'ecart CPU/GPU doit etre EXACTEMENT nul, sinon la copie n'est pas fidele.
++//   diff=true  : la sortie comparee est sub(cast(raw -> F32), get_rows(q8_0 -> F32)) : elle doit etre
++//                nulle partout, ce qui prouve que le gather brut dequantize exactement comme le gather
++//                historique (c'est le critere decisif : le KV reste quantifie jusqu'au flash attention).
++struct test_get_rows_raw : public test_case {
++    const ggml_type type;
++    const int n;     // dims par ligne (d*hkv)
++    const int m;     // lignes de la source (n_kv)
++    const int r;     // lignes gatherées (n_sel)
++    const int ns;    // streams
++    const bool diff; // sortie = sub(raw, get_rows) au lieu de raw
++    // [TAG_TOPK_SORTED] indices TRIES et distincts : reproduit le cas ou le top_k QSA emettrait ses
++    // indices par ordre croissant (design D2-DESIGN.md §3). Sert a MESURER l'hypothese « des indices
++    // tries rendent le gather quasi sequentiel » AVANT d'ecrire le shader de selection triee.
++    const bool sorted;
++
++    std::string vars() override {
++        return VARS_TO_STR7(type, n, m, r, ns, diff, sorted);
++    }
++
++    test_get_rows_raw(ggml_type type = GGML_TYPE_Q8_0, int n = 512, int m = 131072, int r = 2304, int ns = 2, bool diff = false, bool sorted = false)
++        : type(type), n(n), m(m), r(r), ns(ns), diff(diff), sorted(sorted) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * in = ggml_new_tensor_3d(ctx, type, n, m, ns);
++        ggml_set_name(in, "in");
++
++        // indices non contigus : deux rangees utiles (n_tps = 2) par stream, la vue ne lit que la
++        // premiere et saute donc la seconde entre deux streams (meme motif que top_k dans le QSA)
++        ggml_tensor * rows_full = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, r, 2, 1, ns);
++        ggml_set_name(rows_full, "rows_full");
++        ggml_tensor * rows = ggml_view_2d(ctx, rows_full, r, ns, rows_full->nb[3], 0);
++        ggml_set_name(rows, "rows");
++
++        ggml_tensor * raw = ggml_get_rows_raw(ctx, in, rows);
++
++        ggml_tensor * out = raw;
++        if (diff) {
++            // ggml_cpy et NON ggml_cast : ggml_cast renseigne src[1] = resultat (auto-reference), que
++            // ggml_backend_graph_copy ne recopie pas (node_copies[id] n'est renseigne qu'a la fin de la
++            // recursion => src[1] devient NULL et le CPU segfaute). Meme noyau Vulkan dans les deux cas
++            // (ggml_vk_cpy est appele avec src1 = nullptr).
++            ggml_tensor * raw_f32 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n, r, ns, 1);
++            out = ggml_sub(ctx, ggml_cpy(ctx, raw, raw_f32), ggml_get_rows(ctx, in, rows));
++        }
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++
++    // ecart MAXIMAL, pas une erreur normalisee : nmse(x, 0) vaut NaN quand la sortie attendue est
++    // nulle, ce qui passerait le test sans rien verifier (piege du cas `diff`).
++    double max_err() override {
++        return 0.0;
++    }
++
++    double err(const float * a, const float * b, size_t n) override {
++        double result = 0.0;
++        for (size_t i = 0; i < n; ++i) {
++            // le masque QSA contient des -inf : |a-b| n'a pas de sens la, une egalite d'infinis est
++            // correcte et toute autre combinaison est un echec
++            if (std::isinf(a[i]) || std::isinf(b[i])) {
++                if (a[i] != b[i]) {
++                    return INFINITY;
++                }
++                continue;
++            }
++            result = std::max(result, (double) fabsf(a[i] - b[i]));
++        }
++        return result;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {
++                if (ggml_is_view_op(t->op)) { continue; }
++                std::vector<int> data(ggml_nelements(t));
++                if (sorted) {
++                    // indices DISTINCTS, TRIES croissants (motif du top_k QSA trie) : tirage sans
++                    // remise sur [0, m) puis tri. Meme nombre d'indices que le cas non trie, mais
++                    // adresses monotones -> on mesure uniquement l'effet de l'ORDRE.
++                    const size_t want = data.size();
++                    std::vector<int> all(m);
++                    std::iota(all.begin(), all.end(), 0);
++                    std::shuffle(all.begin(), all.end(), std::mt19937(12345));
++                    std::copy(all.begin(), all.begin() + std::min(want, (size_t) m), data.begin());
++                    std::sort(data.begin(), data.end());
++                } else {
++                    // indices : avec remise, donc non monotones et repetes
++                    for (size_t i = 0; i < data.size(); i++) {
++                        data[i] = rand() % m;
++                    }
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int));
++            } else if (t->type == GGML_TYPE_F16 && n == 1) {
++                // masque QSA : 0, -inf et des valeurs quelconques (le -inf est la valeur qui compte)
++                if (ggml_is_view_op(t->op)) { continue; }
++                const int64_t nel = ggml_nelements(t);
++                std::vector<ggml_fp16_t> data(nel);
++                for (int64_t i = 0; i < nel; i++) {
++                    const int k = rand() % 3;
++                    data[i] = k == 0 ? ggml_fp32_to_fp16(-INFINITY)
++                            : k == 1 ? ggml_fp32_to_fp16(0.0f)
++                                     : ggml_fp32_to_fp16((float) (rand() % 1000) / 1000.0f - 0.5f);
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, nel*sizeof(ggml_fp16_t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ // GGML_OP_GET_ROWS_BACK
+ struct test_get_rows_back : public test_case {
+     const ggml_type type;
+@@ -4589,6 +4708,49 @@ struct test_rwkv_wkv7 : public test_case {
+ };
+ 
+ // GGML_OP_MUL_MAT
++// [TAG_HC_SILU_EPILOGUE] MUL_MAT + UNARY(SILU) : la SILU de sortie du matvec est absorbee dans
++// l'epilogue du noyau (motif qwen4exp build_hc_mix : lo = silu(w_down * xn), 97x/token).
++// Le graphe entier est execute et compare au CPU (NMSE) : un SILU perdue ou dupliquee est detectee.
++struct test_mul_mat_silu : public test_case {
++    const ggml_type type_a;
++    const ggml_type type_b;
++    const int64_t m;
++    const int64_t n;
++    const int64_t k;
++
++    std::string vars() override {
++        return VARS_TO_STR5(type_a, type_b, m, n, k);
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    test_mul_mat_silu(ggml_type type_a = GGML_TYPE_Q4_0, ggml_type type_b = GGML_TYPE_F32,
++            int64_t m = 320, int64_t n = 3, int64_t k = 10240)
++        : type_a(type_a), type_b(type_b), m(m), n(n), k(k) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
++        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k, n);
++        ggml_set_name(a, "a");
++        ggml_set_name(b, "b");
++
++        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
++        ggml_set_name(mm, "mm");
++        ggml_tensor * out = ggml_silu(ctx, mm);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "MUL_MAT_SILU";
++    }
++};
++
+ struct test_mul_mat : public test_case {
+     const ggml_type type_a;
+     const ggml_type type_b;
+@@ -8421,6 +8583,13 @@ static const ggml_type other_types[] = {
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++
++    // [TAG_TOPK_QSA_PERF] formes EXACTES du top_k de la selection QSA (k = 2051 > 1024 -> chemin RADIX)
++    // Le mode `test` valide l'ENSEMBLE des indices ; ce bloc n'existe que pour CHRONOMETRER.
++    for (int64_t nrows : {1, 2, 4, 7}) {
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {64512, nrows, 1, 1}, 2051));
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {131072, nrows, 1, 1}, 2051));
++    }
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -8529,6 +8698,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ 
+     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
++
++    // [TAG_QSA_RAW_GATHER] gather brut : formes reelles du QSA au decodage (q8_0, 512 dims de ligne,
++    // indices non contigus, 2304 puis 131072 lignes) + le masque F16 (lignes de 1 element).
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512,   2304,   2304, 2, false));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512,   2304,   2304, 2, true));
++    // [TAG_TOPK_SORTED] nos formes QSA reelles (512 dims, 64512 lignes, 2051 selectionnees) dans les
++    // DEUX ordres d'indices : validation de fidelite (diff) ET de non-regression sur indices tries.
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 64512, 2051, 1, true, false));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 64512, 2051, 1, true, true));
++    // la meme forme a des profondeurs plus grandes, pour verifier que l'effet tient
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 131072, 2051, 1, true, false));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 131072, 2051, 1, true, true));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 131072,   2304, 2, false));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 131072, 131072, 1, false));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 131072, 131072, 1, true));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_F16,   1, 131072,   2304, 2, false));
+     for (ggml_type type : all_types) {
+         for (int b : {1, 7}) {
+             for (bool v : {false, true}) {
+@@ -9181,6 +9366,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+     }
+ 
++    // [TAG_HC_SILU_EPILOGUE] fusion MUL_MAT + UNARY(SILU) : formes exactes de qwen4exp hc_mix
++    // (lo = silu(w_down*xn) : m=320 k=10240 ; gate = silu(w_up*lo) : m=10240 k=320) + w_inject.
++    for (ggml_type ta : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
++        test_cases.emplace_back(new test_mul_mat_silu(ta, GGML_TYPE_F32, 320, 3, 256));
++        test_cases.emplace_back(new test_mul_mat_silu(ta, GGML_TYPE_F32, 4, 3, 10240));
++        test_cases.emplace_back(new test_mul_mat_silu(ta, GGML_TYPE_F32, 320, 1, 10240));
++        // lots de 2 tokens : ne11 == 1, plusieurs colonnes
++        test_cases.emplace_back(new test_mul_mat_silu(ta, GGML_TYPE_F32, 320, 4, 256));
++    }
++
+     for (auto multi_add : {false, true}) {
+         for (auto set_rows : {false, true}) {
+             for (auto broadcast : {false, true}) {
+@@ -9287,6 +9482,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
+ #endif
+ 
++    // [HC-MATVEC] formes EXACTES des 2 matvec bornants de qwen4exp build_hc_mix (97x/token),
++    // num_cols = 3 = verif MTP (dst->ne[1] = 3 -> chemin mul_mat_vec). Validation vs CPU (NMSE 5e-4)
++    // obligatoire AVANT tout A/B de variante de pipeline (LARGE_AMD_COLS, NUM_ROWS, coalesced).
++    for (ggml_type ta : { GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0_ROCMFP4 }) {
++        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,   320, 3, 10240, {1, 1}, {1, 1})); // w_down
++        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10240, 3,   320, {1, 1}, {1, 1})); // w_up
++        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,   320, 1, 10240, {1, 1}, {1, 1})); // w_down n=1 (LARGE_AMD actif)
++        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10240, 1,   320, {1, 1}, {1, 1})); // w_up n=1
++        // largeurs REELLES du decode MTP observees au perf logger : n = 2 et n = 4
++        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,   320, 2, 10240, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,   320, 4, 10240, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10240, 2,   320, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10240, 4,   320, {1, 1}, {1, 1}));
++    }
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4, 4, 10240, {1, 1}, {1, 1})); // w_inject (n=4)
++
+     for (ggml_type type_a : all_types) {
+         for (int i = 1; i < 10; ++i) {
+             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
+@@ -9845,6 +10056,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++    // [TAG_TOPK_QSA] formes EXACTES du top_k de la selection QSA (qwen4exp) : k = 2051 > 1024
++    // => chemin RADIX (un workgroup par ligne). nrows = largeurs MTP observees (1 = draft, 2..7 = verify).
++    // Le contrat ggml_top_k autorise n'importe quel ordre : la validation compare l'ENSEMBLE des indices.
++    for (int64_t nrows : {1, 2, 4, 7}) {
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {64512, nrows, 1, 1}, 2051));
++
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {65536, nrows, 1, 1}, 2051));
++    }
+     for (int k : {1, 2, 3, 7, 15}) {
+         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
+         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
+@@ -10277,6 +10496,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (int64_t kv : { 8192, 32768 }) {
+         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+     }
++    // [TAG_FA_KVTYPE] la variante f16 doit valider contre le CPU comme la q8_0
++    for (int64_t kv : { 8192, 32768 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    // [TAG_FA_PREC] la variante f16acc doit passer la comparaison CPU pour etre deployable
++    for (int64_t kv : { 8192, 32768 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_DEFAULT, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
+ 
+     return test_cases;
+ }
+@@ -10286,6 +10513,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ 
+ // Test cases for performance evaluation: should be representative of real-world use cases
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
++
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+@@ -10312,6 +10540,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+     }
+ 
++    // [HC-MATVEC] formes EXACTES des matvecs de la machinerie hyper-connections de
++    // qwen4exp::build_hc_mix (97 x/forward : 48 couches x 2 mixes + tete), type REEL lu dans
++    // l'en-tete du GGUF prod (Q4_0_ROCMFP4_FAST 4,25 bpw pour down/up ; F16 pour inject) :
++    //   w_down  m=320   k=10240 (1 740 800 o), w_up m=10240 k=320 (1 740 800 o), w_inject f16 m=4 k=10240.
++    // Largeurs REELLES du decode MTP : n=2 et n=4 (n=1 au prefill, n=3 au draft).
++    // Les memes cas sont dans la liste eval (NMSE vs CPU) : le mode perf ne valide RIEN.
++    // Sans ces cas, aucun balayage de pipeline DMMV (SPLITK/LARGE/NUM_ROWS/coalesced) n'est
++    // mesurable : les formes HC n'existaient que dans la liste eval.
++    for (ggml_type ta : { GGML_TYPE_Q4_0_ROCMFP4_FAST }) {
++        for (int64_t n : { 1, 2, 3, 4 }) {
++            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1})); // w_down
++            test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 10240, n,   320, {1, 1}, {1, 1})); // w_up
++        }
++    }
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4, 4, 10240, {1, 1}, {1, 1})); // w_inject
++
++    // [HC-MATVEC-CEILING] matvec n=1 de 44,7 Mo de poids (q8_0 m=8192 k=5120) : sert de MUR
++    // EMPIRIQUE (Go/s reellement atteignable par un DMMV qui ne tient pas en cache), au lieu du
++    // chiffre DRAM 200-230 Go/s qui n'est pas atteignable a 1,74 Mo/appel.
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
++
++    // [TAG_MMID_SWEEP] Balayage de batch pour la ROOFLINE du MoE (chantier 1 : grouped GEMM).
++    // Objectif : voir l'efficacite (Go/s et TFLOPS) par palier de batch aux formes EXACTES du
++    // modele (gate/up k=2560 m=640 ; down k=640 m=2560 ; 512 experts, top-10, type reel), pour
++    // situer le decodage MTP (n = 1..11) par rapport au prefill (n >= 512). Les cas sont aussi
++    // dans la liste eval : le mode perf ne valide RIEN, il faut une validation par cas.
++    for (int64_t n : { 2, 4, 8, 16, 32, 64, 128 }) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
++    }
++
+     // CONT of a 0<->2 permute at DeepSeek-V4 lightning-indexer shapes:
+     // indexer_kq is [n_kv, n_tokens, n_head=64] and gets ggml_cont(ggml_permute(.., 2,1,0,3)).
+     for (int64_t n_kv : { 1024, 1280, 2048, 2304 }) {
+@@ -10550,6 +10809,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     for (int64_t kv : { 2048, 8192, 32768, 65536, 131072 }) {
+         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+     }
++    // [TAG_FA_KVTYPE] MEME forme, MEME profondeur, seul le type du KV change : q8_0 (avant le 17/09)
++    // vs f16 (config DEPLOYEE depuis, +5 % de decode mais -36 % de prefill mesure dans le modele).
++    // But : le surcout prefill du f16 vient-il du KERNEL (octets lus) ou d'un autre poste ? Si c'est
++    // le kernel, un schema "q8_0 au prefill / f16 au decode" recupere le prefill sans perdre le decode.
++    for (int64_t kv : { 2048, 8192, 32768, 65536, 131072 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    // meme comparaison au regime de DECODE (batch MTP reel) sur KV long
++    for (int64_t kv : { 32768, 65536 }) {
++        for (int64_t nb : { 1, 7 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++    }
++    // [TAG_FA_PREC] ACCUMULATION f32 (ce que le modele force aujourd'hui) vs DEFAULT (= pipeline
++    // `f16acc`, selectionne ligne 8666 de ggml-vulkan.cpp quand prec == GGML_PREC_DEFAULT).
++    // Enjeu : le noyau FA est COMPUTE-BOUND (TFLOPS plat a 7,35 de nb=256 a 4096) et sur RDNA
++    // l'accumulation f16 des tuiles WMMA/coopmat est ~2x la f32 => si c'est confirme, le poste
++    // n°1 du prefill (47-53 %) peut etre divise par ~2 avec UNE ligne de modele.
++    for (int64_t kv : { 8192, 32768, 65536 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_DEFAULT, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    for (int64_t kv : { 32768, 65536 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 7, true, false, 0, 0, GGML_PREC_DEFAULT, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++
++    // [TAG_FA_NB_SWEEP] diagnostic P-b : TFLOPS du kernel FA au PREFILL en fonction du nombre de
++    // lignes de requetes (nb), a kv FIXE (65536 = palier de reference du prefill long).
++    // But : distinguer un noyau limite par le staging des tuiles K/V (ou le gain croit avec nb,
++    // donc il faut agrandir la reutilisation par tuile) d'un noyau structurellement limite par le
++    // tile 16x16 (TFLOPS plats en nb). Seuil de controle : reproduire ~6,5 TFLOPS a nb=2048
++    // (mesure du 16/09, kv=65536). Validation incluse (NMSE contre la reference CPU).
++    for (int64_t nb : { 64, 128, 256, 512, 1024, 2048, 4096 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    }
+ 
+     // [TAG_FA_DECODE_BATCH] regime de DECODE : petit batch (nb) sur un KV long. C'est le batch
+     // REEL de la verification MTP (n-max 6 -> nb=7 ; n-max 10 -> nb=11), et le poste dominant du
+@@ -10570,6 +10863,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+     }
+ 
++    // [TAG_MMID_SWEEP] memes paliers que dans la liste perf : la roofline doit pouvoir etre
++    // VALIDEE (NMSE contre le CPU) et pas seulement chronometree.
++    for (int64_t n : { 2, 4, 8, 16, 32, 64, 128 }) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
++    }
++
+ 
+     for (int kv : { 4096, 8192, 16384, }) {
+         for (int hs : { 64, 128, }) {
+@@ -10643,6 +10943,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 1,  1, 1}));
+     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
+ 
++    // [TAG_TOPK_QSA] nos formes exactes, k = 2051 (chemin RADIX, jamais couvert : la boucle ci-dessous
++    // s'arrete a k = 400, qui reste sur le chemin nary-search).
++    for (int64_t nrows : {1, 2, 4, 7}) {
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {64512, nrows, 1, 1}, 2051));
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {65536, nrows, 1, 1}, 2051));
++    }
++    // [TAG_TOPK_SORTED] A/B de l'hypothese du design D2 : MEME forme (512 dims x 64512/131072 lignes x
++    // 2051 selectionnees), SEUL l'ordre des indices change (aleatoire avec remise / distincts tries).
++    // diff=false => la racine du graphe est GET_ROWS_RAW, donc le filtre `-p 'r=2051'` la voit.
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512,  64512, 2051, 1, false, false));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512,  64512, 2051, 1, false, true));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 131072, 2051, 1, false, false));
++    test_cases.emplace_back(new test_get_rows_raw(GGML_TYPE_Q8_0, 512, 131072, 2051, 1, false, true));
+     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
+     for (auto k : {1, 10, 40, 400}) {
+         for (auto nrows : {1, 16}) {
+-- 
+2.53.0
+

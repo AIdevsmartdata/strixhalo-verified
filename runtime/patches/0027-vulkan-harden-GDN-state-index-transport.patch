@@ -1,0 +1,208 @@
+From 33391770cc4a516f201e3d1488e566a36506a4c1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Fri, 4 Sep 2026 20:08:17 +0200
+Subject: [PATCH 27/54] vulkan: harden GDN state-index transport
+
+Restrict input-state fusion to coherent host-visible leaf indices, validate the runtime row before eliding GET_ROWS, and use memcpy for the scalar read. Device-local or computed indices now retain the legacy gather instead of falling back to the descriptor path that produced stale values on RADV. Remove the unused index binding and assert the single-sequence dispatch contract.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 77 ++++++++++++-------
+ .../vulkan-shaders/gated_delta_net.comp       | 11 +--
+ 2 files changed, 50 insertions(+), 38 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 14d3756cfbf..8a35ad954ea 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1889,7 +1889,7 @@ struct vk_op_gated_delta_net_push_constants {
+     uint32_t cache_seq_stride;
+     uint32_t use_fused_state;
+     uint32_t state_row_stride;
+-    uint32_t state_idx; // [ZC-FIX] idx lu côté host (push constant) — le descriptor data_idx n'est pas fiable
++    uint32_t state_idx; // [ZC-FIX] host-read row index transported as a push constant
+ };
+ 
+ struct vk_op_ssm_scan_push_constants {
+@@ -2441,7 +2441,7 @@ struct ggml_backend_vk_context {
+     // eliding the GET_ROWS gather. Maps the GDN node to {ring, indices} and holds
+     // the GET_ROWS nodes to skip.
+     const ggml_tensor * fused_gdn_state_read {};   // ring read by the current node
+-    const ggml_tensor * fused_gdn_state_idx  {};   // index vector read by the current node
++    const ggml_tensor * fused_gdn_state_idx  {};   // index tensor read on the host for this node
+     std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, const ggml_tensor *>> gdn_state_fused;
+     std::unordered_set<const ggml_tensor *>                      gdn_state_skip;
+ 
+@@ -6375,7 +6375,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             for (uint32_t kda = 0; kda < 2; kda++) {
+                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
+-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
++                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+             }
+         }
+@@ -8637,6 +8637,26 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+     return vk_subbuffer{buffer, offset, size};
+ }
+ 
++// Read a scalar graph input only when Vulkan exposes the exact tensor storage as
++// coherent host memory. Device-local inputs deliberately fall back to the original
++// GET_ROWS node rather than using the descriptor path that proved stale on RADV UMA.
++static bool ggml_vk_tensor_read_i32_host(
++        const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, int32_t * value) {
++    if (!tensor || tensor->type != GGML_TYPE_I32 || ggml_nbytes(tensor) < sizeof(*value)) {
++        return false;
++    }
++
++    const vk_subbuffer buf = ggml_vk_tensor_subbuffer(ctx, tensor);
++    const auto host_required = vk::MemoryPropertyFlagBits::eHostVisible |
++                               vk::MemoryPropertyFlagBits::eHostCoherent;
++    if ((buf.buffer->memory_property_flags & host_required) != host_required || !buf.buffer->ptr) {
++        return false;
++    }
++
++    memcpy(value, (const uint8_t *)buf.buffer->ptr + buf.offset, sizeof(*value));
++    return true;
++}
++
+ // Get a command buffer from pool. Create a new one if no reusable buffer is available
+ static vk_command_buffer* ggml_vk_get_or_create_cmd_buffer(vk_device& device, vk_command_pool& pool) {
+     for (auto& cmd_buffer : pool.cmd_buffers) {
+@@ -13460,33 +13480,25 @@ static void ggml_vk_gated_delta_net(
+     uint32_t use_fused_state = 0;
+     uint32_t state_row_stride = 0;
+     vk_subbuffer state_buf = src_buf[5];
+-    vk_subbuffer idx_buf    = src_buf[5]; // valid dummy binding in the legacy path
+     if (fused_state_ring) {
+         GGML_ASSERT(fused_state_idx != nullptr);
++        GGML_ASSERT(n_seqs == 1);
+         GGML_ASSERT(fused_state_ring->type == GGML_TYPE_F32);
+         GGML_ASSERT(fused_state_idx->type == GGML_TYPE_I32);
+         use_fused_state = 1;
+         state_row_stride = (uint32_t)(fused_state_ring->nb[1] / sizeof(float));
+         state_buf = ggml_vk_tensor_subbuffer(ctx, fused_state_ring);
+-        idx_buf   = ggml_vk_tensor_subbuffer(ctx, fused_state_idx);
+     }
+ 
+-    // [ZC-FIX] le GDN ne peut pas lire l'index s_copy via descriptor (binding 8) :
+-    // la valeur vue par le kernel au moment de l'exécution n'est pas celle écrite par
+-    // set_input (cause exacte non élucidée — voir FINDINGS §79). On lit l'index côté
+-    // host au moment du dispatch et on le passe par push constant, ce qui est fiable.
++    // [ZC-FIX] The row index is read from coherent host-visible storage and passed
++    // as a push constant. prepare_gdn_state_fusion() already rejected device-local
++    // or out-of-range indices, so reaching this dispatch establishes both invariants.
+     uint32_t state_idx_pc = 0;
+     if (fused_state_ring) {
+-        auto ib_ctx2 = (ggml_backend_vk_buffer_context *)fused_state_idx->buffer->context;
+-        if (ib_ctx2->dev_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+-            state_idx_pc = (uint32_t)*(const int32_t *)((const uint8_t *)ib_ctx2->dev_buffer->ptr + vk_tensor_offset(fused_state_idx) + fused_state_idx->view_offs);
+-        } else {
+-            // buffer device-local : on ne peut pas lire côté host — on garde la lecture GPU
+-            // via data_idx (mode 1 ne doit alors PAS utiliser state_idx_pc).
+-            state_idx_pc = 0;
+-            // marquer l'usage GPU en forçant use_fused_state = 4
+-            if (use_fused_state == 1) use_fused_state = 4;
+-        }
++        int32_t state_idx_host = 0;
++        GGML_ASSERT(ggml_vk_tensor_read_i32_host(ctx, fused_state_idx, &state_idx_host));
++        GGML_ASSERT(state_idx_host >= 0 && state_idx_host < fused_state_ring->ne[1]);
++        state_idx_pc = (uint32_t)state_idx_host;
+     }
+ 
+     const vk_op_gated_delta_net_push_constants pc = {
+@@ -13502,7 +13514,7 @@ static void ggml_vk_gated_delta_net(
+     };
+ 
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], state_buf, dst_buf, cache_buf, idx_buf},
++        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], state_buf, dst_buf, cache_buf},
+         pc, { H, n_seqs, S_v });
+ }
+ 
+@@ -16111,9 +16123,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+                 need_sync = true;
+             }
+         }
+-        // [TAG_GDN_ZC] chemin d'entrée fusionné : le noyau lit le ring (et le vecteur
+-        // d'indices) — ordonner contre les écritures précédentes du même buffer
+-        // (rs_z, CPY rollback).
++        // [TAG_GDN_ZC] chemin d'entrée fusionné : le noyau lit le ring directement.
++        // Ordonner cette lecture contre les écritures précédentes du même buffer
++        // (rs_z, CPY rollback). L'index est lu côté host avant le dispatch.
+         if (!need_sync && ctx->fused_gdn_state_read) {
+             if (overlaps_unsynced(ctx->fused_gdn_state_read, ctx->unsynced_nodes_written)) {
+                 need_sync = true;
+@@ -16152,12 +16164,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         if (ctx->fused_gdn_cache_dst) {
+             ctx->unsynced_nodes_written.push_back(ctx->fused_gdn_cache_dst);
+         }
+-        // [TAG_GDN_ZC] mémoriser les lectures du ring et des indices pour la suite
++        // [TAG_GDN_ZC] mémoriser la lecture GPU du ring pour la suite.
++        // L'index est transporté par push constant et n'est pas une lecture GPU.
+         if (ctx->fused_gdn_state_read) {
+             ctx->unsynced_nodes_read.push_back(ctx->fused_gdn_state_read);
+-            if (ctx->fused_gdn_state_idx) {
+-                ctx->unsynced_nodes_read.push_back(ctx->fused_gdn_state_idx);
+-            }
+         }
+     }
+     if (vk_enable_sync_logger) {
+@@ -18095,8 +18105,9 @@ static void ggml_vk_prepare_gdn_state_fusion(ggml_backend_vk_context * ctx, ggml
+             ring->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, ring->ne[0])) {
+             continue;
+         }
+-        // index vector: I32 with a single entry (n_seqs == 1)
+-        if (idx->type != GGML_TYPE_I32 || idx->ne[0] != 1 ||
++        // Index vector: one I32 leaf input. A computed index cannot be read on the host
++        // before command submission, so it must retain the original GET_ROWS path.
++        if (idx->op != GGML_OP_NONE || idx->type != GGML_TYPE_I32 || idx->ne[0] != 1 ||
+             idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) {
+             continue;
+         }
+@@ -18109,6 +18120,14 @@ static void ggml_vk_prepare_gdn_state_fusion(ggml_backend_vk_context * ctx, ggml
+         if (ring->ne[0] != chain.getrows->ne[0]) {
+             continue;
+         }
++        // The descriptor path for this scalar has produced stale values on RADV UMA.
++        // Fuse only when the canonical Vulkan subbuffer is host-visible, and validate
++        // the row before suppressing GET_ROWS. Other backends retain the legacy graph.
++        int32_t state_idx = 0;
++        if (!ggml_vk_tensor_read_i32_host(ctx, idx, &state_idx) ||
++            state_idx < 0 || state_idx >= ring->ne[1]) {
++            continue;
++        }
+         // GDN state geometry must match [S_v, S_v, H, 1]
+         const int64_t S_v = src_v->ne[0];
+         const int64_t H   = src_v->ne[1];
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index 701dea8348e..bf85151333d 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -50,9 +50,6 @@ layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+ // Binding 7 is the CPY destination recognized by the backend graph fusion.
+ // It aliases DstBuf in the legacy path and is never written there.
+ layout(binding = 7)           buffer CacheBuf { FLOAT_TYPE data_cache[]; };
+-// Binding 8 is the I32 row-index vector of the elided GET_ROWS (input-side fusion).
+-// Unused in the legacy path.
+-layout(binding = 8) readonly  buffer IdxBuf   { int data_idx[]; };
+ 
+ #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
+ shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+@@ -120,13 +117,9 @@ void main() {
+     // (head, col, row) addressing inside the row is unchanged.
+     uint state_in_base;
+     if (use_fused_state == 1u) {
+-        // [ZC-FIX] index passé par push constant (lu côté host au dispatch) :
+-        // la lecture du descriptor data_idx n'est pas fiable dans ce dispatch
+-        // (valeur périmée observée, cf. FINDINGS §79).
++        // [ZC-FIX] host-read index transported as a push constant. Device-local
++        // indices keep the original GET_ROWS graph and never enter this path.
+         state_in_base = state_idx * state_row_stride + head_id * state_size;
+-    } else if (use_fused_state == 4u) {
+-        // [ZC-FIX] fallback : index non lisible côté host (buffer device-local)
+-        state_in_base = uint(data_idx[seq_id]) * state_row_stride + head_id * state_size;
+     } else {
+         state_in_base = (seq_id * H + head_id) * state_size;
+     }
+-- 
+2.53.0
+

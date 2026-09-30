@@ -1,0 +1,174 @@
+From bcf49d3c3de7af5a6338f69c1938cf6e5613efe8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Fri, 4 Sep 2026 14:48:22 +0200
+Subject: [PATCH 23/54] Revert "ggml: optional dst_state for gated_delta_net
+ snapshots ([TAG_GDN_ZC] stage A)"
+
+The Vulkan port does not need to extend the GGML op API: the recurrent-cache CPY
+can be elided by a backend graph fusion instead, keeping the graph and the public
+API unchanged (mirrors CUDA commit 5a460dea).
+---
+ ggml/include/ggml.h                  |  9 ---------
+ ggml/src/ggml-cpu/ops.cpp            | 18 +++---------------
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp |  1 -
+ ggml/src/ggml.c                      | 17 +----------------
+ src/models/delta-net-base.cpp        |  4 ++--
+ tests/test-backend-ops.cpp           |  2 +-
+ 6 files changed, 7 insertions(+), 44 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 92624acce8d..d3819c7b54f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2606,14 +2606,6 @@ extern "C" {
+     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
+     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
+     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+-    //
+-    // [TAG_GDN_ZC] dst_state (nullable): when set, the snapshots are written DIRECTLY into
+-    // this view instead of the dst tail — zero-copy into the recurrent ring (port Vulkan du
+-    // commit CUDA 5a460de / PR #23940). Contract: F32, ne[0] = S_v*S_v*H contiguous (the
+-    // per-(seq,head) block, head-major inside), nb[1] = per-seq stride, nb[2] = per-slot
+-    // stride, ne[2] >= min(n_tokens, K). dst then carries the attention scores only
+-    // (no state tail). Requires K > 1. Backends without support must not receive it
+-    // (the builder gates on a backend probe; pass nullptr = legacy behavior).
+     GGML_API struct ggml_tensor * ggml_gated_delta_net(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * q,
+@@ -2622,7 +2614,6 @@ extern "C" {
+             struct ggml_tensor  * g,
+             struct ggml_tensor  * beta,
+             struct ggml_tensor  * state,
+-            struct ggml_tensor  * dst_state,
+             int64_t               K);
+ 
+     // DSA lightning indexer
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 69bcd973dcc..df3aaf6bec7 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -10803,7 +10803,6 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     ggml_tensor * src_g     = dst->src[3];
+     ggml_tensor * src_beta  = dst->src[4];
+     ggml_tensor * src_state = dst->src[5];
+-    ggml_tensor * dst_state = dst->src[6]; // [TAG_GDN_ZC] nullable — vue ring pour les snapshots
+ 
+     const int64_t S_v      = src_v->ne[0];
+     const int64_t H        = src_v->ne[1];
+@@ -10936,20 +10935,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+             if (K > 1) {
+                 const int64_t target_slot = n_tokens - 1 - t;
+                 if (target_slot >= 0 && target_slot < K) {
+-                    // [TAG_GDN_ZC] vue ring fournie : snapshot écrit DIRECTEMENT dans le ring
+-                    // (port CUDA 5a460de), sinon comportement legacy (tail du dst)
+-                    if (dst_state) {
+-                        float * curr_state_o = (float *) (
+-                                (char *) dst_state->data +
+-                                target_slot * dst_state->nb[2] +
+-                                iv3       * dst_state->nb[1]) +
+-                                iv1 * S_v * S_v;
+-                        memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+-                    } else {
+-                        float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
+-                                         (iv3 * H + iv1) * S_v * S_v;
+-                        memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+-                    }
++                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
++                                     (iv3 * H + iv1) * S_v * S_v;
++                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                 }
+             }
+         }
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 287c681f157..1b4459d93fd 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -20380,7 +20380,6 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
+             tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
+             src_clone[2], src_clone[3], src_clone[4], src_clone[5],
+-            tensor->src[6] ? src_clone[6] : nullptr, // [TAG_GDN_ZC]
+             ggml_get_op_params_i32(tensor, 0));
+         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
+             src_clone[0]->flags = tensor->src[0]->flags;
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 808f5852735..ed86a0a4f86 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6364,9 +6364,7 @@ struct ggml_tensor * ggml_gated_delta_net(
+         struct ggml_tensor  * g,
+         struct ggml_tensor  * beta,
+         struct ggml_tensor  * state,
+-        struct ggml_tensor  * dst_state,
+         int64_t               K) {
+-    // [TAG_GDN_ZC] dst_state nullable — voir ggml.h pour le contrat
+     GGML_ASSERT(ggml_is_contiguous_rows(q));
+     GGML_ASSERT(ggml_is_contiguous_rows(k));
+     GGML_ASSERT(ggml_is_contiguous_rows(v));
+@@ -6396,19 +6394,7 @@ struct ggml_tensor * ggml_gated_delta_net(
+     GGML_ASSERT(state->ne[2] == H);
+     GGML_ASSERT(state->ne[3] == n_seqs);
+     GGML_ASSERT(K >= 1);
+-
+-    int64_t state_rows = K * S_v * n_seqs;
+-    if (dst_state) {
+-        // [TAG_GDN_ZC] snapshots -> vue du ring (ne[0] = S_v*S_v*H par bloc (seq,head)),
+-        // dst = scores d'attention uniquement (pas de tail d'état)
+-        GGML_ASSERT(K > 1 && "dst_state requires the snapshot path (K > 1)");
+-        GGML_ASSERT(dst_state->type == GGML_TYPE_F32);
+-        GGML_ASSERT(ggml_is_contiguous_rows(dst_state));
+-        GGML_ASSERT(dst_state->ne[0] == S_v * S_v * H);
+-        GGML_ASSERT(dst_state->ne[1] == n_seqs);
+-        GGML_ASSERT(dst_state->ne[2] >= (n_tokens < K ? n_tokens : K));
+-        state_rows = 0;
+-    }
++    const int64_t state_rows = K * S_v * n_seqs;
+     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+ 
+@@ -6421,7 +6407,6 @@ struct ggml_tensor * ggml_gated_delta_net(
+     result->src[3] = g;
+     result->src[4] = beta;
+     result->src[5] = state;
+-    result->src[6] = dst_state;
+ 
+     return result;
+ }
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index a863791e1b6..ad661264773 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -399,7 +399,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+ 
+     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
+-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*dst_state=*/nullptr, /*K=*/1);
++    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+     if (n_tokens == 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+     } else {
+@@ -564,7 +564,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t K = cparams.n_rs_seq + 1;
+ 
+     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*dst_state=*/nullptr, K);
++    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 2d1b97b8aa1..2809d8dcda6 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4433,7 +4433,7 @@ struct test_gated_delta_net : public test_case {
+         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+         q = ggml_l2_norm(ctx, q, 1e-6f);
+         k = ggml_l2_norm(ctx, k, 1e-6f);
+-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, nullptr, K);
++        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+         return out;
+     }
+ 
+-- 
+2.53.0
+

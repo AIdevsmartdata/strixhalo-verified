@@ -1,0 +1,76 @@
+From 0fd8d9af8a43ecc9ab8f870fe39a206c3e0947d5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Wed, 2 Sep 2026 15:26:27 +0200
+Subject: [PATCH 16/54] =?UTF-8?q?qwen4exp:=20graph=20hygiene=20=E2=80=94?=
+ =?UTF-8?q?=20hoist=20PLE=20conv1d=20weight=20cast,=20drop=20per-layer=20H?=
+ =?UTF-8?q?C=20cont=20copy?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- [TAG_PLE_CONV_FIX] the [kern, hc_dim] conv weight has kern on the fast axis, so each
+  tap's column was cont+cast at every decode step (8 nodes/token). Hoisted to one
+  cont+cast+transpose per graph exec; taps are now free contiguous views.
+- [TAG_HC_NOCONT] hc stream collapse: the adds accept strided views natively and the
+  first add allocates a contiguous dst — removed the per-layer cont copy (48 nodes/token).
+- Verified: temp-0 outputs byte-identical vs previous binary. Decode +1.2% (31.7 -> 32.2 t/s).
+---
+ src/models/qwen4exp.cpp | 26 +++++++++++++++-----------
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 1146813cb18..ec25dbf2d22 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -332,9 +332,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+ 
+     // collapse the streams by their mean
++    // [TAG_HC_NOCONT] the adds below accept strided views natively and the first add
++    // allocates a contiguous dst — the per-layer cont copy was pure dispatch overhead
+     ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+             ggml_row_size(gated->type, n_embd) * hc, 0);
+-    mixed = ggml_cont(ctx0, mixed);
+     for (int64_t c = 1; c < hc; ++c) {
+         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                 ggml_row_size(gated->type, n_embd) * hc,
+@@ -1646,6 +1647,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
+             hist, hc_dim, il);
+ 
+     ggml_tensor * conv_out = nullptr;
++    // [TAG_PLE_CONV_FIX] hoist the weight cast out of the tap loop: the [kern, hc_dim] kernel
++    // has kern on the fast axis, so per-tap columns are strided and were being cont+cast
++    // at every decode step (CPY/CONT x4/token in the profile). One cont+cast+transpose here
++    // makes every tap a free contiguous view.
++    ggml_tensor * w_conv_f32 = model.layers[il].ple_conv1d;
++    if (w_conv_f32->type != GGML_TYPE_F32) {
++        w_conv_f32 = ggml_cast(ctx0, ggml_cont(ctx0, w_conv_f32), GGML_TYPE_F32);
++    }
++    // [hc_dim, kern] contiguous: tap k = wk_all_t[k*hc_dim .. k*hc_dim+hc_dim]
++    ggml_tensor * wk_all_t = ggml_cont(ctx0, ggml_transpose(ctx0, w_conv_f32));
+     for (int64_t k = 0; k < kern; ++k) {
+         // tap k reads (kern-1-k)*dilation positions back
+         const int64_t start = hist - (kern - 1 - k) * dil;
+@@ -1656,16 +1667,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
+                                 padded->nb[1], padded->nb[2],
+                                 ggml_row_size(padded->type, start))));
+ 
+-        // column k of the [kern, hc_dim] kernel is one weight per channel
+-        ggml_tensor * wk = ggml_cont(ctx0,
+-                ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
+-                        model.layers[il].ple_conv1d->nb[1],
+-                        k * model.layers[il].ple_conv1d->nb[0]));
+-        // this kernel keeps the file type, so cast it before it multiplies an f32 activation
+-        wk = ggml_reshape_1d(ctx0, wk, hc_dim);
+-        if (wk->type != GGML_TYPE_F32) {
+-            wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
+-        }
++        // tap k of the kernel: contiguous view of the pre-cast transposed weight
++        ggml_tensor * wk = ggml_view_1d(ctx0, wk_all_t, hc_dim,
++                k * ggml_row_size(wk_all_t->type, hc_dim));
+ 
+         ggml_tensor * term = ggml_mul(ctx0, shifted, wk);
+         conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
+-- 
+2.53.0
+

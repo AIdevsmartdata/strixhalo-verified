@@ -1,0 +1,181 @@
+From ca66b69d0efc3453be12c1bb977823334f32bb9b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Wed, 9 Sep 2026 13:15:24 +0200
+Subject: [PATCH 37/54] vulkan: coopmat1 FA prefill stack (P-hoist + Psh
+ query-major), ported from Nathanw1014
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- hoist GEMM2 P-fragment coopMatLoad out of the hsv_tile loop (e11cafa02)
+- store Psh query-major so the GEMM2 A load vectorizes, LDS 16384->15360B (40f85eb85)
+- host shmem estimator updated to the new Psh layout
+- GGML_VK_FA_FORCE/GGML_VK_FA_TUNING env overrides (prefill regime only, n_rows>=128),
+  with optional 5th subgroup_size field; GGML_VK_DEBUG_FA_TUNING print
+- NOTE: Bc=32/rs=2 override measured faster (-11% FA) but FAILS backend
+  correctness (test-backend-ops FLASH_ATTN_EXT) — rejected, kept default params
+
+Microbench kv=131072 nb=2048 q8_0 (exact qwen4exp prefill shape): 1163 -> 1092 ms (-6.1%)
+Prod prefill 81k nonce: 332.1 -> 321.8 s (-3.1%), toolcall greedy 3/3, France OK
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 50 +++++++++++++++++--
+ .../vulkan-shaders/flash_attn_cm1.comp        | 26 +++++++---
+ 2 files changed, 65 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index b86c18c6231..d428bb31521 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4038,6 +4038,48 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
+     }
+ }
+ 
++// [TAG_FA_TUNING] debug: print the selected FA code path + tuning params for a given shape.
++// Usage: GGML_VK_DEBUG_FA_TUNING=1 (prints one line per distinct shape, from the dispatch side).
++static vk_fa_tuning_params get_fa_tuning_params_dbg(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
++    vk_fa_tuning_params params = get_fa_tuning_params(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
++    // [TAG_FA_TUNING] experiment knobs (no rebuild): GGML_VK_FA_FORCE=scalar|cm1 re-selects the
++    // code path; GGML_VK_FA_TUNING="Br,Bc,wg,rs" overrides block/workgroup parameters.
++    static const char * force = getenv("GGML_VK_FA_FORCE");
++    static const char * ovr_s = getenv("GGML_VK_FA_TUNING");
++    // Overrides gated to the prefill regime (n_rows >= 128): decode/MTP calls (N <= 8)
++    // must keep their upstream-tuned small-N parameters.
++    if ((force || ovr_s) && n_rows >= 128) {
++        if (force) {
++            if (strcmp(force, "scalar") == 0) {
++                params = get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
++            } else if (strcmp(force, "cm1") == 0) {
++                params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
++            }
++        }
++        if (ovr_s) {
++            uint32_t Br = 0, Bc = 0, wg = 0, rs = 0, sub = 0;
++            int nf = sscanf(ovr_s, "%u,%u,%u,%u,%u", &Br, &Bc, &wg, &rs, &sub);
++            if (nf >= 4 && Br > 0 && Bc > 0 && wg > 0 && rs > 0) {
++                params.block_rows = Br;
++                params.block_cols = Bc;
++                params.workgroup_size = wg;
++                params.row_split = rs;
++                if (nf == 5 && sub > 0) {
++                    params.subgroup_size = sub;
++                }
++            }
++        }
++    }
++    static const bool dbg = getenv("GGML_VK_DEBUG_FA_TUNING") != nullptr;
++    if (dbg) {
++        std::cerr << "[FA_TUNING] hsk=" << hsk << " hsv=" << hsv << " n_rows=" << n_rows << " n_kv=" << n_kv
++                  << " k=" << ggml_type_name(k_type) << " v=" << ggml_type_name(v_type) << " f32acc=" << f32acc
++                  << " device.coopmat2=" << device->coopmat2 << " coopmat1_fa=" << device->coopmat1_fa_support << " -> ";
++        params.print();
++    }
++    return params;
++}
++
+ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
+                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
+     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
+@@ -11439,8 +11481,8 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
+     const uint32_t qstride = hsk_pad / 4 + 2;
+     const uint32_t Qf = Br * qstride * f16vec4;
+ 
+-    const uint32_t psh_stride = Br / 4 + 2;
+-    const uint32_t Psh = Bc * psh_stride * f16vec4;
++    const uint32_t psh_stride = Bc / 4 + 2;
++    const uint32_t Psh = Br * psh_stride * f16vec4;
+ 
+     const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
+     const uint32_t sfsh = Bc * sfshstride * acctype;
+@@ -11548,7 +11590,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+ 
+     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
+     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
+-    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
++    vk_fa_tuning_params tuning_params = get_fa_tuning_params_dbg(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
+     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
+ 
+     if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+@@ -11561,7 +11603,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+         workgroups_y /= gqa_ratio;
+     }
+ 
+-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
++    tuning_params = get_fa_tuning_params_dbg(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+ 
+     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
+     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+index 057ed739aa8..c812657973e 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+@@ -44,8 +44,11 @@ shared float tmpsh[row_split];
+ const uint32_t qstride = HSK_pad / 4 + 2;
+ shared FLOAT_TYPEV4 Qf[Br * qstride];
+ 
+-const uint psh_stride = Br / 4 + 2;
+-shared FLOAT_TYPEV4 Psh[Bc * psh_stride];
++// P is stored query-major with KV contiguous so the GEMM2 UseA load can be RowMajor:
++// RADV flips the requested layout for UseA, and only the resulting internal column-major
++// case gets an alignment hint, which is what lets the 16 element loads vectorize.
++const uint psh_stride = Bc / 4 + 2;
++shared FLOAT_TYPEV4 Psh[Br * psh_stride];
+ 
+ // Avoid padding for hsk==256 to make it fit in 48KB shmem.
+ const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
+@@ -382,15 +385,19 @@ void main() {
+ 
+             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
+                 const uint row = tile_row(r);
++                const uint pcol_vec  = col / 4;
++                const uint pcol_comp = col % 4;
+                 if (KV_bounds_check && j * Bc + col >= KV) {
+-                    Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
++                    [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
++                        Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = FLOAT_TYPE(0.0f);
++                    }
+                 } else {
+                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
+                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
+                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                         Lf[r + vec_idx] += Pf[vec_idx];
++                        Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = Pf[vec_idx];
+                     }
+-                    Psh[col * psh_stride + row / 4] = Pf;
+                 }
+             }
+         }
+@@ -423,6 +430,13 @@ void main() {
+ 
+         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
+ 
++        // Psh is not written again until the next KV block, so the P fragments are the same
++        // for every hsv_tile. Load them once instead of re-reading LDS per tile.
++        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
++        [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
++            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * (MatBc / 4), psh_stride, gl_CooperativeMatrixLayoutRowMajor);
++        }
++
+         // Each subgroup handles HSV/4 columns
+         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
+             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
+@@ -476,8 +490,6 @@ void main() {
+ 
+             if (hsv_offset < HSV_pad) {
+                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+-                    coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+-
+                     if (SHMEM_STAGING == 0) {
+                     if (!USE_DECODE_V && !KV_bounds_check) {
+                         // F16/BF16 values can be loaded directly from global memory
+@@ -493,7 +505,7 @@ void main() {
+                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                     }
+ 
+-                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
++                    PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
+                 }
+ 
+                 // Store PVMat to pvsh and load into Of
+-- 
+2.53.0
+

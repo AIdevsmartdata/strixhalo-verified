@@ -1,0 +1,285 @@
+From 9ce7674061edf026cdf164aadd7bb5d1a933bdd8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Tue, 8 Sep 2026 12:42:52 +0200
+Subject: [PATCH 34/54] sampler: backend-sampling + MTP safety fixes
+ (F2/F1/F3/F4)
+
+F2 - ngram-bias transactional state: clone/copy preserve recent + in_thinking,
+backend_init refuses multi-output offload (single shared history).
+F1 - constrained full-vocab fallback: with backend candidates filtered by the
+prefix, rebuild from raw logits and run the whole chain on the CPU.
+F3 - backend_reject hook: grammar/budget rejection resample draws a fresh
+uniform instead of reusing the pending backend draw; accept() no double-advance.
+F4 - server: skip the probabilistic verifier (forbidden grammar_first+backend)
+when a grammar is attached; MTP (no dists) unaffected.
+
+Red/Green: regression test (model-free, real libllama) went 5 FAIL -> 8 PASS.
+Reviewed in bench_qwen38/mtp_deep_20260908/reviews/sampling-mtp.md (F5 deferred).
+---
+ common/sampling.cpp             | 44 ++++++++++++++++++
+ include/llama.h                 | 11 +++++
+ src/llama-sampler.cpp           | 80 +++++++++++++++++++++++++++++++--
+ tools/server/server-context.cpp |  7 ++-
+ 4 files changed, 137 insertions(+), 5 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index f78879e182e..a3ad633a86a 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -702,6 +702,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+                     // grammar_first=false CPU flow: rbudget -> grmr -> chain)
+                     gsmpl->set_raw_logits(ctx, idx);
+ 
++                    // [TAG_CONSTRAINT_REJECT] the pending backend draw was made against the
++                    // unconstrained distribution: discard it so the resample draws a fresh
++                    // uniform and accept() does not double-advance the host RNG
++                    llama_sampler_backend_reject(chain);
++
+                     llama_sampler_apply(gsmpl->rbudget, &cur_p);
+ 
+                     if (gsmpl->grmr && grammar_should_apply(gsmpl)) {
+@@ -745,6 +750,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+                 // downloaded for grammar sequences by the server via llama_set_need_raw_logits)
+                 gsmpl->set_raw_logits(ctx, idx);
+ 
++                // [TAG_CONSTRAINT_REJECT] the pending backend draw was made against the
++                // unconstrained distribution: discard it so the resample draws a fresh
++                // uniform and accept() does not double-advance the host RNG
++                llama_sampler_backend_reject(chain);
++
+                 // [TAG_BUDGET_BACKEND] keep the budget force intact if both are active:
+                 // rbudget first (mask to the forced token), then grammar, then chain —
+                 // same order as the grammar_first=false CPU flow
+@@ -773,6 +783,40 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+         }
+     }
+ 
++    // [TAG_CONSTRAINT_FULLVOCAB] when the backend produced no token for this position, the
++    // sampled candidates may already be filtered by the backend prefix (top-k/top-p/...):
++    // a pending grammar or forced token outside that set could never be produced and the
++    // terminal CPU stage would fail (all -inf -> NaN, or a forbidden singleton). Rebuild the
++    // candidates from the raw logits and run the entire chain on the CPU with the constraints
++    // applied first, mirroring the rejection resample above. Constrained sequences must have
++    // llama_set_need_raw_logits enabled (the server does for grammar and budget sequences).
++    {
++        const bool forcing = rbudget &&
++            common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING;
++        const bool grammar_pending = grmr && grammar_should_apply(gsmpl);
++
++        if ((forcing || grammar_pending) &&
++                (llama_get_sampled_candidates_ith(ctx, idx) != nullptr ||
++                 llama_get_sampled_logits_ith(ctx, idx) != nullptr) &&
++                llama_get_raw_logits_ith(ctx, idx) != nullptr) {
++            gsmpl->set_raw_logits(ctx, idx);
++
++            if (rbudget) {
++                llama_sampler_apply(rbudget, &cur_p);
++            }
++
++            if (grammar_pending) {
++                llama_sampler_apply(grmr, &cur_p);
++            }
++
++            llama_sampler_chain_apply_cpu(chain, &cur_p);
++
++            GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
++
++            return cur_p.data[cur_p.selected].id;
++        }
++    }
++
+     // apply reasoning budget first
+     llama_sampler_apply(rbudget, &cur_p);
+ 
+diff --git a/include/llama.h b/include/llama.h
+index 09cc08a3480..c88e28d0e92 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1348,6 +1348,11 @@ extern "C" {
+         // copy mutable state from src into dst while keeping dst's references to the current sampling graph
+         // src and dst must have the same type and configuration
+         void (*copy_state)(const struct llama_sampler * src, struct llama_sampler * dst);
++
++        // [TAG_CONSTRAINT_REJECT] the backend-sampled token of the current position was rejected
++        // by a host-side constraint (grammar / reasoning-budget FORCING): re-align backend draw
++        // accounting so the CPU rejection resample draws a fresh uniform. Can be NULL.
++        void (*backend_reject)(struct llama_sampler * smpl);
+     };
+ 
+     struct llama_sampler {
+@@ -1400,6 +1405,12 @@ extern "C" {
+     // the backend graph and this CPU application each see the logits exactly once.
+     LLAMA_API void                   llama_sampler_chain_apply_cpu(struct llama_sampler * chain, llama_token_data_array * cur_p);
+ 
++    // [TAG_CONSTRAINT_REJECT] notify backend samplers that the sampled token of the current
++    // position was rejected by a host-side constraint (grammar / reasoning budget FORCING).
++    // Must be called before the CPU rejection resample so it draws a fresh uniform instead of
++    // reusing the pending backend draw. No-op when there is no pending backend draw.
++    LLAMA_API void                   llama_sampler_backend_reject(struct llama_sampler * smpl);
++
+     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
+     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
+ 
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 8dd0d0b8e82..9c1284c3b5d 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -848,6 +848,20 @@ static void llama_sampler_chain_backend_reset(struct llama_sampler * smpl) {
+     }
+ }
+ 
++static void llama_sampler_chain_backend_reject(struct llama_sampler * smpl) {
++    auto * chain = (llama_sampler_chain *) smpl->ctx;
++
++    for (auto & entry : chain->samplers) {
++        if (!entry.is_backend) {
++            break;
++        }
++
++        if (entry.ptr->iface->backend_reject) {
++            entry.ptr->iface->backend_reject(entry.ptr);
++        }
++    }
++}
++
+ static void llama_sampler_chain_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+     const auto * src_chain = (const llama_sampler_chain *) src->ctx;
+     auto * dst_chain = (llama_sampler_chain *) dst->ctx;
+@@ -878,6 +892,7 @@ static struct llama_sampler_i llama_sampler_chain_i = {
+     /* .backend_set_input = */ llama_sampler_chain_backend_set_input,
+     /* .backend_reset     = */ llama_sampler_chain_backend_reset,
+     /* .copy_state        = */ llama_sampler_chain_copy_state,
++    /* .backend_reject    = */ llama_sampler_chain_backend_reject,
+ };
+ 
+ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_params params) {
+@@ -1398,6 +1413,24 @@ static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token t
+     ++sctx->n_backend_draws_committed;
+ }
+ 
++static void llama_sampler_dist_backend_reject(struct llama_sampler * smpl) {
++    auto * sctx = (llama_sampler_dist *) smpl->ctx;
++
++    if (!sctx->backend_transactional) {
++        return;
++    }
++
++    // [TAG_CONSTRAINT_REJECT] advance the host RNG past the backend draws that were
++    // generated but never committed: the pending backend uniform was drawn against the
++    // unconstrained distribution, so the CPU rejection resample must not reuse it
++    // (see llama_sampler_dist_backend_begin for the paired accounting pattern)
++    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
++    while (sctx->n_backend_draws_committed < sctx->n_backend_draws_generated) {
++        dist(sctx->rng);
++        ++sctx->n_backend_draws_committed;
++    }
++}
++
+ static struct llama_sampler_i llama_sampler_dist_i = {
+     /* .name              = */ llama_sampler_dist_name,
+     /* .accept            = */ llama_sampler_dist_accept,
+@@ -1411,6 +1444,7 @@ static struct llama_sampler_i llama_sampler_dist_i = {
+     /* .backend_set_input = */ llama_sampler_dist_backend_set_input,
+     /* .backend_reset     = */ llama_sampler_dist_backend_reset,
+     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_dist>,
++    /* .backend_reject    = */ llama_sampler_dist_backend_reject,
+ };
+ 
+ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
+@@ -1452,6 +1486,21 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
+     }
+ }
+ 
++// [TAG_CONSTRAINT_REJECT] the backend-sampled token of the current position was rejected by
++// a host-side constraint (grammar / reasoning-budget FORCING). Re-aligns backend draw
++// accounting so that:
++//  - the CPU rejection resample draws a fresh uniform (the pending backend uniform was
++//    drawn against the unconstrained distribution and is discarded),
++//  - the subsequent accept() does not double-advance the host RNG.
++// Pair with llama_sampler_backend_begin, which resets the same accounting each step.
++void llama_sampler_backend_reject(llama_sampler * sampler) {
++    GGML_ASSERT(sampler != nullptr);
++
++    if (sampler->iface->backend_reject) {
++        sampler->iface->backend_reject(sampler);
++    }
++}
++
+ // top-k
+ 
+ struct llama_sampler_top_k : public llama_sampler_backend {
+@@ -4099,6 +4148,13 @@ struct llama_sampler_ngram_bias : public llama_sampler_backend {
+     std::vector<float>   pairs_biases;
+     struct ggml_tensor * inp_logit_bias;
+     struct ggml_tensor * inp_logit_idxs;
++
++    void copy_state(const llama_sampler_ngram_bias & src) {
++        // note: pairs_tokens/pairs_biases/inp_logit_bias/inp_logit_idxs belong to the
++        // current sampling graph
++        in_thinking = src.in_thinking;
++        recent      = src.recent;
++    }
+ };
+ 
+ // Max number of (token, bias) pairs pushed to the GPU backend per token.
+@@ -4162,9 +4218,17 @@ static bool llama_sampler_ngram_bias_backend_init(
+         ggml_backend_buffer_type_t   buft,
+         uint32_t                     n_outputs_max_per_seq) {
+     GGML_UNUSED(buft);
+-    GGML_UNUSED(n_outputs_max_per_seq);
+ 
+     auto * sctx = (llama_sampler_ngram_bias *) smpl->ctx;
++
++    // all sequence positions share the single n-gram history / thinking gate captured
++    // before the batch: like penalties, refuse multi-output offload instead of computing
++    // every position from the same stale input
++    if (n_outputs_max_per_seq > 1) {
++        sctx->init(false);
++        return false;
++    }
++
+     sctx->init(true);
+ 
+     // backend only when a lookup callback is available
+@@ -4237,9 +4301,17 @@ static void llama_sampler_ngram_bias_reset(struct llama_sampler * smpl) {
+ 
+ static struct llama_sampler * llama_sampler_ngram_bias_clone(const struct llama_sampler * smpl) {
+     const auto * ctx = (const llama_sampler_ngram_bias *) smpl->ctx;
+-    return llama_sampler_init_ngram_bias(ctx->cache, ctx->lookup_callback, ctx->alpha,
+-                                         ctx->ngram_min, ctx->ngram_max, ctx->n_last,
+-                                         ctx->think_start_token, ctx->think_end_token);
++    auto * result = llama_sampler_init_ngram_bias(ctx->cache, ctx->lookup_callback, ctx->alpha,
++                                                  ctx->ngram_min, ctx->ngram_max, ctx->n_last,
++                                                  ctx->think_start_token, ctx->think_end_token);
++
++    // preserve the transactional state (history and thinking gate): the server clones the
++    // chain before speculative verification and must be able to restore it exactly
++    auto * result_ctx = (llama_sampler_ngram_bias *) result->ctx;
++    result_ctx->in_thinking = ctx->in_thinking;
++    result_ctx->recent      = ctx->recent;
++
++    return result;
+ }
+ 
+ static void llama_sampler_ngram_bias_free(struct llama_sampler * smpl) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index fb0be21ba7f..c89d41a5ed8 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3797,7 +3797,12 @@ private:
+                     accepted.push_back(common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch.back()));
+                     common_sampler_accept(slot.smpl.get(), accepted.back(), true);
+                 } else if (can_rollback && slot.task->params.sampling.temp > 0.0f &&
+-                           slot.spec_dists.size() == slot.spec_draft.size()) {
++                           slot.spec_dists.size() == slot.spec_draft.size() &&
++                           // [TAG_GRAMMAR_BACKEND] the probabilistic verifier forces
++                           // grammar_first, which is unsupported with backend sampling
++                           // (GGML_ASSERT); the standard path below validates grammar
++                           // compliance instead. MTP fills no dists and is unaffected.
++                           !common_sampler_has_grammar(slot.smpl.get())) {
+                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists);
+                 } else {
+                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+-- 
+2.53.0
+

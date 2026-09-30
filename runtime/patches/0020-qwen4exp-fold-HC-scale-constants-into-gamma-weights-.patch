@@ -1,0 +1,126 @@
+From 7ef8c4c48226e09271c25c47552dabea94f72f18 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Thu, 3 Sep 2026 23:09:07 +0200
+Subject: [PATCH 20/54] qwen4exp: fold HC scale constants into gamma weights
+ ([TAG_HC_SCALE_FOLD])
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Optional GGUF key qwen4exp.hyper_connection.scale_fold: when 1, the three
+constant SCALE ops of the hyper-connection graph (lo 1/hc, mixed 1/hc, inject
+1/hc) are omitted — the GGUF gammas (hc_attn_norm, hc_ffn_norm, output_hc_norm)
+carry the 1/hc factor instead (patched in place, F32, power-of-2 exact).
+
+Identity is bit-exact: 1/hc is a power of two, so scaling commutes bitwise
+through the matmul, elementwise ops and the sum of streams. Removes ~3 of the
+~12 per-layer HC micro-kernels measured in the profile (~96 layers x 2 HC).
+
+Default 0 = legacy graph, untouched. Paired with patch_hcfold.py (bench_qwen38).
+---
+ src/llama-arch.cpp      |  4 ++++
+ src/llama-arch.h        |  1 +
+ src/llama-hparams.h     |  2 ++
+ src/models/qwen4exp.cpp | 24 +++++++++++++++++++++---
+ 4 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 4c074b4e11f..6b6ec51c781 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -295,6 +295,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,   "%s.hyper_connection.sinkhorn_iterations"   },
+     { LLM_KV_HYPER_CONNECTION_EPSILON,               "%s.hyper_connection.epsilon"               },
+     { LLM_KV_HYPER_CONNECTION_LOW_RANK,              "%s.hyper_connection.low_rank"              },
++    // [TAG_HC_SCALE_FOLD] fork-only: 1 = les gamma HC sont pre-scalés ×1/hc dans le GGUF,
++    // les 3 SCALE constantes du graphe (lo, mixed, inject) sont omises — identité bit-exacte
++    // (1/hc = puissance de 2). Le patcher GGUF écrit la clé + les gamma scalés.
++    { LLM_KV_HYPER_CONNECTION_SCALE_FOLD,            "%s.hyper_connection.scale_fold"            },
+ 
+     { LLM_KV_PLE_LAYERS,                             "%s.ple.layers"                             },
+     { LLM_KV_PLE_NGRAM_SIZE,                         "%s.ple.ngram_size"                         },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 58edb316e63..fda77fb12ba 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -300,6 +300,7 @@ enum llm_kv {
+     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
+     LLM_KV_HYPER_CONNECTION_EPSILON,
+     LLM_KV_HYPER_CONNECTION_LOW_RANK,
++    LLM_KV_HYPER_CONNECTION_SCALE_FOLD,
+ 
+     LLM_KV_PLE_LAYERS,
+     LLM_KV_PLE_NGRAM_SIZE,
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 1411692a890..d7187fd0313 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -273,6 +273,8 @@ struct llama_hparams {
+     uint32_t dsv4_o_group_count        = 0;
+     uint32_t dsv4_o_lora_rank          = 0;
+     uint32_t dsv4_hc_mult              = 0;
++    // [TAG_HC_SCALE_FOLD] 1 = GGUF pre-scalé (gamma HC ×1/hc), graphe sans les 3 SCALE constants
++    bool     dsv4_hc_scale_fold        = false;
+     uint32_t dsv4_hc_sinkhorn_iters    = 0;
+     uint32_t dsv4_hash_layer_count     = 0;
+     float    dsv4_compress_rope_base   = 0.0f;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index ec25dbf2d22..474fac5b712 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -27,6 +27,11 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
+     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
+     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
++    {
++        uint32_t hc_fold = 0;
++        ml.get_key(LLM_KV_HYPER_CONNECTION_SCALE_FOLD, hc_fold, false);
++        hparams.dsv4_hc_scale_fold = hc_fold != 0;
++    }
+     GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
+     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
+ 
+@@ -323,8 +328,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     xn = ggml_mul(ctx0, xn, w_norm);
+     cb(xn, "hc_norm", il);
+ 
++    // [TAG_HC_SCALE_FOLD] folded GGUF: w_norm porte le ×1/hc, donc xn est déjà scalé et
++    // les 3 SCALE constants (lo, mixed, inject) sont omis — identité bit-exacte (1/hc = 2^-2)
++    const bool folded = hparams.dsv4_hc_scale_fold;
+     ggml_tensor * lo = build_lora_mm(w_down, xn);
+-    lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
++    if (!folded) {
++        lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
++    } else {
++        lo = ggml_silu(ctx0, lo);
++    }
+     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+     cb(gate, "hc_gate", il);
+ 
+@@ -342,7 +354,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+                 ggml_row_size(gated->type, n_embd) * c);
+         mixed = ggml_add(ctx0, mixed, s);
+     }
+-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
++    if (!folded) {
++        mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
++    }
+     cb(mixed, "hc_mixed", il);
+ 
+     if (inject) {
+@@ -362,7 +376,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     const int64_t nt = residual->ne[2];
+ 
+     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
++    // [TAG_HC_SCALE_FOLD] GGUF folded : inject est déjà ×1/hc (w_norm porte le scale)
++    const bool folded = hparams.dsv4_hc_scale_fold;
++    ggml_tensor * w = folded ? ggml_sigmoid(ctx0, inject)
++                              : ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
++    w = ggml_scale(ctx0, w, 2.0f);
+     w = ggml_scale(ctx0, w, 2.0f);
+     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+ 
+-- 
+2.53.0
+

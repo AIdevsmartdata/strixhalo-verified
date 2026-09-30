@@ -1,0 +1,269 @@
+From 1f6cbbedef99c4ae3413acb4488be2d9073b738c Mon Sep 17 00:00:00 2001
+From: itsnotoger <19309683+itsnotoger@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 18:49:58 +0200
+Subject: [PATCH 31/54] kv-cache : optimize restoring non-contiguous cells
+ (#27991)
+
+* kv cache : batch state restore scatter reads per contiguous run
+
+When restoring state into non-contiguous destination cells (e.g. a
+prompt-cache snapshot into a fragmented ring), state_read_data issued
+one small copy per KV cell - ~1.4M copies of a few KiB each for a
+40k+ token restore, taking 25-63 s on the CUDA backend.
+
+The snapshot stores cell rows in cell order, so a maximal run of
+consecutive destination indices maps to one contiguous block and can
+be restored with a single copy. Precompute the runs once and use them
+in all three scatter loops (K, V, transposed V). Byte-identical.
+
+The on-device reader copies with a byte cursor when the read and
+write chunking differs, so the batched reads are safe for it as well.
+Batching makes equal tensor counts with a different split reachable
+(save ranges [2,1] vs restore runs [1,2]); the next commit teaches the
+reader's 1:1 path to fall back to the byte cursor in that case.
+
+Verified in a production setup: 1,363,616 copies / 25-63 s -> 224
+copies / 221-424 ms for the same restores (42,603 cells, 4 runs).
+
+Assisted-by: Claude Code (unsloth/qwen3.8-27b)
+
+* context : fall back to the byte cursor when read and write chunking differ
+
+the on-device reader copies saved state back with a 1:1 copy by tensor
+index whenever the write and read sides recorded the same number of
+tensors, guarded by a per-tensor size assert.
+
+equal tensor counts do not imply equal chunking: a state restore may
+batch its reads per contiguous run of destination cells while the save
+used per-range reads, so both sides can record two tensors that split
+the same data differently, and the assert aborts in all builds.
+
+compare the per-tensor sizes and only take the 1:1 path when the
+chunking actually matches, otherwise fall through to the existing
+byte-cursor copy. both sides enumerate the same logical data in the
+same order, so the cursor copy is well-defined across tensor
+boundaries.
+
+Assisted-by: Claude Code (unsloth/qwen3.8-27b)
+
+* tests : cover state restore scatter reads on host and on-device paths
+
+decode the same prefix on two sequences, interleaving the seq 0 cells
+between the seq 1 cells, so the seq 1 cells are isolated from each
+other in the kv cache (three cells, two saved ranges). save the seq 1
+state, free the interleaved seq 0 cells, and restore: the destination
+is then non-contiguous (two runs), and the restore-side chunking has
+the same tensor count as the save-side with a different split, so the
+scatter path is batched per contiguous run and the on-device reader's
+byte-cursor fallback is exercised.
+
+the restored state is saved again on the host and compared byte for
+byte with the first save: the blob is serialized in sequence cell
+order, so the two saves are identical if and only if the scatter
+restore wrote exactly the same KV content. this documents the
+byte-identical guarantee of the run-batched scatter reads.
+
+one test per io backend: the host (CPU) path and the on-device path.
+
+Assisted-by: Claude Code (unsloth/qwen3.8-27b)
+---
+ src/llama-context.cpp  | 85 +++++++++++++++++++++++++++++++++++++++++-
+ src/llama-kv-cache.cpp | 64 +++++++++++++------------------
+ 2 files changed, 109 insertions(+), 40 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b36a1d605cf..7d5ffbd4875 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2902,9 +2902,90 @@ public:
+                 GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+             }
+ 
+-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+-                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
++            if (mbuf_cur.n_tensors == mbuf.n_tensors) {
++                // an equal tensor count does not imply the same chunking, e.g. save ranges [2,1] vs restore runs [1,2]
++                bool same_chunking = true;
++                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
++                    if (ggml_nbytes(mbuf_cur.cpy[i]) != ggml_nbytes(mbuf.org[i])) {
++                        same_chunking = false;
++                        break;
++                    }
++                }
++
++                if (same_chunking) {
++                    // same chunking: copy 1:1 by index
++                    for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
++                        ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
++                    }
++                    continue;
++                }
++            }
++
++            // different chunking: copy the write-side data (mbuf_cur.cpy) into the read-side targets (mbuf.org)
++            // with a byte cursor. Write and read enumerate the same logical data in the same order but may chunk
++            // it differently (even with an equal number of tensors), so copy across tensor boundaries rather than
++            // 1:1 by index.
++            const size_t total = mbuf_cur.total_size;
++
++            ggml_init_params params_scratch = {
++                /*.mem_size   =*/ 2*(mbuf_cur.cpy.size() + mbuf.org.size())*ggml_tensor_overhead(),
++                /*.mem_buffer =*/ NULL,
++                /*.no_alloc   =*/ true,
++            };
++            ggml_context * ctx_scratch = ggml_init(params_scratch);
++
++            size_t src_pos  = 0;
++            size_t dst_pos  = 0;
++            size_t src_j    = 0;
++            size_t dst_i    = 0;
++            size_t src_base = 0;
++            size_t dst_base = 0;
++
++            while (src_pos < total) {
++                const auto & src_t = mbuf_cur.cpy[src_j];
++                const auto & dst_t = mbuf.org[dst_i];
++
++                const size_t src_size = ggml_nbytes(src_t);
++                const size_t dst_size = ggml_nbytes(dst_t);
++
++                const size_t src_off  = src_pos - src_base;
++                const size_t dst_off  = dst_pos - dst_base;
++
++                const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
++
++                const size_t   el   = ggml_element_size(src_t);
++                const int64_t n_el = (int64_t) (n_copy / el);
++
++                auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
++                ggml_backend_view_init(src_v);
++                auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
++                ggml_backend_view_init(dst_v);
++
++                ggml_backend_tensor_copy(src_v, dst_v);
++
++                src_pos += n_copy;
++                dst_pos += n_copy;
++
++                if (src_pos - src_base == src_size) {
++                    src_base = src_pos;
++                    ++src_j;
++                }
++                if (dst_pos - dst_base == dst_size) {
++                    dst_base = dst_pos;
++                    ++dst_i;
++                }
+             }
++
++            GGML_ASSERT(src_pos == total && dst_pos == total);
++            // any tensors left unvisited hold no data
++            for (size_t i = src_j; i < mbuf_cur.cpy.size(); ++i) {
++                GGML_ASSERT(ggml_nbytes(mbuf_cur.cpy[i]) == 0);
++            }
++            for (size_t i = dst_i; i < mbuf.org.size(); ++i) {
++                GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
++            }
++
++            ggml_free(ctx_scratch);
+         }
+ 
+         GGML_ASSERT(buf_size == 0);
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index a519725f52e..2f2b668043a 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2544,6 +2544,24 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+     auto & cells = v_cells[strm];
+ 
++    // batch the scatter reads per contiguous run of destination indices
++    // from inclusive, to exclusive - same convention as cell_ranges_t
++    // contiguous cells yield a single run covering the whole block
++    struct cell_run { uint32_t from; uint32_t to; };
++    std::vector<cell_run> runs;
++    if (cell_count > 0) {
++        const auto & idxs = sinfo.idxs[0];
++        uint32_t i0 = 0;
++        while (i0 < cell_count) {
++            uint32_t i1 = i0 + 1;
++            while (i1 < cell_count && idxs[i1] == idxs[i1 - 1] + 1) {
++                ++i1;
++            }
++            runs.push_back({idxs[i0], idxs[i1 - 1] + 1});
++            i0 = i1;
++        }
++    }
++
+     uint32_t v_trans;
+     uint32_t n_layer;
+ 
+@@ -2591,17 +2609,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+             return false;
+         }
+ 
+-        if (cell_count) {
+-            if (sinfo.is_contiguous()) {
+-                // Fast path: contiguous cells, single memcpy
+-                io.read_tensor(k, sinfo.head() * k_size_row, cell_count * k_size_row);
+-            } else {
+-                // Slow path: scatter to non-contiguous positions
+-                for (uint32_t i = 0; i < cell_count; ++i) {
+-                    const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
+-                    io.read_tensor(k, dst_offset, k_size_row);
+-                }
+-            }
++        for (const auto & r : runs) {
++            io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
+         }
+     }
+ 
+@@ -2634,17 +2643,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+                 return false;
+             }
+ 
+-            if (cell_count) {
+-                if (sinfo.is_contiguous()) {
+-                    // Fast path: contiguous cells, single memcpy
+-                    io.read_tensor(v, sinfo.head() * v_size_row, cell_count * v_size_row);
+-                } else {
+-                    // Slow path: scatter to non-contiguous positions
+-                    for (uint32_t i = 0; i < cell_count; ++i) {
+-                        const size_t dst_offset = sinfo.idxs[0][i] * v_size_row;
+-                        io.read_tensor(v, dst_offset, v_size_row);
+-                    }
+-                }
++            for (const auto & r : runs) {
++                io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
+             }
+         }
+     } else {
+@@ -2685,22 +2685,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+                 return false;
+             }
+ 
+-            if (cell_count) {
+-                if (sinfo.is_contiguous()) {
+-                    // Fast path: contiguous cells
+-                    const uint32_t h = sinfo.head();
+-                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+-                        const size_t dst_offset = (h + j * cells.size()) * v_size_el;
+-                        io.read_tensor(v, dst_offset, cell_count * v_size_el);
+-                    }
+-                } else {
+-                    // Slow path: scatter to non-contiguous positions
+-                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+-                        for (uint32_t i = 0; i < cell_count; ++i) {
+-                            const size_t dst_offset = (sinfo.idxs[0][i] + j * cells.size()) * v_size_el;
+-                            io.read_tensor(v, dst_offset, v_size_el);
+-                        }
+-                    }
++            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
++                for (const auto & r : runs) {
++                    const size_t dst_offset = ((size_t) r.from + j * cells.size()) * v_size_el;
++                    io.read_tensor(v, dst_offset, (size_t) (r.to - r.from) * v_size_el);
+                 }
+             }
+         }
+-- 
+2.53.0
+

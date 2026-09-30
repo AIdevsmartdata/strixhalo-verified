@@ -1,0 +1,563 @@
+From f28e2b04269ee0ac655e75a98bbd43b511b41d91 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 5 Sep 2026 17:30:05 +0200
+Subject: [PATCH 30/54] vulkan: fuse hc_combine chain into one kernel
+ ([TAG_HC_COMBINE_FUSED] S2, soup)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fuses the per-layer hyper-connection combine of qwen4exp (96x per decode
+token): SIGMOID -> SCALE(2.0) -> SCALE(2.0) -> [RESHAPE w] and RESHAPE(b)
+-> REPEAT_4D -> MUL(b,w) -> ADD(res, mul) become ONE kernel
+  dst = res + b * ((sig*2.0)*2.0)
+while the SIGMOID stays a normal unary kernel node (recomputing
+1/(1+exp(-x)) in a different shader broke byte-exactness vs unary.comp
+codegen — validated by full-model checksum A/B).
+
+- matcher by DEPENDENCIES (lesson S1: never assume DFS node order);
+  requires uses==1 intermediates, exact 2.0f scale factors, f32,
+  contiguous i rows, 4 scalars/thread direct (i,j,k) indexing
+  (no flat idx / fastdiv / fastmod — GPT-5.6 review), local_size 64,
+  grid (n_embd/4/64, hc, nt)
+- precise on every intermediate: mul-then-add as two rounded steps,
+  no FMA contraction
+- skip-set mechanism (GDN_ZC pattern) elides SCALE/SCALE/REPEAT/MUL
+- sync: direct reads of block_out and sig registered in the
+  overlaps_unsynced checks
+- gate env GGML_VK_DISABLE_HC_COMBINE_FUSED; disabled under
+  GGML_VULKAN_CHECK_RESULTS
+
+Validated on the 125B (FOLD.v2): byte-exact (probe/France/probs/texts
+checksums match the pre-change reference), 96/96 chains fused,
+~1% GPU time saved (368ms GPU on a 29.4s-GPU session), +0.74% wall-clock
+on the A/B (4+4 runs).
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 328 +++++++++++++++++-
+ .../vulkan-shaders/hc_combine.comp            |  61 ++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   2 +
+ 3 files changed, 390 insertions(+), 1 deletion(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/hc_combine.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 8a35ad954ea..bf7575cbc86 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -967,6 +967,9 @@ struct vk_device_struct {
+ 
+     vk_pipeline pipeline_add_id_f32;
+ 
++    // [TAG_HC_COMBINE_FUSED] kernel unique du motif hc_combine (f32 uniquement)
++    vk_pipeline pipeline_hc_combine;
++
+     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
+     vk_pipeline pipeline_concat_transpose_i32;
+     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
+@@ -1642,6 +1645,18 @@ struct vk_op_multi_add_push_constants {
+ static_assert(MAX_PARAMETER_COUNT == 12);
+ static_assert(sizeof(vk_op_multi_add_push_constants) <= 256);
+ 
++// [TAG_HC_COMBINE_FUSED] Push constants du kernel hc_combine.comp v5 (indexation
++// dimensionnelle directe, 4 scalaires par thread — pas de vec4 SSBO : les offsets de
++// base des tenseurs du graphe ne sont que 4B-alignés sur ce driver).
++struct vk_op_hc_combine_push_constants {
++    uint32_t n_i;                 // threads par ligne (j,k) = n_embd/4 (4 scalars/thread)
++    uint32_t r_j; uint32_t r_k;  // res strides (f32 units)
++    uint32_t b_k;                 // b   stride  (f32 units, pas de dim j)
++    uint32_t s_j; uint32_t s_k;  // sig strides (f32 units)
++    uint32_t d_j; uint32_t d_k;  // dst strides (f32 units)
++};
++static_assert(sizeof(vk_op_hc_combine_push_constants) <= 128); // limite minimale garantie Vulkan
++
+ struct vk_op_topk_moe_push_constants {
+     uint32_t n_rows;
+     uint32_t n_experts_push;
+@@ -2445,6 +2460,21 @@ struct ggml_backend_vk_context {
+     std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, const ggml_tensor *>> gdn_state_fused;
+     std::unordered_set<const ggml_tensor *>                      gdn_state_skip;
+ 
++    // [TAG_HC_COMBINE_FUSED] hc_combine (qwen4exp build_hc_combine) single-kernel fusion:
++    //   SIGMOID -> SCALE(2.0) -> SCALE(2.0) -> [RESHAPE w]
++    //   RESHAPE(b) -> REPEAT_4D -> MUL(b,w) -> ADD(res, mul)
++    // become one kernel writing the ADD dst: dst = res + b * (4*sigmoid(inject)).
++    // hc_combine_fused maps the terminal ADD node to its operands; hc_combine_skip
++    // holds the SIGMOID/SCALE/SCALE/REPEAT/MUL nodes that are elided. Rebuilt per graph.
++    struct vk_hc_combine_entry {
++        const ggml_tensor * res;  // ADD.src[0] (same shape as dst)
++        const ggml_tensor * b;    // RESHAPE (n_embd, 1, nt) view of block_out
++        const ggml_tensor * sig;  // (hc, nt) output of the standard unary SIGMOID (kept as a real kernel node)
++    };
++    const vk_hc_combine_entry * fused_hc_combine {};   // entry for the current node (nullptr = normal ADD)
++    std::unordered_map<const ggml_tensor *, vk_hc_combine_entry>  hc_combine_fused;
++    std::unordered_set<const ggml_tensor *>                       hc_combine_skip;
++
+     // for GGML_VK_PERF_LOGGER
+     std::unique_ptr<vk_perf_logger> perf_logger;
+     vk::QueryPool query_pool;
+@@ -6059,6 +6089,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
+ 
++    // [TAG_HC_COMBINE_FUSED] 4 bindings (A=res, B=b reshape, C=sig, D=dst)
++    // grid (n_i, hc, nt) : local_size 64, un vec4 par thread
++    ggml_vk_create_pipeline(device, device->pipeline_hc_combine, "hc_combine_f32", hc_combine_f32_len, hc_combine_f32_data, "main", 4, sizeof(vk_op_hc_combine_push_constants), {64, 1, 1}, {}, 1);
++
+     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_set_f32, "set_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 0}, 1);
+ 
+@@ -13057,6 +13091,59 @@ static void ggml_vk_acc(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     });
+ }
+ 
++// [TAG_HC_COMBINE_FUSED] Exécute le kernel unique hc_combine pour le nœud ADD terminal
++// d'une chaîne hc_combine marquée. dst = res + b * (4*sigmoid(inject)). Copie du pattern
++// multi_add (buffers/uma/dispatch) avec 4 tenseurs : res, b_reshape, inject, dst.
++static void ggml_vk_hc_combine(ggml_backend_vk_context * ctx, vk_context& subctx,
++                               const ggml_tensor * res, const ggml_tensor * b,
++                               const ggml_tensor * sig, ggml_tensor * dst) {
++    vk_pipeline pipeline = ctx->device->pipeline_hc_combine;
++    if (pipeline == nullptr) {
++        std::cerr << "ggml_vulkan: Error: Missing hc_combine";
++        GGML_ABORT("fatal error");
++    }
++
++    // v5 : grid (n_i, hc, nt), 4 scalaires par thread, indexation directe (i=t*4+l, j=wg.y, k=wg.z)
++    vk_op_hc_combine_push_constants pc {};
++    pc.n_i = (uint32_t)(dst->ne[0] / 4);
++    pc.r_j = (uint32_t)(res->nb[1] / 4);
++    pc.r_k = (uint32_t)(res->nb[2] / 4);
++    pc.b_k = (uint32_t)(b->nb[2] / 4);
++    pc.s_j = (uint32_t)(sig->nb[0] / 4);
++    pc.s_k = (uint32_t)(sig->nb[1] / 4);
++    pc.d_j = (uint32_t)(dst->nb[1] / 4);
++    pc.d_k = (uint32_t)(dst->nb[2] / 4);
++
++    const ggml_tensor * tensors[4] = { res, b, sig, dst };
++
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    vk_subbuffer sbuf[4];
++    for (uint32_t i = 0; i < 4; ++i) {
++        vk_buffer buf = nullptr;
++        size_t offset = 0;
++        bool uma = false;
++        if (ctx->device->uma) {
++            ggml_vk_host_get(ctx->device, tensors[i]->data, buf, offset);
++            uma = buf != nullptr;
++        }
++        if (!uma) {
++            ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) tensors[i]->buffer->context;
++            GGML_ASSERT(buf_ctx != nullptr);
++            buf = buf_ctx->dev_buffer;
++            offset = vk_tensor_offset(tensors[i]) + tensors[i]->view_offs;
++        }
++        GGML_ASSERT(buf != nullptr && offset % 4 == 0); // scalaires f32 — garanti par le matcher (misalign==0)
++        sbuf[i] = ggml_vk_subbuffer(ctx, buf, offset);
++    }
++
++    // elements en unités de wg_denoms {64,1,1}: (n_i threads, hc, nt)
++    const std::array<uint32_t, 3> elements = { pc.n_i, (uint32_t)dst->ne[1], (uint32_t)dst->ne[2] };
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++        { sbuf[0], sbuf[1], sbuf[2], sbuf[3] }, pc, elements);
++}
++
+ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+     const ggml_tensor *first_node = cgraph->nodes[node_idx];
+     const ggml_tensor *dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+@@ -16131,6 +16218,15 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+                 need_sync = true;
+             }
+         }
++        // [TAG_HC_COMBINE_FUSED] le kernel lit block_out (via le reshape b) et inject
++        // directement — ce ne sont pas des srcs du nœud ADD : ordonner ces lectures
++        // contre les écritures non synchronisées.
++        if (!need_sync && ctx->fused_hc_combine) {
++            if (overlaps_unsynced(ctx->fused_hc_combine->b, ctx->unsynced_nodes_written) ||
++                overlaps_unsynced(ctx->fused_hc_combine->sig, ctx->unsynced_nodes_written)) {
++                need_sync = true;
++            }
++        }
+ 
+         if (need_sync) {
+             if (vk_enable_sync_logger) {
+@@ -16169,6 +16265,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         if (ctx->fused_gdn_state_read) {
+             ctx->unsynced_nodes_read.push_back(ctx->fused_gdn_state_read);
+         }
++        // [TAG_HC_COMBINE_FUSED] mémoriser les lectures GPU directes (b reshape, inject)
++        // pour ordonner les nœuds suivants qui écriraient ces buffers.
++        if (ctx->fused_hc_combine) {
++            ctx->unsynced_nodes_read.push_back(ctx->fused_hc_combine->b);
++            ctx->unsynced_nodes_read.push_back(ctx->fused_hc_combine->sig);
++        }
+     }
+     if (vk_enable_sync_logger) {
+         for (int i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+@@ -16208,7 +16310,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+     case GGML_OP_ADD:
+-        if (ctx->num_additional_fused_ops) {
++        if (ctx->fused_hc_combine) {
++            // [TAG_HC_COMBINE_FUSED] chaîne entière en un kernel : dst = res + b*(4*sigmoid(inject))
++            ggml_vk_hc_combine(ctx, compute_ctx, ctx->fused_hc_combine->res,
++                               ctx->fused_hc_combine->b, ctx->fused_hc_combine->sig, node);
++        } else if (ctx->num_additional_fused_ops) {
+             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
+         } else {
+             ggml_vk_add(ctx, compute_ctx, src0, src1, node);
+@@ -17938,6 +18044,162 @@ static int32_t find_first_set(uint32_t x) {
+ //   cpy  = CPY(src, dst) where dst is a VIEW of the recurrent state cache
+ // Returns the cache view the GDN kernel must write, or nullptr when the pattern
+ // does not match exactly (anything else keeps the plain CPY path).
++// [TAG_HC_COMBINE_FUSED] Préparation par DÉPENDANCES (leçon S1 : l'ordre DFS réel
++// rend REPEAT/MUL/ADD adjacents mais SIGMOID/SCALE ailleurs — le matcher ne suppose
++// AUCUN ordre, il remonte les pointeurs src).
++// Motif cible (qwen4exp build_hc_combine, hc = hyper_connection.count >= 2) :
++//   w_r = RESHAPE_3D(1, hc, nt) ; w_r->src = SCALE(2.0) -> SCALE(2.0) -> SIGMOID -> inject
++//   b_r = RESHAPE_3D(n_embd, 1, nt) ; rep = REPEAT_4D(b_r, (n_embd, hc, nt))
++//   mul = MUL(rep, w_r) ; add = ADD(res, mul) ; dst de l'ADD = (n_embd, hc, nt) f32
++// Identité requise : tous f32, misalign nul, intermédiaires à usage unique,
++// scales EXACTEMENT 2.0f (le kernel fait 2*(2*sigmoid)).
++static bool ggml_vk_match_hc_combine(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx,
++                                      std::unordered_map<const ggml_tensor *, int> & idx_of,
++                                      ggml_backend_vk_context::vk_hc_combine_entry * out) {
++    const ggml_tensor * add = cgraph->nodes[node_idx];
++    if (add->op != GGML_OP_ADD || add->ne[3] != 1) {
++        return false;
++    }
++    const ggml_tensor * res = add->src[0];
++    const ggml_tensor * mul = add->src[1];
++    if (!res || !mul || mul->op != GGML_OP_MUL) {
++        return false;
++    }
++    const ggml_tensor * rep = mul->src[0];
++    const ggml_tensor * w_r = mul->src[1];
++    if (!rep || !w_r || rep->op != GGML_OP_REPEAT || w_r->op != GGML_OP_RESHAPE) {
++        return false;
++    }
++    const ggml_tensor * b_r = rep->src[0];
++    if (!b_r || b_r->op != GGML_OP_RESHAPE) {
++        return false;
++    }
++    // shapes : dst (n_embd, hc, nt), b_r (n_embd, 1, nt), w_r (1, hc, nt)
++    const int64_t n_embd = add->ne[0];
++    const int64_t hc     = add->ne[1];
++    const int64_t nt     = add->ne[2];
++    if (hc < 2 || add->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_are_same_shape(add, res) || !ggml_are_same_shape(add, mul) || !ggml_are_same_shape(add, rep)) {
++        return false;
++    }
++    if (b_r->ne[0] != n_embd || b_r->ne[1] != 1 || b_r->ne[2] != nt || b_r->ne[3] != 1 || b_r->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (w_r->ne[0] != 1 || w_r->ne[1] != hc || w_r->ne[2] != nt || w_r->ne[3] != 1 || w_r->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // chaîne w : RESHAPE <- SCALE(2.0f) <- SCALE(2.0f) <- SIGMOID <- inject (f32 (hc, nt))
++    const ggml_tensor * s1 = w_r->src[0];
++    if (!s1 || s1->op != GGML_OP_SCALE || s1->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const ggml_tensor * s2 = s1->src[0];
++    if (!s2 || s2->op != GGML_OP_SCALE || s2->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const ggml_tensor * sig = s2->src[0];
++    if (!sig || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // Le kernel lit le RÉSULTAT du SIGMOID (exécuté normalement par le pipeline unary
++    // standard : codegen identique, bit-exact). Le SIGMOID lui-même n'est PAS élidé.
++    const ggml_tensor * sig_out = sig;
++    if (sig_out->ne[0] != hc || sig_out->ne[1] != nt) {
++        return false;
++    }
++    // les deux scale portent EXACTEMENT le facteur 2.0f (op_params), le kernel fait 2*(2*sig)
++    float f1, f2;
++    memcpy(&f1, s1->op_params, sizeof(float));
++    memcpy(&f2, s2->op_params, sizeof(float));
++    if (f1 != 2.0f || f2 != 2.0f) {
++        return false;
++    }
++    // intermédiaires à usage unique (par pointeur d'index dans le graphe)
++    auto uses1 = [&](const ggml_tensor * t) {
++        auto it = idx_of.find(t);
++        return it != idx_of.end() && ggml_node_get_use_count(cgraph, it->second) == 1;
++    };
++    if (!uses1(mul) || !uses1(rep) || !uses1(s1) || !uses1(s2) || !uses1(sig)) {
++        return false;
++    }
++    // alignment (comme multi_add : aucun misalign toléré)
++    if (get_misalign_bytes(ctx, res) || get_misalign_bytes(ctx, b_r) ||
++        get_misalign_bytes(ctx, sig_out) || get_misalign_bytes(ctx, add)) {
++        return false;
++    }
++    // v5 : lignes i contiguës f32 (4 scalaires consécutifs par thread) —
++    // aucune contrainte d'alignement 16B : les offsets de base ne sont que 4B-alignés
++    if (add->ne[0] % 4 != 0 ||
++        res->nb[0] != 4 || add->nb[0] != 4 || b_r->nb[0] != 4) {
++        return false;
++    }
++    out->res = res;
++    out->b   = b_r;
++    out->sig = sig_out;
++    return true;
++}
++
++static void ggml_vk_prepare_hc_combine_fusion(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
++    ctx->hc_combine_fused.clear();
++    ctx->hc_combine_skip.clear();
++
++#if defined(GGML_VULKAN_CHECK_RESULTS)
++    // Le checker recalculerait chaque nœud contre le CPU : des nœuds élidés
++    // produiraient de faux mismatches.
++    return;
++#endif
++    if (ctx->device->disable_fusion || getenv("GGML_VK_DISABLE_HC_COMBINE_FUSED") != nullptr) {
++        return;
++    }
++
++    static bool dbg_init = false;
++    static bool dbg = false;
++    if (!dbg_init) {
++        dbg_init = true;
++        dbg = getenv("GGML_VK_DEBUG_HC_COMBINE") != nullptr;
++    }
++
++    // index des pointeurs -> node_idx (une passe, O(n))
++    std::unordered_map<const ggml_tensor *, int> idx_of;
++    idx_of.reserve(cgraph->n_nodes);
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        idx_of[cgraph->nodes[i]] = i;
++    }
++
++    uint32_t fused_n = 0;
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        const ggml_tensor * add = cgraph->nodes[i];
++        if (add->op != GGML_OP_ADD) {
++            continue;
++        }
++        ggml_backend_vk_context::vk_hc_combine_entry entry;
++        if (!ggml_vk_match_hc_combine(ctx, cgraph, i, idx_of, &entry)) {
++            continue;
++        }
++        const ggml_tensor * mul = add->src[1];
++        const ggml_tensor * rep = mul->src[0];
++        const ggml_tensor * w_r = mul->src[1];
++        const ggml_tensor * s1 = w_r->src[0];
++        const ggml_tensor * s2 = s1->src[0];
++        const ggml_tensor * sig = s2->src[0];
++        // SIGMOID VOLONTAIREMENT NON élidé : il reste un nœud unary standard
++        // (le kernel lit son résultat — recomputer l'exp in-kernel a produit des
++        // ULP différents et cassé l'identité byte-à-byte, test S2 du 05/09).
++        ctx->hc_combine_fused[add] = entry;
++        ctx->hc_combine_skip.insert(s1);
++        ctx->hc_combine_skip.insert(s2);
++        ctx->hc_combine_skip.insert(rep);
++        ctx->hc_combine_skip.insert(mul);
++        ++fused_n;
++    }
++    if (dbg) {
++        fprintf(stderr, "[HC_COMBINE] %u chaînes fusionnées, %zu nœuds élidés (graphe de %d nœuds)\n",
++                fused_n, ctx->hc_combine_skip.size(), cgraph->n_nodes);
++    }
++}
++
+ static const ggml_tensor * ggml_vk_gdn_cache_dst(
+         const ggml_tensor * gdn, const ggml_tensor * src, const ggml_tensor * cpy) {
+     if (gdn->type != GGML_TYPE_F32) {
+@@ -18335,6 +18597,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ggml_vk_prepare_gdn_cache_fusion(ctx, cgraph);
+     // [TAG_GDN_ZC] idem pour les GET_ROWS d'état en entrée du GDN
+     ggml_vk_prepare_gdn_state_fusion(ctx, cgraph);
++    // [TAG_HC_COMBINE_FUSED] idem pour les chaînes hc_combine
++    ggml_vk_prepare_hc_combine_fusion(ctx, cgraph);
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         if (first_node_in_batch) {
+@@ -18349,6 +18613,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         if (ctx->gdn_state_skip.count(cgraph->nodes[i])) {
+             continue;
+         }
++        // [TAG_HC_COMBINE_FUSED] SIGMOID/SCALE/SCALE/REPEAT/MUL élidés par le kernel hc_combine
++        if (ctx->hc_combine_skip.count(cgraph->nodes[i])) {
++            continue;
++        }
+ 
+         {
+             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
+@@ -18379,6 +18647,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_gdn_cache_dst = nullptr;
+         ctx->fused_gdn_state_read = nullptr;
+         ctx->fused_gdn_state_idx  = nullptr;
++        ctx->fused_hc_combine    = nullptr;
+         {
+             // [TAG_GDN_ZC] si ce nœud est un GDN dont le CPY de cache est éliminé,
+             // le noyau écrit lui-même la tranche de cache.
+@@ -18392,8 +18661,63 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_gdn_state_read = sit->second.first;
+                 ctx->fused_gdn_state_idx  = sit->second.second;
+             }
++            // [TAG_HC_COMBINE_FUSED] ce nœud est l'ADD terminal d'une chaîne hc_combine :
++            // le kernel unique écrit son dst, les 5 autres nœuds sont élidés (skip-set).
++            auto hcc_it = ctx->hc_combine_fused.find(cgraph->nodes[i]);
++            if (hcc_it != ctx->hc_combine_fused.end()) {
++                ctx->fused_hc_combine = &hcc_it->second;
++            }
+         }
+         const char *fusion_string {};
++        if (ctx->fused_hc_combine) {
++            fusion_string = "HC_COMBINE";
++        }
++        // [TAG_HC_COMBINE_DEBUG] Dump structurel réel du motif hc_combine (l. de leçon S1 :
++        // ne JAMAIS supposer l'ordre DFS — dumper avant d'écrire un matcher).
++        // Gate : GGML_VK_DEBUG_HC_COMBINE, max 6 fenêtres.
++        {
++            static const bool dbg_hcc = getenv("GGML_VK_DEBUG_HC_COMBINE") != nullptr;
++            static uint32_t dbg_hcc_n = 0;
++            if (dbg_hcc && dbg_hcc_n < 6) {
++                const ggml_tensor * nd = cgraph->nodes[i];
++                if (nd->op == GGML_OP_ADD && nd->name && strstr(nd->name, "hc_combine")) {
++                    ++dbg_hcc_n;
++                    // remonte les dépendances (profondeur 6) et imprime : op, node_idx, type,
++                    // ne, nb, view_offs, uses — position réelle dans le DFS.
++                    const ggml_tensor * chain[6];
++                    uint32_t cch = 0;
++                    chain[cch++] = nd;
++                    for (uint32_t k = 0; k + 1 < 6; ++k) {
++                        const ggml_tensor * t = chain[k];
++                        if (!t) break;
++                        const ggml_tensor * s0 = t->src[0];
++                        const ggml_tensor * s1 = t->src[1];
++                        if (cch < 6 && s0) chain[cch++] = s0;
++                        if (cch < 6 && s1) chain[cch++] = s1;
++                    }
++                    for (uint32_t k = 0; k < cch; ++k) {
++                        const ggml_tensor * t = chain[k];
++                        int idx = -1;
++                        for (int j = 0; j <= i; ++j) {
++                            if (cgraph->nodes[j] == t) { idx = j; break; }
++                        }
++                        const ggml_tensor * vs = t->view_src;
++                        char nbbuf[160];
++                        snprintf(nbbuf, sizeof(nbbuf), "%zu,%zu,%zu,%zu",
++                                 (size_t)t->nb[0], (size_t)t->nb[1], (size_t)t->nb[2], (size_t)t->nb[3]);
++                        fprintf(stderr,
++                                "[HCC] root_i=%d k=%u op=%s idx=%d type=%s ne=%lld,%lld,%lld,%lld nb=%s "
++                                "offs=%zu base=%s uses=%u name=%s\n",
++                                i, k, ggml_op_name(t->op), idx, ggml_type_name(t->type),
++                                (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
++                                nbbuf, (size_t)t->view_offs,
++                                vs ? ggml_op_name(vs->op) : "-",
++                                ggml_node_get_use_count(cgraph, idx >= 0 ? idx : i),
++                                t->name ? t->name : "-");
++                    }
++                }
++            }
++        }
+         if (!ctx->device->disable_fusion) {
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+             if (num_adds) {
+@@ -18614,6 +18938,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_gdn_cache_dst = nullptr;
+                 ctx->fused_gdn_state_read = nullptr;
+                 ctx->fused_gdn_state_idx  = nullptr;
++                ctx->fused_hc_combine    = nullptr;
+             }
+         }
+ 
+@@ -18660,6 +18985,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_gdn_cache_dst = nullptr;
+         ctx->fused_gdn_state_read = nullptr;
+         ctx->fused_gdn_state_idx  = nullptr;
++        ctx->fused_hc_combine    = nullptr;
+     }
+ 
+     ctx->last_total_flops = total_flops;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/hc_combine.comp b/ggml/src/ggml-vulkan/vulkan-shaders/hc_combine.comp
+new file mode 100644
+index 00000000000..a98bc887bd7
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/hc_combine.comp
+@@ -0,0 +1,61 @@
++#version 450
++
++// [TAG_HC_COMBINE_FUSED] Single-kernel hc_combine (qwen4exp build_hc_combine), v5
++// (GPT-5.6 review: direct dimensional indexing + 4 scalars/thread; vec4 SSBO path
++// dropped because graph tensor base offsets are only 4B-aligned on this driver —
++// it capped fusion at 2/96 chains):
++//   dst[i,j,k] = res[i,j,k] + b[i,k] * ((sig[j,k] * 2.0) * 2.0)
++// - grid: (ceil(n_embd/4/64), hc, nt), local_size 64, FOUR consecutive i per thread
++// - i = t*4 + {0..3} (contiguous f32 row), j = WG.y, k = WG.z:
++//   NO flat indexing, NO fastdiv/fastmod (t, j, k are in range by construction)
++// - the SIGMOID itself stays a normal unary kernel node (bit-exact by definition);
++//   recomputing 1/(1+exp(-x)) in a different shader broke byte-exactness (S2 test 05/09)
++// Bit-exactness rules (validated empirically by full-model checksum A/B):
++// - `precise` on every intermediate: separate rounded mul then rounded add,
++//   no FMA contraction, exactly like the original MUL/ADD kernel chain
++// - the two *2.0 multiplications (powers of two) are kept distinct, both exact
++
++#extension GL_EXT_control_flow_attributes : require // [[unroll]]
++
++layout (push_constant) uniform parameter
++{
++    uint n_i;             // threads per (j,k) row = n_embd/4 (4 scalars each)
++    uint r_j; uint r_k;  // res strides (f32 units)
++    uint b_k;             // b   stride  (f32 units)  — b has no j dimension
++    uint s_j; uint s_k;  // sig strides (f32 units)
++    uint d_j; uint d_k;  // dst strides (f32 units)
++} p;
++
++layout (binding = 0) readonly restrict buffer A { float data_a[]; }; // res
++layout (binding = 1) readonly restrict buffer B { float data_b[]; }; // b (via reshape of block_out)
++layout (binding = 2) readonly restrict buffer C { float data_c[]; }; // sig (unary SIGMOID output)
++layout (binding = 3) writeonly restrict buffer D { float data_d[]; }; // dst
++
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++void main() {
++    const uint t = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
++    if (t >= p.n_i) {
++        return;
++    }
++    const uint j = gl_WorkGroupID.y; // < hc by grid construction
++    const uint k = gl_WorkGroupID.z; // < nt by grid construction
++
++    const uint x     = t * 4;             // first i of this thread
++    const uint rbase = x + j*p.r_j + k*p.r_k;
++    const uint bbase = x +         k*p.b_k;
++    const uint dbase = x + j*p.d_j + k*p.d_k;
++
++    const float s = data_c[j*p.s_j + k*p.s_k];
++
++    precise float w0 = s * 2.0f;  // SCALE(2.0): exact (power of two)
++    precise float w1 = w0 * 2.0f; // SCALE(2.0): exact (power of two)
++
++    [[unroll]] for (uint l = 0; l < 4; ++l) {
++        precise float r = data_a[rbase + l];
++        precise float b = data_b[bbase + l];
++        precise float m = b * w1; // no FMA contraction: mul is one rounded step
++        precise float o = r + m; // add is the next rounded step, as in the original chain
++        data_d[dbase + l] = o;
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index bacf60b165e..a79844a8db2 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1184,6 +1184,8 @@ void process_shaders() {
+     string_to_spv("add_id_f32", "add_id.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+ 
+     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});
++
++    string_to_spv("hc_combine_f32", "hc_combine.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"C_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "1"}});
+ 
+     string_to_spv("ssm_scan_f32",          "ssm_scan.comp", {{"A_TYPE", "float"}});
+-- 
+2.53.0
+

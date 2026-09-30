@@ -1,0 +1,817 @@
+From cd7a02486067c3660970bf0e5399b94da0239851 Mon Sep 17 00:00:00 2001
+From: agent <agent@ace>
+Date: Wed, 16 Sep 2026 13:33:51 +0200
+Subject: [PATCH 44/54] qsa: fix pooled shadowing (segfault), write indexer
+ keys below budget, env-gated FA split-k, debug traces
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 277 +++++++++++++++++++++++----
+ src/models/qwen4exp.cpp              | 223 +++++++++++++++++----
+ tests/test-backend-ops.cpp           |  47 ++++-
+ 3 files changed, 471 insertions(+), 76 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 98d4ed3367f..8fcb51ce0c2 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2203,8 +2203,20 @@ private:
+ 
+ std::mutex vk_memory_logger::log_mutex;
+ 
++// [TAG_PERF_ACCOUNT] horloge monotone pour la comptabilite CPU du perf-logger.
++// Objectif : expliquer 100 % du temps mural, pas seulement le temps des noyaux GPU.
++//   wall = cpu_loop (iteration des noeuds + construction des command buffers) + submit
++//        + cpu_wait (attente de la fence, pendant laquelle le GPU execute les noyaux)
++//        + gap (temps hors graph_compute : echantillonnage, boucle de speculation, HTTP)
++//   kernel_s est un SOUS-ENSEMBLE de cpu_wait (le travail GPU reellement execute).
++static inline uint64_t vk_perf_now_ns() {
++    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
+ static bool vk_perf_logger_enabled = false;
+ static bool vk_perf_logger_concurrent = false;
++// [TAG_PERF_COVERAGE] trace par graph_compute + suivi de couverture (noeuds vs timestamps)
++static bool vk_perf_logger_trace = false;
+ static bool vk_enable_sync_logger = false;
+ // number of calls between perf logger prints
+ static uint32_t vk_perf_logger_frequency = 1;
+@@ -2315,10 +2327,99 @@ class vk_perf_logger {
+             std::cerr << "Total time: " << total_all_op_times / 1000.0 << " us." << std::endl;
+         }
+ 
++        print_coverage();
++
+         timings.clear();
+         flops.clear();
+     }
+ 
++    // [TAG_PERF_COVERAGE] enregistre, pour un graph_compute, le nombre de noeuds du graphe,
++    // le nombre de timestamps effectivement ecrits (query_idx) et le temps mesure.
++    // Un ecart nodes != queries signale des ops non mesurees ; time_us sert a comparer au temps reel.
++    void log_graph_stats(uint32_t n_nodes, uint32_t n_queries, uint32_t n_invalid, uint64_t total_us) {
++        ++cov_graphs;
++        cov_nodes += n_nodes;
++        cov_queries += n_queries;
++        cov_invalid += n_invalid;
++        cov_time_ns += total_us;
++        if (vk_perf_logger_trace) {
++            std::cerr << "PERF_GRAPH nodes=" << n_nodes << " queries=" << n_queries
++                      << " invalid_deltas=" << n_invalid << " time_us=" << total_us << std::endl;
++        }
++    }
++
++    // [TAG_PERF_ACCOUNT] comptabilite CPU d'un graph_compute.
++    //   entry_ns     : entree dans ggml_backend_vk_graph_compute
++    //   loop_end_ns  : fin de l'iteration des noeuds (construction des command buffers incluse)
++    //   submitted_ns : apres vkQueueSubmit
++    //   waited_ns    : apres waitForFences (le GPU a fini)
++    //   skipped      : aucun timestamp ecrit (query_idx == 0) -> trou de mesure signale
++    void log_cpu_stats(uint64_t entry_ns, uint64_t loop_end_ns, uint64_t submitted_ns, uint64_t waited_ns,
++                       uint64_t kernel_ns, bool skipped) {
++        if (entry_ns == 0) {
++            return;
++        }
++        if (cov_wall_first_ns == 0) {
++            cov_wall_first_ns = entry_ns;
++        }
++        uint64_t gap = (cov_last_exit_ns != 0 && entry_ns > cov_last_exit_ns) ? entry_ns - cov_last_exit_ns : 0;
++        const uint64_t loop = loop_end_ns > entry_ns ? loop_end_ns - entry_ns : 0;
++        const uint64_t sub  = submitted_ns > loop_end_ns ? submitted_ns - loop_end_ns : 0;
++        const uint64_t wait = waited_ns > submitted_ns ? waited_ns - submitted_ns : 0;
++        cov_cpu_loop_ns   += loop;
++        cov_cpu_submit_ns += sub;
++        cov_cpu_wait_ns   += wait;
++        cov_gap_ns        += gap;
++        cov_last_exit_ns   = waited_ns;
++        if (waited_ns > cov_wall_last_ns) {
++            cov_wall_last_ns = waited_ns;
++        }
++        ++cov_graphs_instrumented;
++        if (skipped) {
++            ++cov_skipped;
++        }
++        if (vk_perf_logger_trace) {
++            std::cerr << "PERF_ACCOUNT cpu_loop_us=" << loop / 1000.0
++                      << " submit_us=" << sub / 1000.0
++                      << " wait_us=" << wait / 1000.0
++                      << " gap_us=" << gap / 1000.0
++                      << " kernel_us=" << kernel_ns / 1000.0
++                      << " skipped=" << (skipped ? 1 : 0) << std::endl;
++        }
++    }
++
++    void print_coverage() {
++        if (cov_graphs == 0) {
++            return;
++        }
++        char buf[320];
++        snprintf(buf, sizeof(buf),
++                 "PERF_COVERAGE graphs=%llu nodes=%llu queries=%llu invalid_deltas=%llu measured_s=%.3f query_ratio_pct=%.1f invalid_pct=%.1f",
++                 (unsigned long long) cov_graphs, (unsigned long long) cov_nodes,
++                 (unsigned long long) cov_queries, (unsigned long long) cov_invalid,
++                 cov_time_ns / 1e9,
++                 cov_nodes ? (100.0 * (double) cov_queries / (double) cov_nodes) : 0.0,
++                 cov_queries ? (100.0 * (double) cov_invalid / (double) cov_queries) : 0.0);
++        std::cerr << buf << std::endl;
++
++        // [TAG_PERF_ACCOUNT] le mur est explique : cpu_loop + submit + wait + gap.
++        // kernel_s est un sous-ensemble de cpu_wait (travail GPU pendant l'attente de fence).
++        const double wall = cov_wall_last_ns > cov_wall_first_ns
++                          ? (double) (cov_wall_last_ns - cov_wall_first_ns) / 1e9 : 0.0;
++        const double loop = cov_cpu_loop_ns / 1e9, sub = cov_cpu_submit_ns / 1e9;
++        const double wait = cov_cpu_wait_ns / 1e9, gap = cov_gap_ns / 1e9, kern = cov_time_ns / 1e9;
++        char buf2[440];
++        snprintf(buf2, sizeof(buf2),
++                 "PERF_ACCOUNT wall_s=%.3f cpu_loop_s=%.3f(%.0f%%) submit_s=%.3f(%.0f%%) wait_s=%.3f(%.0f%%) "
++                 "gap_s=%.3f(%.0f%%) kernel_s=%.3f(%.0f%% de wall, sous-ensemble du wait) "
++                 "graphs_instrumented=%llu skipped=%llu",
++                 wall, loop, wall ? 100.0 * loop / wall : 0.0, sub, wall ? 100.0 * sub / wall : 0.0,
++                 wait, wall ? 100.0 * wait / wall : 0.0, gap, wall ? 100.0 * gap / wall : 0.0,
++                 kern, wall ? 100.0 * kern / wall : 0.0,
++                 (unsigned long long) cov_graphs_instrumented, (unsigned long long) cov_skipped);
++        std::cerr << buf2 << std::endl;
++    }
++
+     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops) {
+         *n_flops = ggml_vk_get_node_flops(node);
+         std::string fusion_str;
+@@ -2460,6 +2561,12 @@ class vk_perf_logger {
+     std::map<std::string, std::vector<uint64_t>> timings;
+     std::map<std::string, std::vector<uint64_t>> flops;
+     uint32_t print_count {};
++    // [TAG_PERF_COVERAGE]
++    uint64_t cov_graphs {}, cov_nodes {}, cov_queries {}, cov_invalid {}, cov_time_ns {};
++    // [TAG_PERF_ACCOUNT] comptabilite complete du temps mural
++    uint64_t cov_cpu_loop_ns {}, cov_cpu_submit_ns {}, cov_cpu_wait_ns {}, cov_gap_ns {};
++    uint64_t cov_wall_first_ns {}, cov_wall_last_ns {}, cov_last_exit_ns {};
++    uint64_t cov_skipped {}, cov_graphs_instrumented {};
+ };
+ 
+ struct ggml_backend_vk_context {
+@@ -5149,10 +5256,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         };
+ 
+         if (dense_wave32_active) {
+-            retile(l_warptile_mmq, 10, 32);
+-            retile(m_warptile_mmq, 10, 32);
+-            retile(s_warptile_mmq, 10, 32);
+-            if (dense_wave32 >= 2) {
++            // Retile selectif des warptiles quantifies, pour separer les effets prefill/decode.
++            // Le mode global (1) gagne +7,3 % de prefill @32k mais perd 26 % de decode ; le but est
++            // d'isoler le warptile qui porte le gain. Modes : 1 = l+m+s, 2 = l+m+s + float,
++            // 3 = l, 4 = m, 5 = s, 6 = m+s.
++            const bool rl = (dense_wave32 == 1 || dense_wave32 == 2 || dense_wave32 == 3);
++            const bool rm = (dense_wave32 == 1 || dense_wave32 == 2 || dense_wave32 == 4 || dense_wave32 == 6);
++            const bool rs = (dense_wave32 == 1 || dense_wave32 == 2 || dense_wave32 == 5 || dense_wave32 == 6);
++            if (rl) retile(l_warptile_mmq, 10, 32);
++            if (rm) retile(m_warptile_mmq, 10, 32);
++            if (rs) retile(s_warptile_mmq, 10, 32);
++            if (dense_wave32 == 2) {
+                 retile(l_warptile, 10, 32);
+                 retile(m_warptile, 10, 32);
+                 retile(s_warptile, 10, 32);
+@@ -5324,42 +5438,42 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         if (device->mul_mat ## ID ## _s[TYPE]) \
+             ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mmid_req_sgs);   \
+ 
+-        CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_TQ2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_TQ2_0], matmul_id_subgroup_tq2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_S],   matmul_id_subgroup_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_M],   matmul_id_subgroup_iq1_m_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_XXS], matmul_id_subgroup_iq2_xxs_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ2_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_XS],  matmul_id_subgroup_iq2_xs_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ2_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_S],   matmul_id_subgroup_iq2_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ3_XXS, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_XXS], matmul_id_subgroup_iq3_xxs_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S],   matmul_id_subgroup_iq3_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS],  matmul_id_subgroup_iq4_xs_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL],  matmul_id_subgroup_iq4_nl_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4],  matmul_id_subgroup_rocmfp4_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_id_subgroup_rocmfp4_fast_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp3_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp6_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-        CREATE_MM2(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp8_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_1], matmul_id_subgroup_q4_1_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_1], matmul_id_subgroup_q5_1_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_K], matmul_id_subgroup_q2_k_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_TQ2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_TQ2_0], matmul_id_subgroup_tq2_0_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_K], matmul_id_subgroup_q3_k_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_K], matmul_id_subgroup_q4_k_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_K], matmul_id_subgroup_q5_k_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_S],   matmul_id_subgroup_iq1_s_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_M],   matmul_id_subgroup_iq1_m_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_XXS], matmul_id_subgroup_iq2_xxs_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ2_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_XS],  matmul_id_subgroup_iq2_xs_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ2_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_S],   matmul_id_subgroup_iq2_s_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ3_XXS, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_XXS], matmul_id_subgroup_iq3_xxs_f32, mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ3_S,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S],   matmul_id_subgroup_iq3_s_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS],  matmul_id_subgroup_iq4_xs_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL],  matmul_id_subgroup_iq4_nl_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4],  matmul_id_subgroup_rocmfp4_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q4_0_ROCMFP4_FAST,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0_ROCMFP4_FAST],  matmul_id_subgroup_rocmfp4_fast_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q3_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp3_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q6_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp6_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++        CREATE_MM2(GGML_TYPE_Q8_0_ROCMFPX,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0_ROCMFPX],  matmul_id_subgroup_rocmfpx_fp8_f32,  mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+ #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
+         if (device->ocp_fp4) {
+-            CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32_ocp,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-            CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32_ocp,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++            CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32_ocp,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++            CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32_ocp,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         } else
+ #endif
+         {
+-            CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+-            CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++            CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
++            CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32,   mmq_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+         }
+ 
+         // f16-B variants of the same quant matmul_id pipelines. The _f16 SPIR-V is already built
+@@ -8154,6 +8268,7 @@ static void ggml_vk_instance_init() {
+ 
+     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
++    vk_perf_logger_trace = getenv("GGML_VK_PERF_LOGGER_TRACE") != nullptr;
+     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
+     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
+     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
+@@ -9626,6 +9741,23 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx,
+     const bool mm_m = is_q8_1 ? ctx->device->mul_mat_m_int[src0_type] : ctx->device->mul_mat_m[src0_type];
+     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
+ 
++    // [GUESS_LOG] instrumentation temporaire (GGML_VK_GUESS_LOG=1) : quelle variante de pipeline est
++    // choisie pour quelle forme (m, n, types). Une seule ligne par combinaison unique, pour rester
++    // lisible sur un forward complet. Sert a elucider l'effet de bord observe sur le warptile medium.
++    auto guess_log = [&](const char * path, const char * pick) {
++        static const bool on = getenv("GGML_VK_GUESS_LOG") != nullptr;
++        if (!on) return;
++        static std::mutex mu;
++        static std::set<std::string> seen;
++        char buf[200];
++        snprintf(buf, sizeof(buf), "GUESS %-9s pick=%s m=%-6u n=%-6u t0=%-12s t1=%-5s aligned=%d q8_1=%d",
++                 path, pick, m, n, ggml_type_name(src0_type), ggml_type_name(src1_type),(int) aligned,(int) is_q8_1);
++        std::lock_guard<std::mutex> lk(mu);
++        if (seen.insert(buf).second) {
++            GGML_LOG_WARN("%s\n", buf);
++        }
++    };
++
+     if (ctx->device->coopmat2) {
+         const uint32_t shader_core_count = ctx->device->shader_core_count;
+         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
+@@ -9643,22 +9775,28 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx,
+                             (tiles_l <= shader_core_count / 3 && tiles_m > shader_core_count / 2);
+ 
+         if ((mm_l && (n > crossover_large && prefer_large)) || (!mm_m && !mm_s)) {
++            guess_log("coopmat2", "l");
+             return aligned ? mmp->a_l : mmp->l;
+         }
+         // Use medium shader when the N dimension is greater than the small shader's tile size
+         uint32_t crossover_medium = mmp->s->wg_denoms[1];
+         if ((mm_m && (n > crossover_medium)) || !mm_s) {
++            guess_log("coopmat2", "m");
+             return aligned ? mmp->a_m : mmp->m;
+         }
++        guess_log("coopmat2", "s");
+         return aligned ? mmp->a_s : mmp->s;
+     }
+ 
+     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
++        guess_log("coopmat1", "s");
+         return aligned ? mmp->a_s : mmp->s;
+     }
+     if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
++        guess_log("coopmat1", "m");
+         return aligned ? mmp->a_m : mmp->m;
+     }
++    guess_log("coopmat1", "l");
+     return aligned ? mmp->a_l : mmp->l;
+ }
+ 
+@@ -9726,6 +9864,20 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
+     const bool mm_m = is_q8_1 ? ctx->device->mul_mat_id_m_int[src0_type] : ctx->device->mul_mat_id_m[src0_type];
+     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_id_s_int[src0_type] : ctx->device->mul_mat_id_s[src0_type];
+ 
++    // [TAG_MMID_FORCE_PIPE] Experience decode : forcer la variante de pipeline du MoE (s/m/l).
++    // Motif : au decode, n (tokens) <= 32 -> la variante 's' (tuiles 32x32) est choisie, ce qui
++    // multiplie le nombre de workgroups (640/32 = 20 tuiles M) alors que 512 experts sont
++    // balayes dont ~94 % sortent immediatement (data_expert_count == 0). La variante 'l'
++    // (tuiles 128x128) reduit ce nombre de 4x et charge des blocs plus gros.
++    // Ne change QUE l'ordonnancement (meme boucle sur k) -> a valider par SHA bit-a-bit.
++    static const char * mmid_force_pipe = getenv("GGML_VK_MMID_FORCE_PIPE");
++    if (mmid_force_pipe && !ctx->device->coopmat2) {
++        const char c = mmid_force_pipe[0];
++        if ((c == 's') && mm_s) return aligned ? mmp->a_s : mmp->s;
++        if ((c == 'm') && mm_m) return aligned ? mmp->a_m : mmp->m;
++        if ((c == 'l') && mm_l) return aligned ? mmp->a_l : mmp->l;
++    }
++
+     if (ctx->device->coopmat2) {
+         // Use large shader when the N dimension is greater than the medium shader's tile size
+         uint32_t crossover_large = mmp->m->wg_denoms[1];
+@@ -11904,6 +12056,20 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+         }
+     }
+ 
++    // [TAG_FA_SPLIT_K] Forcer le split_k du kernel d'attention (chantier P-1).
++    // Au prefill (n_tokens > Br), la condition gqa ci-dessus n'est JAMAIS vraie :
++    // split_k reste a 1, la grille est minuscule (n_tokens/Br workgroups) et chaque
++    // workgroup boucle sequentiellement sur tout le KV -> 6,3 TFLOPS a 131k.
++    // Le chemin split_k (et son shader de reduction) est deja implemente et
++    // exerce au decode : on le rend forcable pour pouvoir le mesurer.
++    {
++        const char * env_sk = getenv("GGML_VK_FA_SPLIT_K");
++        if (env_sk != nullptr) {
++            uint32_t forced = (uint32_t) atoi(env_sk);
++            if (forced > 1) { split_k = forced; }
++        }
++    }
++
+     if (split_k > 1) {
+         // Try to evenly split KV into split_k chunks, but it needs to be a multiple
+         // of "align", so recompute split_k based on that.
+@@ -19205,6 +19371,8 @@ static void ggml_vk_prepare_gdn_state_fusion(ggml_backend_vk_context * ctx, ggml
+ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
++    // [TAG_PERF_ACCOUNT] entree : debut de la comptabilite CPU de ce graph_compute
++    const uint64_t perf_entry_ns = vk_perf_logger_enabled ? vk_perf_now_ns() : 0;
+ 
+     ctx->device->diag_cgraph = nullptr;
+     ctx->device->diag_prev_start = -1;
+@@ -19752,6 +19920,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     }
+ 
+     ctx->last_total_flops = total_flops;
++    const uint64_t perf_loop_end_ns = vk_perf_logger_enabled ? vk_perf_now_ns() : 0;
+ 
+     if (vk_perf_logger_enabled) {
+         // End the command buffer and submit/wait
+@@ -19760,19 +19929,32 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ggml_vk_ctx_end(compute_ctx);
+ 
+         ggml_vk_submit(compute_ctx, ctx->device->fence);
++        const uint64_t perf_submitted_ns = vk_perf_now_ns();
+         VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "GGML_VULKAN_PERF waitForFences", ctx->device);
++        const uint64_t perf_waited_ns = vk_perf_now_ns();
+         ctx->device->device.resetFences({ ctx->device->fence });
+         ctx->compute_ctx.reset();
+ 
+         // Get the results and pass them to the logger
+         std::vector<uint64_t> timestamps(cgraph->n_nodes + 1);
+         VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, (cgraph->n_nodes + 1)*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results", ctx->device);
++        uint64_t perf_graph_total_us = 0;
++        uint32_t perf_graph_invalid = 0;
+         if (!vk_perf_logger_concurrent) {
+             // Log each op separately
+             for (int i = 1; i < ctx->query_idx; i++) {
+                 auto node = ctx->query_nodes[i];
+                 auto name = ctx->query_fusion_names[i];
+-                ctx->perf_logger->log_timing(node, name, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
++                // [TAG_PERF_COVERAGE] un timestamp non ecrit vaut 0 : la soustraction NON SIGNEE
++                // produirait un delta negatif converti en ~1.8e19 ns, qui ecrase la mesure et
++                // pollue les statistiques. On ignore ces intervalles et on les compte.
++                if (timestamps[i] == 0 || timestamps[i] < timestamps[i-1]) {
++                    ++perf_graph_invalid;
++                    continue;
++                }
++                uint64_t dt = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
++                perf_graph_total_us += dt;
++                ctx->perf_logger->log_timing(node, name, dt);
+             }
+         } else {
+             // Log each group of nodes
+@@ -19793,6 +19975,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+             }
+         }
++        ctx->perf_logger->log_graph_stats((uint32_t) cgraph->n_nodes, (uint32_t) ctx->query_idx, perf_graph_invalid, perf_graph_total_us);
++        ctx->perf_logger->log_cpu_stats(perf_entry_ns, perf_loop_end_ns, perf_submitted_ns, perf_waited_ns,
++                                        perf_graph_total_us, ctx->query_idx == 0);
+         ctx->perf_logger->print_timings();
+     }
+ 
+@@ -20809,6 +20994,26 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0])) {
+                     return false;
+                 }
++                // [TAG_QSA_TOPK_RADIX] ggml_vk_topk dispose d'un chemin radix (un workgroup
++                // par ligne) pour les k au-dela des pipelines shared-memory : il y bascule
++                // des que k > 2^(num_topk_pipelines-1). Sans ce cas, supports_op refusait
++                // ces top_k ; le scheduler les renvoyait au CPU et inserait 2 frontieres
++                // GPU/CPU par couche d'indexer QSA (12 par ubatch, 465 graph_compute au
++                // lieu de 31 sur un prefill de 64k). Les consommateurs traitent la
++                // selection comme un ensemble, donc l'ordre (non trie) du radix convient.
++                // GGML_VK_NO_TOPK_RADIX=1 force l'ancien comportement (A/B).
++                static const bool no_topk_radix = [] {
++                    const char * e = getenv("GGML_VK_NO_TOPK_RADIX");
++                    return e != nullptr && atoll(e) != 0;
++                }();
++                if (!no_topk_radix && device->pipeline_topk_radix_f32 != nullptr) {
++                    // memes bornes que les GGML_ASSERT de ggml_vk_topk (arithmetique 32 bits)
++                    const uint64_t ncols = (uint64_t) op->src[0]->ne[0];
++                    const uint64_t nrows = (uint64_t) ggml_nrows(op->src[0]);
++                    if (nrows * ncols <= UINT32_MAX && nrows * (uint64_t) op->ne[0] <= UINT32_MAX) {
++                        return true;
++                    }
++                }
+                 // We could potentially support larger, using argsort to sort the
+                 // whole thing. Not clear if this is needed.
+                 uint32_t min_pipeline = (uint32_t)log2f(float(op->ne[0])) + 1;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index e07af5b7c7c..b14c9e7fa36 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -110,6 +110,44 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+         }
+     }
+ 
++    // [QSA-GGUF] Some third-party GGUF conversions write `compress_ratios` as an all-zero array
++    // even though the model ships an indexer and was trained with QSA. That silently disables the
++    // sparse-attention path -- `qsa = ... && dsv4_compress_ratios[il] > 0` -- so the 12
++    // full-attention layers run DENSE attention: ~57x more attention work at long context
++    // (118k KV with a 2051-token budget) and an attention distribution that differs from
++    // training. `indexer_compress_ratio` is not exported as its own GGUF key, so it cannot be
++    // recovered from the file: allow an explicit override instead of guessing.
++    {
++        bool all_zero = true;
++        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
++            if (hparams.dsv4_compress_ratios[il] != 0) {
++                all_zero = false;
++                break;
++            }
++        }
++
++        if (all_zero && hparams.indexer_head_size > 0) {
++            const char * env = getenv("LLAMA_QSA_COMPRESS_RATIO");
++            const uint32_t r = env ? (uint32_t) atoi(env) : 0;
++
++            if (r > 0) {
++                uint32_t n_set = 0;
++                for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
++                    if (!hparams.is_recr(il)) {
++                        hparams.dsv4_compress_ratios[il] = r;
++                        n_set++;
++                    }
++                }
++                LLAMA_LOG_WARN("%s: GGUF compress_ratios is all zero -> forcing r=%u on %u QSA layer(s) from LLAMA_QSA_COMPRESS_RATIO\n",
++                        __func__, r, n_set);
++            } else {
++                LLAMA_LOG_WARN("%s: GGUF compress_ratios is all zero while an indexer is present: QSA is "
++                        "DISABLED and the full-attention layers run DENSE. Set LLAMA_QSA_COMPRESS_RATIO=4 "
++                        "to match Qwen/Qwen3.8-Flash-Next config.json (indexer_compress_ratio).\n", __func__);
++            }
++        }
++    }
++
+     switch (hparams.n_layer()) {
+         case 48: type = LLM_TYPE_A3B; break;
+         default: type = LLM_TYPE_UNKNOWN;
+@@ -669,7 +707,10 @@ public:
+ 
+     void set_input(const llama_ubatch * ubatch) override {
+         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
++        // [TAG_QSA_KEEPKEYS] entree reduite (ecriture des cles seules) : pas d'entrees de selection
++        if (cell_blk != nullptr) {
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
++        }
+     }
+ 
+     bool can_reuse(const llm_graph_params & params) override {
+@@ -689,6 +730,10 @@ public:
+         res &= params.ubatch.n_tokens % n_stream == 0;
+ 
+         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
++        if (cell_blk == nullptr) {
++            // [TAG_QSA_KEEPKEYS] cette entree ne porte que les k_idxs (elle ne selectionne pas)
++            return res;
++        }
+         res &= cell_blk->ne[0]  == n_kv;
+         res &= cell_blk->ne[1]  == n_stream;
+         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+@@ -729,11 +774,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+     GGML_ASSERT(r > 0);
+ 
++    // [TAG_QSA_KEEPKEYS] pendant la construction du graphe de reserve (resolve_fused_ops /
++    // graph_reserve), les poids du modele sont des tenseurs NULL : ne rien construire dans ce
++    // cas (comportement de l'ancien garde, qui sortait avant tout build_lora_mm).
++    if (model.layers[il].index_k_proj == nullptr || cur == nullptr) {
++        return nullptr;
++    }
++
+     const int64_t n_blocks = (n_kv + r - 1)/r;
+ 
+     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
+     const int64_t n_stream = mctx_hyb->get_n_stream();
+-    GGML_ASSERT(n_tokens % n_stream == 0);
++    // [TAG_QSA_KEEPKEYS] GGML_ASSERT est un no-op en release : le graphe de RESERVE utilise un
++    // ubatch factice de 1 token pour 4 streams (n_tps = 1/4 = 0) -> tenseurs degeneres -> un
++    // tenseur NULL finit dans ggml_mul_mat (segfault a +0x1a de ggml_mul_mat). On sort donc vers
++    // le chemin dense quand la contrainte n'est pas respectee, au lieu de la supposer.
++    if (n_tokens % n_stream != 0) {
++        return nullptr;
++    }
+     const int64_t n_tps = n_tokens/n_stream;
+ 
+     // only the "which block is visible" half of the bias varies per block
+@@ -744,29 +802,74 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
+         cparams.causal_attn && !hparams.use_alibi;
+ 
++    // [TAG_QSA_NOSEL] Sous le budget (n_kv <= indexer_top_k + r - 1) le top_k selectionne deja
++    // tous les tokens (width == n_kv) et le masque reconstruit devrait etre bit-a-bit egal au
++    // masque causal. Mesure 2026-09-14 : avec des egalites massives de scores relu (blocs sans
++    // match = 0.0 exact), le top_k a k == n retourne des doublons -> set_rows demasque moins de
++    // cellules que n_kv -> perte de contexte DEPENDANTE DU CONTENU (chiffres transposes, runaway).
++    // On sort donc vers le chemin dense, reference exacte sous le budget. A/B : LLAMA_QSA_NOSEL_GUARD=0.
++    const bool nosel_guard = [] {
++        const char * e = getenv("LLAMA_QSA_NOSEL_GUARD");
++        return e == nullptr || atoll(e) != 0;
++    }();
++    const bool select = !(nosel_guard && n_kv <= (int64_t) hparams.indexer_top_k + r - 1);
++
++    // [TAG_QSA_KEEPKEYS] Sous le budget on reste sur le chemin dense (reference exacte), mais on
++    // ECRIT QUAND MEME les cles d'indexer. Sinon, des que la sequence depasse le budget, les
++    // premiers blocs sont scores sur des cles jamais ecrites -> selection corrompue. C'est la
++    // cause du KO du round-trip pi+read sous QSA (14/09) : un premier tour sous 2051 tokens
++    // n'ecrivait aucune cle, le tour suivant au-dela du budget scorait des cles absentes.
++    //
++    // Les entrees de selection (cell_blk, blk_cells, blk_pos, bias) ne sont creees QUE si l'on
++    // selectionne : les creer sans qu'aucun noeud ne les consomme fait planter le backend
++    // (GGML_ASSERT(buffer) au premier set_input, incident du 15/09). D'ou deux jeux d'entrees
++    // distincts, choisis par la cle de map.
++    const bool write_keys = select || [] {
++        const char * e = getenv("LLAMA_QSA_WRITE_KEYS");
++        return e == nullptr || atoll(e) != 0;   // actif par defaut ; =0 restaure l'ancien comportement
++    }();
++    if (!select && !write_keys) {
++        return nullptr;
++    }
++
++    // [TAG_QSA_DBG] trace de diagnostic (LLAMA_QSA_DEBUG=1) : n_kv, decision, pointeurs
++    static const bool qsa_dbg = [] {
++        const char * e = getenv("LLAMA_QSA_DEBUG");
++        return e != nullptr && atoll(e) != 0;
++    }();
++    if (qsa_dbg) {
++        fprintf(stderr, "[QSA_DBG] il=%d n_kv=%lld n_tokens=%lld select=%d write_keys=%d ikp=%p cur=%p\n",
++                (int) il, (long long) n_kv, (long long) n_tokens, (int) select, (int) write_keys,
++                (void *) model.layers[il].index_k_proj, (void *) cur);
++        fflush(stderr);
++    }
++
+     // nothing above depends on the layer, so the layers sharing a ratio share one input set
++    const uint32_t inp_key = (uint32_t) r | (select ? 0x10000u : 0u);
+     llm_graph_input_qsa * inp = nullptr;
+ 
+-    const auto it = qsa_inps.find((uint32_t) r);
++    const auto it = qsa_inps.find(inp_key);
+     if (it != qsa_inps.end()) {
+         inp = it->second;
+     } else {
+         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+ 
+-        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+-
+-        ggml_set_input(qsa->cell_blk);
+-        ggml_set_input(qsa->blk_cells);
+-        ggml_set_input(qsa->blk_pos);
+-        ggml_set_input(qsa->bias);
++        qsa->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
++        if (select) {
++            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
++            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
++            qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
++            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
++
++            ggml_set_input(qsa->cell_blk);
++            ggml_set_input(qsa->blk_cells);
++            ggml_set_input(qsa->blk_pos);
++            ggml_set_input(qsa->bias);
++        }
+ 
+         inp = qsa.get();
+         res->add_input(std::move(qsa));
+-        qsa_inps.emplace((uint32_t) r, inp);
++        qsa_inps.emplace(inp_key, inp);
+     }
+ 
+     // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
+@@ -776,33 +879,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
+ 
++    // sous le budget : cles ecrites, pas de selection -> attention dense (reference exacte)
++    if (!select) {
++        return nullptr;
++    }
++
+     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
+     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
++    if (qsa_dbg) { fprintf(stderr, "[QSA_DBG]   get_k -> %p\n", (void *) k_all); fflush(stderr); }
++    // [TAG_QSA_KEEPKEYS] graphe de RESERVE : le cache d'indexer n'a pas encore de tenseur k
++    // (get_k renvoie NULL). ggml_get_rows est implemente VIA ggml_mul_mat pour le cas F32+I32,
++    // d'ou un segfault a +0x1a de ggml_mul_mat si l'on ne verifie pas. C'est un bug preexistant
++    // (QSA + un contexte reserve assez grand) que ce garde ferme : on reste en dense.
++    if (k_all == nullptr) {
++        return nullptr;
++    }
+     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
+ 
+-    // gathers per stream: blk_cells row s indexes stream s's own cells
+-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
+-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+-
+-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
++    // [TAG_QSA_BOUND] Le court-circuit du pooling (mesure borne haute LLAMA_QSA_SKIP_POOL) est
++    // retire : le chemin est le pooling reel.
++    //
++    // ATTENTION (bug corrige le 16/09) : la version issue du nettoyage du 15/09 redeclarait
++    // `pooled` DANS la branche active, ce qui MASQUAIT le `pooled` exterieur. Le
++    // ggml_mul_mat du score recevait donc toujours un tenseur NULL -> segfault dans
++    // ggml_mul_mat (+0x1a) : QSA ne pouvait plus fonctionner du tout. Ne jamais redeclarer.
+     ggml_tensor * pooled = nullptr;
+-    for (int64_t i = 0; i < r; ++i) {
+-        ggml_tensor * slice = ggml_cont(ctx0,
+-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+-                        members->nb[2], members->nb[3], i*members->nb[1]));
+-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+-    }
+-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+-    cb(pooled, "indexer_k_pooled", il);
++    {
++        // gathers per stream: blk_cells row s indexes stream s's own cells
++        ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
++        members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
++
++        // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
++        for (int64_t i = 0; i < r; ++i) {
++            ggml_tensor * slice = ggml_cont(ctx0,
++                    ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
++                            members->nb[2], members->nb[3], i*members->nb[1]));
++            pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
++        }
++        pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
++        cb(pooled, "indexer_k_pooled", il);
++
++        // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
++        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
++        pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
++        pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
++                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
++        cb(pooled, "indexer_k", il);
+ 
+-    // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
+-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
+-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
+-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+-            ext_factor, attn_factor, beta_fast, beta_slow);
+-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+-    cb(pooled, "indexer_k", il);
++    }
+ 
+     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
+@@ -835,10 +961,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         score = ggml_add(ctx0, score, inp->bias);
+     }
+ 
++    // [TAG_QSA_OPT] LLAMA_QSA_NO_CONT=1 : supprime les ggml_cont inutiles du chemin d'expansion
++    // (ggml_permute ne fait que des vues ; get_rows/add/top_k n'ont pas besoin d'un buffer
++    //  contigu en entree, et le top_k produit deja un tenseur neuf). Objectif : reduire le
++    //  trafic memoire de l'expansion, mesure a ~24 s sur un prefill de 66k.
++    static const bool qsa_no_cont = [] {
++        const char * e = getenv("LLAMA_QSA_NO_CONT");
++        return e != nullptr && atoll(e) != 0;
++    }();
++
+     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+-    ggml_tensor * expanded = ggml_get_rows(ctx0,
+-            ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
+-    expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
++    ggml_tensor * score_p = ggml_permute(ctx0, score, 1, 0, 2, 3);
++    if (!qsa_no_cont) {
++        score_p = ggml_cont(ctx0, score_p);
++    }
++    ggml_tensor * expanded = ggml_get_rows(ctx0, score_p, inp->cell_blk);
++    expanded = ggml_permute(ctx0, expanded, 1, 0, 2, 3);
++    if (!qsa_no_cont) {
++        expanded = ggml_cont(ctx0, expanded);
++    }
+ 
+     if (blk_bias) {
+         // flash attention keeps the mask in f16; the scores are f32
+@@ -862,7 +1003,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // set. When the gather path runs, the row count must be padded to n_sel for the flash
+     // attention granularity: repeat the first index; the pad entries are re-masked to
+     // -inf in build_attn_qsa_gather, so duplicates are never visible.
+-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
++    // [TAG_QSA_OPT] top_k cree deja un tenseur neuf (donc contigu) : le cont etait inutile
++    ggml_tensor * top_k = ggml_top_k(ctx0, expanded, width);
++    if (!qsa_no_cont) {
++        top_k = ggml_cont(ctx0, top_k);
++    }
+ 
+     if (n_sel > width) {
+         ggml_tensor * first = ggml_view_3d(ctx0, top_k, 1, top_k->ne[1], top_k->ne[2],
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b10d3e021af..8089b3aeee4 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10272,6 +10272,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // [TAG_FA_DEPTH_SWEEP] validation de la forme qwen4exp : le mode perf ne valide RIEN.
++    // Sans ces cas, un tuning a cols_per_thread=0 passe « 0/0 tests passed » sans etre vu.
++    for (int64_t kv : { 8192, 32768 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER
+@@ -10291,6 +10297,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // [TAG_FA_DECODE_BATCH] attention au regime de DECODE (petit nb) sur KV long : c'est le poste
++    // dominant du decode au contexte long. Chiffre le gaspillage a nb=7 (batch de verification MTP).
++    for (int64_t kv : { 32768, 131072 }) {
++        for (int64_t nb : { 1, 3, 7, 8, 16 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++        }
++    }
++
++    // [TAG_MMID_SHAPES] MoE du modele : 512 experts, top-10, type REEL Q4_0_ROCMFP4_FAST,
++    // formes exactes et batchs reels (decode n=1, verification MTP n=7 et n=11).
++    for (int64_t n : { 1, 7, 11 }) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
++    }
++
+     // CONT of a 0<->2 permute at DeepSeek-V4 lightning-indexer shapes:
+     // indexer_kq is [n_kv, n_tokens, n_head=64] and gets ggml_cont(ggml_permute(.., 2,1,0,3)).
+     for (int64_t n_kv : { 1024, 1280, 2048, 2304 }) {
+@@ -10523,7 +10544,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     // [TAG_FA_256_GQA12] qwen4exp prefill shape: hsk=hsv=256, GQA12, KV q8_0, ub 2048
+-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 131072, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    // [TAG_FA_DEPTH_SWEEP] balayage de profondeur : meme forme, n_kv croissant.
++    // Sert a mesurer le cout REEl du kernel d'attention en fonction de la longueur de KV,
++    // hors du modele (le perf-logger du runtime ne capture l'attention qu'1 fois sur 6).
++    for (int64_t kv : { 2048, 8192, 32768, 65536, 131072 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    }
++
++    // [TAG_FA_DECODE_BATCH] regime de DECODE : petit batch (nb) sur un KV long. C'est le batch
++    // REEL de la verification MTP (n-max 6 -> nb=7 ; n-max 10 -> nb=11), et le poste dominant du
++    // decode au contexte long (mesure dans le modele : 11,4 tok/s a 131k, 25,7 apres le fix de
++    // sous-allocation). Le banc dit si le kernel amortit les tuiles K sur les requetes ou s'il
++    // retombe en comportement matvec. Validation d'abord : un tuning rapide mais faux doit
++    // echouer ici, contre la reference CPU.
++    for (int64_t nb : { 1, 3, 7, 8, 16 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++    }
++
++    // [TAG_MMID_SHAPES] MoE de Qwen3.8-Flash-Next : 512 experts, top-10, type REEL
++    // Q4_0_ROCMFP4_FAST, formes exactes des experts (gate/up : k=2560,m=640 ; down : k=640,m=2560)
++    // et batchs reels (decode n=1, verification MTP n=7 et n=11). Sans ces cas, un balayage des
++    // warptiles MUL_MAT_ID serait aveugle : le mode perf ne valide rien.
++    for (int64_t n : { 1, 7 }) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
++    }
+ 
+ 
+     for (int kv : { 4096, 8192, 16384, }) {
+-- 
+2.53.0
+

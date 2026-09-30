@@ -1,0 +1,267 @@
+From f85689c7f45c33363b4a31651d6b06b637ba8f0e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 29 Aug 2026 10:58:46 +0200
+Subject: [PATCH 02/54] vulkan: opt-in coalesced loads + tunable MMVQ rows for
+ ROCmFP4
+
+Both behind env vars (off by default), correctness 2440/2440.
+
+- GGML_VK_COALESCED_LOADS: raw-u32 view of A so adjacent threads make
+  aligned full cache-line transactions instead of 17/18-byte typed struct
+  loads straddling cache lines. Measured: +17% prefill, -3.4% decode
+  (shift/combine overhead dominates at batch 1) -> prefill option only.
+- GGML_VK_MMVQ_ROWS: 2/4/8 output rows per workgroup for the vec-id ROCmFP4
+  pipelines (spec constant NUM_ROWS). Measured: no decode gain (rows 4 ~= 2,
+  rows 8 -2%) -> kept as a tuning knob.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 29 ++++++++++++-
+ .../vulkan-shaders/mul_mat_vec_iface.glsl     |  3 ++
+ .../vulkan-shaders/mul_mat_vecq_funcs.glsl    | 41 +++++++++++++++++++
+ .../src/ggml-vulkan/vulkan-shaders/types.glsl | 14 +++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     | 24 +++++++++++
+ 5 files changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index d42b619fb1d..00ab42519bf 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -828,6 +828,8 @@ struct vk_device_struct {
+     bool integer_dot_product;
+     // 0: default, 1: force mmvq, -1: disable mmvq
+     int32_t mmvq_mode;
++    // coalesced raw-u32 loads for the 17/18-byte ROCmFP4 blocks (GGML_VK_COALESCED_LOADS)
++    bool coalesced_loads;
+ 
+     bool subgroup_size_control;
+     uint32_t subgroup_min_size;
+@@ -5539,6 +5541,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     }
+     uint32_t rm_iq = 2 * rm_kq;
+ 
++    // GGML_VK_MMVQ_ROWS: output rows per workgroup in the vec-id matvec (2/4/8).
++    // Larger amortizes the B_Q8_1 re-read across more rows + more loads in flight.
++    uint32_t mmvq_rows = 2 * rm_stdq_int;
++    if (const char * e = getenv("GGML_VK_MMVQ_ROWS")) {
++        const int v = atoi(e);
++        if (v == 2 || v == 4 || v == 8) {
++            mmvq_rows = (uint32_t) v;
++        } else {
++            fprintf(stderr, "ggml_vulkan: GGML_VK_MMVQ_ROWS unsupported %d (2/4/8), keeping %u\n", v, mmvq_rows);
++        }
++    }
++
+     const bool use_subgroups = device->subgroup_arithmetic;
+     // Ensure a subgroup size >= 16 is available
+     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
+@@ -5651,8 +5665,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_MXFP4][i], "mul_mat_vec_mxfp4_q8_1_f32", arr_dmmv_mxfp4_q8_1_f32_len[reduc], arr_dmmv_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                if (device->coalesced_loads) {
++                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i], "mul_mat_vec_rocmfp4_q8_1_f32_coalesced", arr_dmmv_rocmfp4_q8_1_f32_coalesced_len[reduc], arr_dmmv_rocmfp4_q8_1_f32_coalesced_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i], "mul_mat_vec_rocmfp4_fast_q8_1_f32_coalesced", arr_dmmv_rocmfp4_fast_q8_1_f32_coalesced_len[reduc], arr_dmmv_rocmfp4_fast_q8_1_f32_coalesced_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                } else {
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4][i], "mul_mat_vec_rocmfp4_q8_1_f32", arr_dmmv_rocmfp4_q8_1_f32_len[reduc], arr_dmmv_rocmfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST][i], "mul_mat_vec_rocmfp4_fast_q8_1_f32", arr_dmmv_rocmfp4_fast_q8_1_f32_len[reduc], arr_dmmv_rocmfp4_fast_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                }
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0_ROCMFPX][i], "mul_mat_vec_rocmfpx_fp8_q8_1_f32", arr_dmmv_rocmfpx_fp8_q8_1_f32_len[reduc], arr_dmmv_rocmfpx_fp8_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+@@ -5714,8 +5733,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q8_0], "mul_mat_vec_id_q8_0_q8_1_f32", arr_dmmv_id_q8_0_q8_1_f32_len[reduc], arr_dmmv_id_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_MXFP4], "mul_mat_vec_id_mxfp4_q8_1_f32", arr_dmmv_id_mxfp4_q8_1_f32_len[reduc], arr_dmmv_id_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4], "mul_mat_vec_id_rocmfp4_q8_1_f32", arr_dmmv_id_rocmfp4_q8_1_f32_len[reduc], arr_dmmv_id_rocmfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
+-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST], "mul_mat_vec_id_rocmfp4_fast_q8_1_f32", arr_dmmv_id_rocmfp4_fast_q8_1_f32_len[reduc], arr_dmmv_id_rocmfp4_fast_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
++            if (device->coalesced_loads) {
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4], "mul_mat_vec_id_rocmfp4_q8_1_f32_coalesced", arr_dmmv_id_rocmfp4_q8_1_f32_coalesced_len[reduc], arr_dmmv_id_rocmfp4_q8_1_f32_coalesced_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {mmvq_rows, 1, 1}, {wg_size_subgroup_int, mmvq_rows}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST], "mul_mat_vec_id_rocmfp4_fast_q8_1_f32_coalesced", arr_dmmv_id_rocmfp4_fast_q8_1_f32_coalesced_len[reduc], arr_dmmv_id_rocmfp4_fast_q8_1_f32_coalesced_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {mmvq_rows, 1, 1}, {wg_size_subgroup_int, mmvq_rows}, 1, true, use_subgroups, subgroup_size_int);
++            } else {
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4], "mul_mat_vec_id_rocmfp4_q8_1_f32", arr_dmmv_id_rocmfp4_q8_1_f32_len[reduc], arr_dmmv_id_rocmfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {mmvq_rows, 1, 1}, {wg_size_subgroup_int, mmvq_rows}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0_ROCMFP4_FAST], "mul_mat_vec_id_rocmfp4_fast_q8_1_f32", arr_dmmv_id_rocmfp4_fast_q8_1_f32_len[reduc], arr_dmmv_id_rocmfp4_fast_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {mmvq_rows, 1, 1}, {wg_size_subgroup_int, mmvq_rows}, 1, true, use_subgroups, subgroup_size_int);
++            }
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q8_0_ROCMFPX], "mul_mat_vec_id_rocmfpx_fp8_q8_1_f32", arr_dmmv_id_rocmfpx_fp8_q8_1_f32_len[reduc], arr_dmmv_id_rocmfpx_fp8_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_K], "mul_mat_vec_id_q2_k_q8_1_f32", arr_dmmv_id_q2_k_q8_1_f32_len[reduc], arr_dmmv_id_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
+@@ -7494,6 +7518,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
+             device->mmvq_mode = 1;
+         }
++        device->coalesced_loads = getenv("GGML_VK_COALESCED_LOADS") != nullptr;
+ 
+         return device;
+     }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
+index e8d053cdd43..65b959d2fdb 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iface.glsl
+@@ -6,6 +6,9 @@
+ #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+ 
+ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++#if defined(USE_COALESCED_LOADS)
++layout (binding = 0) readonly buffer A_RAW_U32 {uint32_t data_a_u32[];};
++#endif
+ #if defined(A_TYPEV4)
+ layout (binding = 0) readonly buffer AV4 {A_TYPEV4 data_a_v4[];};
+ #endif
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+index bded206808c..5636acb4adf 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+@@ -4,6 +4,30 @@
+ 
+ #include "types.glsl"
+ 
++#ifdef USE_COALESCED_LOADS
++// Raw u32 view of the A buffer: reads become aligned dword transactions shared
++// between adjacent threads (full 64/128-byte cache lines) instead of typed
++// struct loads at 17/18-byte strides that straddle cache lines.
++uint32_t buf_read_u32(uint byte_off) {
++    return data_a_u32[byte_off >> 2u];
++}
++
++int32_t buf_read_i32(uint byte_off) {
++    uint w = byte_off >> 2u;
++    uint shift = (byte_off & 3u) << 3u;
++    if (shift == 0u) {
++        return int32_t(data_a_u32[w]);
++    }
++    return int32_t((data_a_u32[w] >> shift) | (data_a_u32[w + 1u] << (32u - shift)));
++}
++
++uint8_t buf_read_u8(uint byte_off) {
++    uint w = byte_off >> 2u;
++    uint shift = (byte_off & 3u) << 3u;
++    return uint8_t((data_a_u32[w] >> shift) & 0xFFu);
++}
++#endif
++
+ #if defined(DATA_A_Q2_0)
+ FLOAT_TYPE get_dm(uint ib) {
+     return FLOAT_TYPE(data_a[ib / 2].d);
+@@ -140,14 +164,25 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
+ #if defined(DATA_A_ROCMFP4)
+ // dual UE4M3 scales: e[0] covers elements 0-15, e[1] covers 16-31
+ FLOAT_TYPEV2 get_dm2(uint ib) {
++#ifdef USE_COALESCED_LOADS
++    const uint base = ib * A_BLOCK_SIZE;
++    return FLOAT_TYPEV2(FLOAT_TYPE(ue4m3_to_fp32(uint8_t(buf_read_u8(base + A_BLOCK_OFFSET_E)))),
++                        FLOAT_TYPE(ue4m3_to_fp32(uint8_t(buf_read_u8(base + A_BLOCK_OFFSET_E + 1u)))));
++#else
+     return FLOAT_TYPEV2(ue4m3_to_fp32(data_a[ib].e[0]), ue4m3_to_fp32(data_a[ib].e[1]));
++#endif
+ }
+ #endif
+ 
+ #if defined(DATA_A_ROCMFP4_FAST)
+ FLOAT_TYPEV2 get_dm2(uint ib) {
++#ifdef USE_COALESCED_LOADS
++    const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(uint8_t(buf_read_u8(ib * A_BLOCK_SIZE + A_BLOCK_OFFSET_E))));
++    return FLOAT_TYPEV2(d, d);
++#else
+     const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib].e));
+     return FLOAT_TYPEV2(d, d);
++#endif
+ }
+ #endif
+ 
+@@ -155,10 +190,16 @@ FLOAT_TYPEV2 get_dm2(uint ib) {
+ // 1-byte quant loads for ROCmFP4 blocks (18 / 17 bytes). Low nibbles are the
+ // first half of the block, high nibbles the second half.
+ i32vec2 repack(uint ib, uint iqs) {
++#ifdef USE_COALESCED_LOADS
++    // the 16 qs bytes of a block start at an offset that is NOT 4-byte aligned
++    // for odd blocks (17/18-byte stride): gather the 4 bytes via shift/combine
++    const uint32_t qs = uint32_t(buf_read_i32(ib * A_BLOCK_SIZE + A_BLOCK_OFFSET_QS + iqs * 4u));
++#else
+     const uint32_t qs = pack32(u8vec4(data_a[ib].qs[iqs * 4    ],
+                                       data_a[ib].qs[iqs * 4 + 1],
+                                       data_a[ib].qs[iqs * 4 + 2],
+                                       data_a[ib].qs[iqs * 4 + 3]));
++#endif
+ 
+     const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
+     const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+index 983b0732065..979d34caedf 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+@@ -1819,11 +1819,22 @@ struct block_rocmfp4_fast
+     uint8_t e;
+ };
+ 
++// byte layout for the coalesced (USE_COALESCED_LOADS) raw-u32 reads
++#define BLOCK_ROCMFP4_SIZE       18
++#define BLOCK_ROCMFP4_OFFSET_QS  0
++#define BLOCK_ROCMFP4_OFFSET_E   16
++#define BLOCK_ROCMFP4_FAST_SIZE       17
++#define BLOCK_ROCMFP4_FAST_OFFSET_QS  0
++#define BLOCK_ROCMFP4_FAST_OFFSET_E   16
++
+ #if defined(DATA_A_ROCMFP4)
+ #define QUANT_K QUANT_K_ROCMFP4
+ #define QUANT_R QUANT_R_ROCMFP4
+ #define QUANT_AUXF 1
+ #define A_TYPE block_rocmfp4
++#define A_BLOCK_SIZE       BLOCK_ROCMFP4_SIZE
++#define A_BLOCK_OFFSET_QS  BLOCK_ROCMFP4_OFFSET_QS
++#define A_BLOCK_OFFSET_E   BLOCK_ROCMFP4_OFFSET_E
+ #endif
+ 
+ #if defined(DATA_A_ROCMFP4_FAST)
+@@ -1831,6 +1842,9 @@ struct block_rocmfp4_fast
+ #define QUANT_R QUANT_R_ROCMFP4
+ #define QUANT_AUXF 1
+ #define A_TYPE block_rocmfp4_fast
++#define A_BLOCK_SIZE       BLOCK_ROCMFP4_FAST_SIZE
++#define A_BLOCK_OFFSET_QS  BLOCK_ROCMFP4_FAST_OFFSET_QS
++#define A_BLOCK_OFFSET_E   BLOCK_ROCMFP4_FAST_OFFSET_E
+ #endif
+ 
+ #define QUANT_K_ROCMFPX_FP8 32
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 2334c2fa612..ec028f3828a 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -783,6 +783,18 @@ void process_shaders() {
+             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
++
++            // Coalesced-load variants for the 17/18-byte ROCmFP4 blocks: read A through
++            // a raw u32 view so adjacent threads make aligned, full cache-line
++            // transactions instead of typed struct loads straddling cache lines.
++            if (tname == "rocmfp4" || tname == "rocmfp4_fast") {
++                string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_coalesced", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_COALESCED_LOADS", "1"}}));
++                string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_coalesced_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_COALESCED_LOADS", "1"}, {"USE_SUBGROUP_ADD", "1"}}));
++                string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_coalesced_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_COALESCED_LOADS", "1"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
++                string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_coalesced", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_COALESCED_LOADS", "1"}}));
++                string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_coalesced_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_COALESCED_LOADS", "1"}, {"USE_SUBGROUP_ADD", "1"}}));
++                string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_coalesced_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_COALESCED_LOADS", "1"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
++            }
+         }
+ #endif
+ 
+@@ -1302,6 +1314,18 @@ void write_output_files() {
+             src << "const void * arr_dmmv_id_"   << tname << "_" << btype << "_f32_data[3] = {mul_mat_vec_id_" << tname << "_" << btype << "_f32_data, mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_data, mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_no_shmem_data};\n";
+             src << "const uint64_t arr_dmmv_id_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_id_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_id_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
+         }
++        if (btype == "q8_1" && (tname == "rocmfp4" || tname == "rocmfp4_fast")) {
++            hdr << "extern const void * arr_dmmv_" << tname << "_q8_1_f32_coalesced_data[3];\n";
++            hdr << "extern const uint64_t arr_dmmv_" << tname << "_q8_1_f32_coalesced_len[3];\n";
++            hdr << "extern const void * arr_dmmv_id_" << tname << "_q8_1_f32_coalesced_data[3];\n";
++            hdr << "extern const uint64_t arr_dmmv_id_" << tname << "_q8_1_f32_coalesced_len[3];\n";
++            if (basename(input_filepath) == "mul_mat_vec.comp") {
++                src << "const void * arr_dmmv_" << tname << "_q8_1_f32_coalesced_data[3] = {mul_mat_vec_" << tname << "_q8_1_f32_coalesced_data, mul_mat_vec_" << tname << "_q8_1_f32_coalesced_subgroup_data, mul_mat_vec_" << tname << "_q8_1_f32_coalesced_subgroup_no_shmem_data};\n";
++                src << "const uint64_t arr_dmmv_" << tname << "_q8_1_f32_coalesced_len[3] =  {mul_mat_vec_" << tname << "_q8_1_f32_coalesced_len,  mul_mat_vec_" << tname << "_q8_1_f32_coalesced_subgroup_len, mul_mat_vec_" << tname << "_q8_1_f32_coalesced_subgroup_no_shmem_len};\n";
++                src << "const void * arr_dmmv_id_" << tname << "_q8_1_f32_coalesced_data[3] = {mul_mat_vec_id_" << tname << "_q8_1_f32_coalesced_data, mul_mat_vec_id_" << tname << "_q8_1_f32_coalesced_subgroup_data, mul_mat_vec_id_" << tname << "_q8_1_f32_coalesced_subgroup_no_shmem_data};\n";
++                src << "const uint64_t arr_dmmv_id_" << tname << "_q8_1_f32_coalesced_len[3] =  {mul_mat_vec_id_" << tname << "_q8_1_f32_coalesced_len,  mul_mat_vec_id_" << tname << "_q8_1_f32_coalesced_subgroup_len, mul_mat_vec_id_" << tname << "_q8_1_f32_coalesced_subgroup_no_shmem_len};\n";
++            }
++        }
+     }
+     }
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,47 @@
+From ff00ba0e7d7c65f2053c29706be3402d715cd0f0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Wed, 2 Sep 2026 14:11:41 +0200
+Subject: [PATCH 14/54] vulkan: perf-logger tensor names + LARGE workgroups for
+ AMD small-m matvecs (env-gated)
+
+- [TAG_PERF_NAMES] perf logger includes graph cb() tensor names for op attribution
+- [TAG_DMMV_LARGE_AMD] DMMV_WG_SIZE_LARGE for AMD when n==1 && m<=64 && k>=1024
+  (heuristic was NVIDIA/Intel-only). A/B on qwen4exp decode: +1.3% (HC w_inject
+  m=4 k=10240 -125ms, m=48 k=2560 -78ms). Strict gate: regresses m>=320 and n>=2.
+  Env GGML_VK_DMMV_LARGE_AMD=1, off by default upstream behavior.
+  MUL_MAT correctness: 1203/1203 with gate active.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 8097374ba50..a9493d7cb48 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2317,6 +2317,10 @@ class vk_perf_logger {
+                 " (" << node->src[0]->ne[0] << "," << node->src[0]->ne[1] << "," << node->src[0]->ne[2] << "," << node->src[0]->ne[3] << ")";
+             return name.str();
+         }
++        // [TAG_PERF_NAMES] include the tensor name (graph cb() labels) for op attribution
++        if (node->name && node->name[0]) {
++            return fusion_str + ggml_op_name(node->op) + std::string(" |") + node->name;
++        }
+         return fusion_str + ggml_op_name(node->op);
+     }
+ 
+@@ -8293,7 +8297,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+ 
+     // heuristic to choose workgroup size
+     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+-    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
++    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL
++        // [TAG_DMMV_LARGE_AMD] gfx1151: LARGE WG for n=1 matvecs, tiny m, large k.
++        // A/B 02/09: m=4 k=10240 (HC w_inject) -125 ms, m=48 k=2560 -78 ms, f32 m=1 -20 ms.
++        // Regresses m>=320 (n=1) and badly n>=2 (prefill) -> strict gate num_cols==1 && m<=64.
++        || (getenv("GGML_VK_DMMV_LARGE_AMD") && ctx->device->vendor_id == VK_VENDOR_ID_AMD && num_cols == 1 && m <= 64)) {
+         // Prefer larger workgroups when M is small, to spread the work out more
+         // and keep more SMs busy.
+         // q6_k seems to prefer small workgroup size even for "medium" values of M.
+-- 
+2.53.0
+

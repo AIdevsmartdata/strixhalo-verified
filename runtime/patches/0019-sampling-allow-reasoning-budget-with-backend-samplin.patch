@@ -1,0 +1,148 @@
+From 654a6bb83f007601bebc947b0f61ba9c3d02c6c9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Thu, 3 Sep 2026 18:15:17 +0200
+Subject: [PATCH 19/54] sampling: allow reasoning budget with backend sampling
+ ([TAG_BUDGET_BACKEND])
+
+The reasoning budget stage is passthrough except in REASONING_BUDGET_FORCING
+state, where it masks everything but the forced thinking-end token. Instead of
+disabling backend sampling when a budget is active, mirror the
+[TAG_GRAMMAR_BACKEND] flow: the backend token is validated with a single-token
+check (~us) and a CPU resample from raw logits runs on rejection.
+
+- common/sampling.cpp: drop the init-time disable gate; in
+  common_sampler_sample's backend path, add the FORCING single-token check +
+  raw-logits CPU resample (rbudget -> grmr -> chain order)
+- common/sampling.h: add common_sampler_has_reasoning_budget()
+- server-context.cpp: extend llama_set_need_raw_logits to budgeted requests
+  (the resample needs the pre-backend logits host-side)
+
+Measured motivation: budgeted xhigh runs dropped 28.4 -> 22.2 t/s (-22%) because
+the gate killed the GPU top-k. With this, budget + full backend sampling speed.
+---
+ common/sampling.cpp             | 54 +++++++++++++++++++++++++++++----
+ common/sampling.h               |  4 +++
+ tools/server/server-context.cpp |  5 ++-
+ 3 files changed, 56 insertions(+), 7 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 53be0fa72b8..f78879e182e 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -471,11 +471,13 @@ struct common_sampler * common_sampler_init(
+     // rejected by GGML_ASSERT in common_sampler_sample.
+ 
+ 
+-    if (rbudget && params.backend_sampling) {
+-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+-
+-        params.backend_sampling = false;
+-    }
++    // [TAG_BUDGET_BACKEND] reasoning budget no longer disables backend sampling: the
++    // budget stage is passthrough except in REASONING_BUDGET_FORCING state, where it
++    // masks everything but the forced thinking-end token. In common_sampler_sample the
++    // backend token is validated with a single-token check and a CPU resample from raw
++    // logits runs on rejection — the exact mirror of the [TAG_GRAMMAR_BACKEND] flow.
++    // The server enables the raw-logits download for budgeted requests too
++    // (server-context.cpp, common_sampler_has_reasoning_budget).
+ 
+     // Keep verifier randomness independent from both target and draft sampling.
+     const uint32_t speculative_seed = llama_sampler_get_seed(chain) ^ 0x9e3779b9U;
+@@ -652,6 +654,10 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
+     return gsmpl->chain;
+ }
+ 
++bool common_sampler_has_reasoning_budget(const struct common_sampler * gsmpl) {
++    return gsmpl && gsmpl->rbudget;
++}
++
+ bool common_sampler_has_grammar(const struct common_sampler * gsmpl) {
+     // [TAG_GRAMMAR_BACKEND]
+     return gsmpl && gsmpl->grmr != nullptr;
+@@ -680,7 +686,36 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+         if (id != LLAMA_TOKEN_NULL) {
+             LOG_DBG("%s: Backend sampler selected token: '%d'.\n", __func__, id);
+ 
+-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
++            // [TAG_BUDGET_BACKEND] reasoning budget: passthrough except when FORCING.
++            // Validate the backend token with a single-token check (~us); on rejection
++            // (the budget wants to force the thinking-end sequence) resample on the CPU
++            // from the raw logits, mirroring the grammar rejection path below.
++            if (gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
++                llama_token_data       budget_single        = { id, 1.0f, 0.0f };
++                llama_token_data_array budget_single_array  = { &budget_single, 1, -1, false };
++
++                llama_sampler_apply(gsmpl->rbudget, &budget_single_array);
++
++                if (budget_single_array.data[0].logit == -INFINITY) {
++                    // rejected -> CPU resample from raw logits
++                    // (rbudget masks to the forced token; grammar then chain, like the
++                    // grammar_first=false CPU flow: rbudget -> grmr -> chain)
++                    gsmpl->set_raw_logits(ctx, idx);
++
++                    llama_sampler_apply(gsmpl->rbudget, &cur_p);
++
++                    if (gsmpl->grmr && grammar_should_apply(gsmpl)) {
++                        llama_sampler_apply(gsmpl->grmr, &cur_p);
++                    }
++
++                    llama_sampler_chain_apply_cpu(chain, &cur_p);
++
++                    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
++
++                    return cur_p.data[cur_p.selected].id;
++                }
++                // backend token == the forced token -> fall through (fast path)
++            }
+ 
+             if (gsmpl->grmr && grammar_should_apply(gsmpl)) {
+                 // [TAG_GRAMMAR_BACKEND] fast path + rejection resample, mirroring the
+@@ -710,6 +745,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+                 // downloaded for grammar sequences by the server via llama_set_need_raw_logits)
+                 gsmpl->set_raw_logits(ctx, idx);
+ 
++                // [TAG_BUDGET_BACKEND] keep the budget force intact if both are active:
++                // rbudget first (mask to the forced token), then grammar, then chain —
++                // same order as the grammar_first=false CPU flow
++                if (gsmpl->rbudget) {
++                    llama_sampler_apply(gsmpl->rbudget, &cur_p);
++                }
++
+                 llama_sampler_apply(grmr, &cur_p);
+                 // the chain is backend-initialized: run its stages on the CPU explicitly
+                 // (the raw logits are pre-backend, so each stage applies exactly once)
+diff --git a/common/sampling.h b/common/sampling.h
+index 63e11225eea..a11c89dab2d 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -60,6 +60,10 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ // are needed host-side for the backend rejection resample)
+ bool common_sampler_has_grammar(const struct common_sampler * gsmpl);
+ 
++// [TAG_BUDGET_BACKEND] true when a reasoning budget is active (needs raw-logits download
++// with backend sampling, for the FORCING resample — see common_sampler_sample)
++bool common_sampler_has_reasoning_budget(const struct common_sampler * gsmpl);
++
+ // extended sampling implementation:
+ //
+ // - set logits
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 395be620f38..10f48af44e4 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1713,8 +1713,11 @@ private:
+             // [TAG_GRAMMAR_BACKEND] grammar sequences need the raw logits host-side for the
+             // rejection resample even though the chain runs on the backend (costs one
+             // ~1 MB download per token, only for grammar requests)
++            // [TAG_BUDGET_BACKEND] budgeted requests too: the FORCING state resamples on
++            // the CPU from raw logits (see common_sampler_sample)
+             llama_set_need_raw_logits(ctx_tgt, slot.id,
+-                    use_backend_sampling && common_sampler_has_grammar(slot.smpl.get()));
++                    use_backend_sampling && (common_sampler_has_grammar(slot.smpl.get()) ||
++                                            common_sampler_has_reasoning_budget(slot.smpl.get())));
+ 
+             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
+             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
+-- 
+2.53.0
+

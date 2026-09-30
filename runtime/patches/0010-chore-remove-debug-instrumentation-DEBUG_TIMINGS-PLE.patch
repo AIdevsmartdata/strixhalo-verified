@@ -1,0 +1,148 @@
+From 70c993357842832f2be25735b54541f6e6004740 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sun, 30 Aug 2026 22:22:56 +0200
+Subject: [PATCH 10/54] chore: remove debug instrumentation (DEBUG_TIMINGS +
+ PLE_DEBUG_DUMP)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- server-context.cpp: retrait du scoped_timer/DEBUG_TIMINGS (define déjà commenté)
+- qwen4exp.cpp: retrait du dump PLE_DEBUG_DUMP (env-gated, TEMPORARY)
+- common.cpp: instrumentation ROUTE_STATS revertée (résultat déjà consigné §49)
+---
+ src/models/qwen4exp.cpp         | 12 --------
+ tools/server/server-context.cpp | 54 +--------------------------------
+ 2 files changed, 1 insertion(+), 65 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 259f09126eb..7c7d3590421 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1398,10 +1398,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+     mctx->get_prev_tokens(*ubatch, n_prev, prev);
+ 
+-    // TEMPORARY: diagnostic dump to compare get_prev_tokens() against the old ple_hist
+-    // reference. Env-gated, appends one line per token, no effect unless PLE_DEBUG_DUMP is set.
+-    static FILE * dbg = getenv("PLE_DEBUG_DUMP") ? fopen(getenv("PLE_DEBUG_DUMP"), "a") : nullptr;
+-
+     for (int64_t i = 0; i < n_tokens; ++i) {
+         // an EOS in the window resets everything at or before it
+         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
+@@ -1416,14 +1412,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+             ctx[s] = cut ? eos : t;
+         }
+ 
+-        if (dbg) {
+-            fprintf(dbg, "%d,%" PRId64, ubatch->pos[i], ctx[0]);
+-            for (int64_t s = 1; s < n_gram; ++s) {
+-                fprintf(dbg, ",%" PRId64, ctx[s]);
+-            }
+-            fprintf(dbg, "\n");
+-        }
+-
+         // Split (per-head) tables are indexed locally, row 0 per head; the joined table
+         // is one tensor, so its rows need the head's offset into that shared row space.
+         const bool split = !pmodel.ple_ngram_embd.empty();
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d9385b06a8e..5efbfc3854b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2649,49 +2649,7 @@ private:
+         }
+     }
+ 
+-    // @ngxson : for debugging only
+-    int64_t t_pre_decode  = 0;
+-    int64_t t_decode      = 0;
+-    int64_t t_post_decode = 0;
+-    int64_t t_sampl       = 0;
+-    int64_t n_pre_decode  = 0;
+-    int64_t n_decode      = 0;
+-    int64_t n_post_decode = 0;
+-    int64_t n_sampl       = 0;
+-// #define DEBUG_TIMINGS
+-#ifdef DEBUG_TIMINGS
+-    struct scoped_timer {
+-        int64_t & t;
+-        int64_t & n;
+-        int64_t t_start;
+-        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
+-            t_start = ggml_time_us();
+-        }
+-        ~scoped_timer() {
+-            t += ggml_time_us() - t_start;
+-            n++;
+-        }
+-    };
+-#else
+-    struct scoped_timer {
+-        scoped_timer(int64_t &, int64_t &) {}
+-        ~scoped_timer() {}
+-    };
+-#endif
+-
+     void update_slots() {
+-#ifdef DEBUG_TIMINGS
+-        static int64_t t_prev = 0;
+-        int64_t t_start = ggml_time_us();
+-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
+-            t_prev = t_start;
+-            SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
+-            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
+-            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
+-            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
+-            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+-        }
+-#endif
+ 
+         // check if all slots are idle
+         {
+@@ -2721,7 +2679,6 @@ private:
+         }
+ 
+         try {
+-            scoped_timer t(t_pre_decode, n_pre_decode);
+             pre_decode();
+             batch.render();
+         } catch (const std::exception & e) {
+@@ -2759,14 +2716,10 @@ private:
+         for (int32_t off = 0; off < batch.size(); off = off_next) {
+             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+             try {
+-                scoped_timer t(t_decode, n_decode);
+                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
+ 
+                 batch_view = batch.get_view(off, n_tokens);
+                 bool ok = decode(n_batch, off, batch_view);
+-#ifdef DEBUG_TIMINGS
+-                llama_synchronize(ctx_tgt);
+-#endif
+ 
+                 if (ok) {
+                     // move the head of the batch forward with the number of tokens we just processed
+@@ -2785,7 +2738,6 @@ private:
+             }
+ 
+             try {
+-                scoped_timer t(t_post_decode, n_post_decode);
+                 post_decode(n_tokens, off, batch_view);
+             } catch (const std::exception & e) {
+                 SRV_ERR("post_decode() failed: %s\n", e.what());
+@@ -3745,11 +3697,7 @@ private:
+             // shifted according to the current sub-batch
+             const int tok_idx = slot.i_batch - off;
+ 
+-            llama_token id;
+-            {
+-                scoped_timer timer(t_sampl, n_sampl);
+-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+-            }
++            llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+ 
+             slot.i_batch = -1;
+ 
+-- 
+2.53.0
+

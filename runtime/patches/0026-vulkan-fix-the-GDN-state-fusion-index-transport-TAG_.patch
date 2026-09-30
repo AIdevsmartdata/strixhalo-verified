@@ -1,0 +1,122 @@
+From ae0a1d2a023ee6e9350b4d988c200dc34da63764 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Fri, 4 Sep 2026 19:07:50 +0200
+Subject: [PATCH 26/54] vulkan: fix the GDN state-fusion index transport
+ ([TAG_GDN_ZC] state side)
+
+The fused GDN reads the recurrent ring directly instead of the gathered
+scratch. The row index (s_copy) was read inside the kernel through a
+descriptor (binding 8), but the value observed by the GPU at execution
+time was NOT the value written by set_input into the (host-visible,
+coherent) input buffer: deterministic small garbage, byte-proven by
+in-shader binary probes (idx hardcoded 0 -> byte-identical outputs,
+idx read via descriptor -> systematic divergence). Root cause of the
+stale descriptor read not fully elucidated (sets are per-dispatch,
+pool is 12-binding, layout compatible) - documented in FINDINGS 79.
+
+Fix: read the index host-side at dispatch time (the input buffer is
+host-mapped) and pass it via push constant (state_idx). Fallback to the
+GPU read (use_fused_state=4) only when the input buffer is not
+host-visible.
+
+Validated: 27B plain (K=1, aliased ring) and spec (K>1) byte-identical
+ON vs OFF incl. 250-token generations; 125B qs/fr/st identical, 36
+CPY + 36 GET_ROWS elided per graph.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 26 ++++++++++++++++++-
+ .../vulkan-shaders/gated_delta_net.comp       |  7 +++++
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index ef8bb6e8250..14d3756cfbf 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1889,6 +1889,7 @@ struct vk_op_gated_delta_net_push_constants {
+     uint32_t cache_seq_stride;
+     uint32_t use_fused_state;
+     uint32_t state_row_stride;
++    uint32_t state_idx; // [ZC-FIX] idx lu côté host (push constant) — le descriptor data_idx n'est pas fiable
+ };
+ 
+ struct vk_op_ssm_scan_push_constants {
+@@ -13470,6 +13471,24 @@ static void ggml_vk_gated_delta_net(
+         idx_buf   = ggml_vk_tensor_subbuffer(ctx, fused_state_idx);
+     }
+ 
++    // [ZC-FIX] le GDN ne peut pas lire l'index s_copy via descriptor (binding 8) :
++    // la valeur vue par le kernel au moment de l'exécution n'est pas celle écrite par
++    // set_input (cause exacte non élucidée — voir FINDINGS §79). On lit l'index côté
++    // host au moment du dispatch et on le passe par push constant, ce qui est fiable.
++    uint32_t state_idx_pc = 0;
++    if (fused_state_ring) {
++        auto ib_ctx2 = (ggml_backend_vk_buffer_context *)fused_state_idx->buffer->context;
++        if (ib_ctx2->dev_buffer->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
++            state_idx_pc = (uint32_t)*(const int32_t *)((const uint8_t *)ib_ctx2->dev_buffer->ptr + vk_tensor_offset(fused_state_idx) + fused_state_idx->view_offs);
++        } else {
++            // buffer device-local : on ne peut pas lire côté host — on garde la lecture GPU
++            // via data_idx (mode 1 ne doit alors PAS utiliser state_idx_pc).
++            state_idx_pc = 0;
++            // marquer l'usage GPU en forçant use_fused_state = 4
++            if (use_fused_state == 1) use_fused_state = 4;
++        }
++    }
++
+     const vk_op_gated_delta_net_push_constants pc = {
+         H, n_tokens, n_seqs, s_off,
+         sq1, sq2, sq3,
+@@ -13479,7 +13498,7 @@ static void ggml_vk_gated_delta_net(
+         scale,
+         K,
+         use_fused_cache, cache_slot_stride, cache_seq_stride,
+-        use_fused_state, state_row_stride
++        use_fused_state, state_row_stride, state_idx_pc
+     };
+ 
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+@@ -17963,6 +17982,7 @@ static void ggml_vk_prepare_gdn_cache_fusion(ggml_backend_vk_context * ctx, ggml
+         return;
+     }
+ 
++
+     static bool dbg_init = false;
+     static bool dbg = false;
+     if (!dbg_init) {
+@@ -18023,6 +18043,10 @@ static void ggml_vk_prepare_gdn_state_fusion(ggml_backend_vk_context * ctx, ggml
+     if (ctx->device->disable_fusion || ctx->device->disable_gdn_cache_fusion) {
+         return;
+     }
++    // [TAG_GDN_ZC] gate ciblé pour A/B honnête : désactive UNIQUEMENT la fusion d'état
++    if (getenv("GGML_VK_DISABLE_GDN_STATE_FUSION") != nullptr) {
++        return;
++    }
+ 
+     static bool dbg_init = false;
+     static bool dbg = false;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index 9acf900294c..701dea8348e 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -37,6 +37,7 @@ layout(push_constant) uniform Parameters {
+     uint cache_seq_stride;
+     uint use_fused_state;
+     uint state_row_stride;
++    uint state_idx; // [ZC-FIX]
+ };
+ 
+ layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+@@ -119,6 +120,12 @@ void main() {
+     // (head, col, row) addressing inside the row is unchanged.
+     uint state_in_base;
+     if (use_fused_state == 1u) {
++        // [ZC-FIX] index passé par push constant (lu côté host au dispatch) :
++        // la lecture du descriptor data_idx n'est pas fiable dans ce dispatch
++        // (valeur périmée observée, cf. FINDINGS §79).
++        state_in_base = state_idx * state_row_stride + head_id * state_size;
++    } else if (use_fused_state == 4u) {
++        // [ZC-FIX] fallback : index non lisible côté host (buffer device-local)
+         state_in_base = uint(data_idx[seq_id]) * state_row_stride + head_id * state_size;
+     } else {
+         state_in_base = (seq_id * H + head_id) * state_size;
+-- 
+2.53.0
+

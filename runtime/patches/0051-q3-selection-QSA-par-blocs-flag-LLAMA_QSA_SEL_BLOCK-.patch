@@ -1,0 +1,551 @@
+From 5faaedb0be7eb651157f49c953595c1f6e7d2fa5 Mon Sep 17 00:00:00 2001
+From: pi <agent@local>
+Date: Sat, 19 Sep 2026 14:06:56 +0200
+Subject: [PATCH 51/54] q3: selection QSA par blocs (flag LLAMA_QSA_SEL_BLOCK,
+ OFF par defaut)
+
+Supprime l'expansion O(n_kv) de la selection : cell_lut remplace cell_blk sur ce chemin.
+Garde can_reuse + invariant 'cellule = position' (is_pos_2d() est toujours vrai en M-RoPE).
+Instrumentation LLAMA_QSA_SEL_DUMP (tenseur output marque) + LLAMA_QSA_DEBUG.
+Verifie : SHA greedy = refs 8a488585/0f3d5973 avec flag ON, RETR 14k 4/4, zebra.
+Non deploye. SPEC/REPORT: /root/bench_qwen38/Q3-{SPEC,REPORT}.md
+---
+ src/llama-memory-hybrid-idx.cpp |   5 +
+ src/llama-memory-hybrid-idx.h   |   5 +
+ src/models/qwen4exp.cpp         | 385 +++++++++++++++++++++++++++++++-
+ 3 files changed, 388 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 4a02f3d40e2..80dd3547e7f 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -923,6 +923,11 @@ const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const
+     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+ }
+ 
++// [TAG_QSA_SEL_BLOCK] acces (const) a l'etat des cellules du cache d'indexer
++const llama_kv_cache * llama_memory_hybrid_idx_context::get_mem_idx() const {
++    return mem != nullptr ? mem->get_mem_idx() : nullptr;
++}
++
+ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
+     GGML_ASSERT(i_cur < ns_ubatch.size());
+ 
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index d9a55bb4149..7aafb3deb7b 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -146,6 +146,11 @@ public:
+     // nullptr with no indexer
+     const llama_kv_cache_context * get_idx() const;
+ 
++    // [TAG_QSA_SEL_BLOCK] etat des cellules du cache d'indexer : le chemin de selection au niveau
++    // bloc lit la disposition des cellules (trous, cellules etrangeres) pour decider s'il peut
++    // remplacer la table cellule -> bloc du chemin historique. nullptr sans indexer.
++    const llama_kv_cache * get_mem_idx() const;
++
+     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
+     uint32_t get_n_stream() const;
+ 
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index ab3e687017c..e0b0a7b175c 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1,6 +1,7 @@
+ #include "models.h"
+ #include "ggml-backend.h"
+ #include "llama-impl.h"
++#include "llama-kv-cache.h"
+ #include "llama-memory-hybrid-idx.h"
+ #include "llama-memory-recurrent.h"
+ #include "llama-ple-disk.h"
+@@ -871,6 +872,114 @@ static bool qsa_cache_compressed_enabled() {
+     return en;
+ }
+ 
++// [TAG_QSA_SEL_BLOCK] Remplissage hote de la table (bloc, rang) -> cellule utilisee par le chemin de
++// selection au niveau bloc. Elle ne depend que de (ratio, n_kv) : c'est une progression arithmetique,
++// pas le scan du cache. Le dernier bloc (incomplet) pointe ses rangs invalides sur n_kv-1 : ces slots
++// portent un score -inf cote graphe, ils ne sont donc jamais selectionnes, et leurs indices restent
++// dans les bornes (aucune lecture de masque hors bornes).
++static void qsa_fill_cell_lut(int32_t * lut, int64_t r, int64_t n_kv, int64_t n_blocks, int64_t n_tps) {
++    const int64_t n_blocks_f = n_kv/r;
++    const int64_t tail_len   = n_kv - r*n_blocks_f;
++
++    for (int64_t b = 0; b < n_blocks; ++b) {
++        for (int64_t j = 0; j < r; ++j) {
++            lut[j + r*b] = (b == n_blocks_f && j >= tail_len) ? (int32_t) (n_kv - 1)
++                                                              : (int32_t) (r*b + j);
++        }
++    }
++
++    // une seule tranche est calculee : les jetons partagent la meme table
++    for (int64_t t = 1; t < n_tps; ++t) {
++        memcpy(lut + r*n_blocks*t, lut, (size_t) r*n_blocks*sizeof(int32_t));
++    }
++}
++
++// [TAG_QSA_SEL_DUMP] Verification d'exactitude : les `width` indices de cellules selectionnes par
++// jeton et par couche sont recopies dans un tenseur sink, relu par l'hote au pas SUIVANT puis ecrits
++// tries dans le fichier pointe par LLAMA_QSA_SEL_DUMP. Le sink est un tenseur de graphe marque OUTPUT
++// (ggml-alloc ne recycle pas sa memoire) et lu via ggml_backend_tensor_get : aucun passage par l'hote
++// au milieu du graphe, aucun noeud CPU.
++static const char * qsa_sel_dump_path() {
++    static const char * p = getenv("LLAMA_QSA_SEL_DUMP");
++    return (p != nullptr && *p != '\0') ? p : nullptr;
++}
++
++// [TAG_QSA_SEL_BLOCK] Le chemin bloc remplace la table cellule -> bloc du chemin historique
++// (cell_blk, remplie par l'hote pendant son scan du cache) par une table (bloc, rang) -> cellule
++// deduite de « cellule = position ». Les deux coincident SSI le cache est REGULIER :
++//  - une seule sequence dans l'ubatch ET dans le cache : une cellule etrangere creerait un groupe
++//    de bloc melange entre sequences, que l'hote ne peut pas resumer en un seul bloc ;
++//  - pas d'ubatch 2D : une image repete les positions et l'hote reclasse alors les cellules par
++//    rang mrope (le rang ne suit plus la position) ;
++//  - toutes les cellules [0, n_kv) occupees : un trou rend son bloc incomplet, ses cellules sont
++//    renvoyees au bloc « mort » avec le biais 1e9, et la numerotation des blocs se decale.
++// Sans ces trois conditions le bloc de queue incomplet n'est plus le seul bloc non resolu et la
++// table (bloc, rang) -> cellule serait FAUSSE : on retombe sur le chemin historique (selection
++// identique par construction, gain perdu pour ce pas).
++static bool qsa_cache_block_uniform(const llama_kv_cache * kv, const llama_ubatch & ubatch, int64_t n_kv) {
++    static const bool dbg = getenv("LLAMA_QSA_DEBUG") != nullptr;
++
++    if (kv == nullptr || ubatch.n_seqs != 1) {
++        if (dbg) {
++            fprintf(stderr, "[QSA_SB] refus kv=%p n_seqs=%d\n", (const void *) kv, (int) ubatch.n_seqs);
++        }
++        return false;
++    }
++
++    const llama_seq_id seq = ubatch.seq_id[0][0];
++    const llama_kv_cells & cells = kv->get_cells(seq);
++
++    for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
++        if (sq != (int) seq && cells.seq_pos_min(sq) >= 0) {
++            if (dbg) {
++                fprintf(stderr, "[QSA_SB] refus : sequence %d aussi presente dans le cache (seq=%d)\n", sq, (int) seq);
++            }
++            return false;
++        }
++    }
++
++    // « cellule = position » : c'est l'invariant du fork QSA (noyau d'indexeur + assert « cell
++    // position runs past the cell window »). Il exclut exactement les cas ou le classement des
++    // cellules par bloc s'ecarte de cellule/r : image/m-rope (positions repetees, l'hote reclasse
++    // par rang mrope), cache decale, cache avec trous ou cellules etrangeres.
++    // NB : ubatch.is_pos_2d() n'est PAS utilisable ici : il vaut n_pos >= 3, donc toujours vrai sur
++    // ce modele m-rope, texte compris (constate au smoke test).
++    //
++    // Les cellules VIDES de queue sont normales : n_kv du cache d'indexeur est arrondi au-dela des
++    // cellules ecrites (3072 pour 2935 cellules au smoke). Une cellule vide est toujours masquee
++    // (-inf) donc jamais selectionnee par la reference : la seule contrainte est qu'aucune cellule
++    // OCCUPEE ne suive le premier trou, sinon la numerotation des blocs se decale.
++    int64_t used = 0;
++
++    while (used < n_kv && !cells.is_empty((uint32_t) used)) {
++        if (!cells.seq_has((uint32_t) used, seq) || cells.pos_get((uint32_t) used) != (llama_pos) used) {
++            if (dbg) {
++                fprintf(stderr, "[QSA_SB] refus : cellule %lld has=%d pos=%d (n_kv=%lld seq=%d)\n",
++                        (long long) used, (int) cells.seq_has((uint32_t) used, seq),
++                        (int) cells.pos_get((uint32_t) used), (long long) n_kv, (int) seq);
++            }
++            return false;
++        }
++        used++;
++    }
++
++    for (int64_t j = used; j < n_kv; ++j) {
++        if (!cells.is_empty((uint32_t) j)) {
++            if (dbg) {
++                fprintf(stderr, "[QSA_SB] refus : cellule %lld occupee apres le trou %lld\n",
++                        (long long) j, (long long) used);
++            }
++            return false;
++        }
++    }
++
++    if (dbg) {
++        fprintf(stderr, "[QSA_SB] OK n_kv=%lld used=%lld seq=%d\n", (long long) n_kv, (long long) used, (int) seq);
++    }
++
++    return true;
++}
++
+ class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
+ public:
+     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
+@@ -881,6 +990,29 @@ public:
+     int64_t n_kv = 0;
+     virtual ~llm_graph_input_qsa() = default;
+ 
++    // [TAG_QSA_SEL_DUMP] sink de verification : `width` indices de cellules par jeton et par couche.
++    // Cree une fois par graphe et par couche, partage par tous les pas tant que le graphe vit.
++    ggml_tensor * qsa_dump_sink(ggml_context * ctx0, int il, int64_t width, int64_t n_tps, int64_t n_stream) {
++        if (width <= 0 || n_tps <= 0 || n_stream <= 0) {
++            return nullptr;
++        }
++        if ((int) dump_sinks.size() <= il) {
++            dump_sinks.resize(il + 1, nullptr);
++        }
++        if (dump_sinks[il] == nullptr) {
++            ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, width, n_tps, 1, n_stream);
++            ggml_set_output(t);
++            ggml_format_name(t, "qsa_sel_dump_%d", il);
++            dump_sinks[il] = t;
++            dump_width     = width;
++        }
++        ggml_tensor * t = dump_sinks[il];
++        if (t->ne[0] != width || t->ne[1] != n_tps || t->ne[3] != n_stream) {
++            return nullptr;
++        }
++        return t;
++    }
++
+     void set_input(const llama_ubatch * ubatch) override {
+         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+         // [TAG_QSA_KEEPKEYS] entree reduite (ecriture des cles seules) : pas d'entrees de selection
+@@ -888,11 +1020,26 @@ public:
+             mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_ends, ubatch, ratio, blk_bias, n_kv);
+         }
+ 
++        // [TAG_QSA_SEL_BLOCK] la table (bloc, rang) -> cellule est entierement deterministe :
++        // remplissage direct, sans passer par le scan du cache.
++        if (cell_lut != nullptr) {
++            GGML_ASSERT(ggml_backend_buffer_is_host(cell_lut->buffer));
++            const int64_t n_kv_lut = mctx->get_idx()->get_n_kv();
++            const int64_t n_blocks = (n_kv_lut + (int64_t) ratio - 1)/(int64_t) ratio;
++            GGML_ASSERT(cell_lut->ne[0] == (int64_t) ratio && cell_lut->ne[1] == n_blocks);
++            qsa_fill_cell_lut((int32_t *) cell_lut->data, ratio, n_kv_lut, n_blocks, cell_lut->ne[2]);
++        }
++
+         // [TAG_QSA_CACHE_COMPRESSED] lists d'ecriture des cles de bloc (aussi sous le budget, ou
+         // seules les cles sont ecrites)
+         if (wr_cells != nullptr) {
+             mctx->set_input_qsa_wr(wr_members, wr_cells, wr_pos, ubatch, ratio);
+         }
++
++        // [TAG_QSA_SEL_DUMP] lecture du sink (ecrit par le pas precedent)
++        if (!dump_sinks.empty()) {
++            qsa_dump_read();
++        }
+     }
+ 
+     bool can_reuse(const llm_graph_params & params) override {
+@@ -929,10 +1076,22 @@ public:
+             res &= wr_members->ne[0] == (uint32_t) (wr_n*ratio);
+             res &= wr_pos->ne[0]     == (uint32_t) (4*wr_n);
+         }
+-        if (cell_blk == nullptr) {
++        if (cell_blk == nullptr && cell_lut == nullptr) {
+             // [TAG_QSA_KEEPKEYS] cette entree ne porte que les k_idxs (elle ne selectionne pas)
+             return res;
+         }
++        // [TAG_QSA_SEL_BLOCK] entrees du chemin de selection au niveau bloc. Le chemin remplace la
++        // table cellule -> bloc du chemin historique : si la disposition du cache cesse d'etre
++        // reguliere (trou, cellule etrangere, ubatch 2D) le graphe doit etre reconstruit, sinon il
++        // selectionnerait avec une table fausse.
++        if (cell_lut != nullptr) {
++            const bool uniform = qsa_cache_block_uniform(mctx->get_mem_idx(), params.ubatch, n_kv);
++            res &= uniform;
++            res &= cell_lut->ne[0] == (int64_t) ratio;
++            res &= cell_lut->ne[1] == n_blocks;
++            res &= cell_lut->ne[2] == params.ubatch.n_tokens;
++            return res;
++        }
+         res &= cell_blk->ne[0]  == n_kv;
+         res &= cell_blk->ne[1]  == n_stream;
+         if (blk_cells != nullptr) {
+@@ -956,6 +1115,7 @@ public:
+     // per stream: a cell index names a different token in each stream
+     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
+     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
++    ggml_tensor * cell_lut  = nullptr;   // [TAG_QSA_SEL_BLOCK] I32 [ratio, n_blocks, n_tokens/n_stream]
+     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
+     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
+     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+@@ -971,11 +1131,87 @@ public:
+     ggml_tensor * blk_ends   = nullptr;  // I32 [n_blocks, n_stream]
+     bool          cmp        = false;    // ce jeu d'entrees porte le chemin des cles de bloc
+ 
++    // [TAG_QSA_SEL_DUMP] un sink par couche d'attention pleine (voir qsa_dump_read)
++    std::vector<ggml_tensor *> dump_sinks;
++    int64_t                    dump_width = 0;
++    bool                       dump_armed = false;
++
+     const llama_memory_hybrid_idx_context * mctx;
+     const uint32_t ratio;
+ 
+     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
+     const bool blk_bias;
++
++private:
++    void qsa_dump_read() {
++        const char * path = qsa_sel_dump_path();
++        if (path == nullptr) {
++            return;
++        }
++
++        // attendre que tous les sinks soient alloues : sinon la premiere lecture lirait du vide
++        for (ggml_tensor * t : dump_sinks) {
++            if (t != nullptr && t->buffer == nullptr) {
++                return;
++            }
++        }
++        if (!dump_armed) {
++            dump_armed = true;   // le pas suivant lira la selection du pas courant
++            return;
++        }
++
++        static FILE * f       = nullptr;
++        static long   step    = 0;
++        static int    skipped = 0;
++        if (f == nullptr) {
++            f = fopen(path, "w");
++            if (f == nullptr) {
++                return;
++            }
++            fprintf(f, "# QSA_SEL_DUMP v1 width=%lld n_kv=%lld\n", (long long) dump_width, (long long) n_kv);
++        }
++
++        const int64_t width = dump_width;
++        std::vector<int32_t> buf;
++
++        for (size_t il = 0; il < dump_sinks.size(); ++il) {
++            ggml_tensor * t = dump_sinks[il];
++            if (t == nullptr || t->buffer == nullptr || t->ne[0] != width) {
++                continue;
++            }
++            const int64_t n_items = (int64_t) t->ne[0]*t->ne[1]*t->ne[2]*t->ne[3];
++            buf.resize(n_items);
++            ggml_backend_tensor_get(t, buf.data(), 0, n_items*sizeof(int32_t));
++
++            for (int64_t s = 0; s < t->ne[3]; ++s) {
++                for (int64_t tt = 0; tt < t->ne[1]; ++tt) {
++                    int32_t * p = buf.data() + width*(tt + t->ne[1]*s);
++                    bool ok = true;
++                    for (int64_t k = 0; k < width; ++k) {
++                        if (p[k] < 0 || p[k] >= n_kv) {
++                            ok = false;
++                            break;
++                        }
++                    }
++                    if (!ok) {
++                        skipped++;
++                        continue;
++                    }
++                    std::sort(p, p + width);
++                    fprintf(f, "step=%ld il=%d s=%lld t=%lld n=%lld cells=", step, (int) il,
++                            (long long) s, (long long) tt, (long long) width);
++                    for (int64_t k = 0; k < width; ++k) {
++                        fprintf(f, "%d%s", p[k], k + 1 < width ? "," : "");
++                    }
++                    fprintf(f, "\n");
++                }
++            }
++        }
++        fflush(f);
++        step++;
++    }
++
++public:
+ };
+ 
+ // [TAG_QSA_EXPAND_UPSCALE] L'expansion bloc -> cellule est une simple repetition quand
+@@ -1062,6 +1298,48 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+     const bool select = !skip_prefill_sel && !(nosel_guard && n_kv <= (int64_t) hparams.indexer_top_k + r - 1);
+ 
++    // [TAG_QSA_SEL_BLOCK] Selection au niveau BLOC (LLAMA_QSA_SEL_BLOCK=1) : on ne materialise les
++    // scores que pour les cellules CANDIDATES (K_blk blocs x r cellules + la queue incomplete) au
++    // lieu des n_kv cellules. `expanded = get_rows(score_p, cell_blk)` (92 us/couche a 32k, 180 us a
++    // 64k, mesure du 19/09) disparait ; la sortie garde EXACTEMENT le format actuel (indices de
++    // cellules, I32 [n_sel, n_tps, 1, n_stream]) donc build_attn_qsa / build_attn_qsa_gather ne
++    // changent pas. Invariants (Q3-SPEC.md) :
++    //  - le biais de bloc est ajoute AVANT l'expansion => le score est constant dans un bloc ;
++    //  - le masque est purement causal => un bloc est candidat ssi sa PREMIERE cellule est visible
++    //    (mask[r*b] == 0), et ajouter mask[r*b] avant le top-k de blocs ne change aucune valeur
++    //    (x + 0.0 est exact) ;
++    //  - le bloc de queue incomplet (n_kv % r cellules valides) est ecarte du top-k de blocs et
++    //    traite par une voie dediee : ses indices liraient sinon hors bornes du masque.
++    // Le flag est lu une seule fois. Absent => comportement actuel, bit a bit (aucun noeud, aucune
++    // entree supplementaire).
++    static const bool qsa_sel_block = [] {
++        const char * e = getenv("LLAMA_QSA_SEL_BLOCK");
++        return e != nullptr && atoll(e) != 0;
++    }();
++
++    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
++    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
++
++    // [TAG_QSA_GATHER] (from EngramHalo.cpp) the decode gather path needs the selection padded
++    // to the flash attention KV granularity; build_attn_qsa_gather masks the extra entries out
++    // again, so the visible set stays `width`
++    const int64_t n_sel = std::max<int64_t>(width, qsa_gather_n_sel(n_kv, width));
++
++    const int64_t n_blocks_f = n_kv/r;                  // blocs complets
++    const int64_t tail_len   = n_kv - r*n_blocks_f;     // cellules du bloc de queue incomplet
++    const int64_t k_blk      = std::min<int64_t>(n_blocks_f, (width + r - 1)/r + 1);
++    const int64_t n_cand     = k_blk*r + tail_len;
++
++    // decision unique : elle commande A LA FOIS la creation des entrees de graphe et le chemin
++    // emprunte (creer cell_lut sans le consommer ferait ecrire set_input dans un tenseur sans
++    // buffer : GGML_ASSERT(buffer), incident du 15/09).
++    // La disposition du cache est verifiee ici (et dans can_reuse, pour forcer une reconstruction du
++    // graphe si elle change) : hors cache regulier le chemin bloc serait faux (voir
++    // qsa_cache_block_uniform).
++    const bool sel_block_ok = qsa_sel_block && select && blk_bias && n_stream == 1 &&
++                              k_blk >= 1 && width > 0 && width <= n_cand &&
++                              qsa_cache_block_uniform(mctx_hyb->get_mem_idx(), ubatch, n_kv);
++
+     // [TAG_QSA_KEEPKEYS] Sous le budget on reste sur le chemin dense (reference exacte), mais on
+     // ECRIT QUAND MEME les cles d'indexer. Sinon, des que la sequence depasse le budget, les
+     // premiers blocs sont scores sur des cles jamais ecrites -> selection corrompue. C'est la
+@@ -1138,7 +1416,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // nothing above depends on the layer, so the layers sharing a ratio share one input set
+     const uint32_t inp_key = (uint32_t) r | (select ? 0x10000u : 0u) |
+                              (cmp ? 0x20000u : 0u) | (cmp && n_wr > 0 ? 0x40000u : 0u) |
+-                             (cmp && qsa_blk_view ? 0x80000u : 0u);
++                             (cmp && qsa_blk_view ? 0x80000u : 0u) |
++                             (sel_block_ok ? 0x100000u : 0u);
+     llm_graph_input_qsa * inp = nullptr;
+ 
+     const auto it = qsa_inps.find(inp_key);
+@@ -1156,7 +1435,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+             // ne leur alloue pas de buffer et set_input ecrirait dans NULL (segfault constate).
+             // [TAG_QSA_EXPAND_UPSCALE] avec l'upscale NEAREST, cell_blk n'est consomme par AUCUN
+             // noeud : le creer ferait ecrire set_input dans un tenseur sans buffer (GGML_ASSERT(buffer)).
+-            if (!qsa_expand_up_enabled()) {
++            // [TAG_QSA_SEL_BLOCK] idem pour le chemin bloc : cell_blk n'y sert plus (la table
++            // (bloc, rang) -> cellule le remplace), donc on ne cree QUE cell_lut.
++            if (sel_block_ok) {
++                qsa->cell_lut = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r, n_blocks, n_tps);
++                ggml_set_input(qsa->cell_lut);
++            } else if (!qsa_expand_up_enabled()) {
+                 qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+                 ggml_set_input(qsa->cell_blk);
+             }
+@@ -1346,6 +1630,81 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         return e != nullptr && atoll(e) != 0;
+     }();
+ 
++    ggml_tensor * top_k = nullptr;
++
++    if (sel_block_ok) {
++        // [TAG_QSA_SEL_BLOCK] Selection au niveau BLOC puis scores des seules cellules candidates.
++        //
++        // Rappel des invariants : `score` porte deja le biais (par bloc) et le score est constant
++        // dans un bloc ; le masque est purement causal, donc mask[r*b] decide a lui seul si un bloc
++        // est entierement (in)visible, et l'ajouter avant le top-k de blocs laisse chaque valeur
++        // candidate inchangee (x + 0.0 est exact). Le bloc de queue incomplet n'a pas ses r
++        // cellules : il est ecarte du top-k de blocs (les vues ci-dessous s'arretent aux blocs
++        // complets) et traite par une voie dediee de `tail_len` slots, exactement les cellules que
++        // l'hote marque « toujours visibles » (biais 1e9).
++        const int64_t n_cmp = n_blocks_f;   // blocs complets
++
++        // vues "un element par bloc" : nb[1] = nb[0] de score (le pas de bloc), nb[2] = pas de jeton
++        // (ggml_get_rows exige a->ne[2] == b->ne[1] : les jetons voyagent donc en ne[2])
++        ggml_tensor * score_v = ggml_view_3d(ctx0, score, 1, n_blocks, n_tps,
++                score->nb[0], score->nb[1], 0);
++        ggml_tensor * score_vc = ggml_view_3d(ctx0, score, 1, n_cmp, n_tps,
++                score->nb[0], score->nb[1], 0);
++
++        // masque de la PREMIERE cellule de chaque bloc : toutes les lectures restent dans les
++        // bornes (r*b_last < n_kv), y compris la ligne du bloc de queue
++        ggml_tensor * mask_blk = ggml_view_3d(ctx0, kq_mask, 1, n_cmp, n_tps,
++                r*kq_mask->nb[0], kq_mask->nb[1], 0);
++        mask_blk = ggml_cast(ctx0, mask_blk, GGML_TYPE_F32);
++
++        // le ggml_add produit un tenseur NEUF contigu [1, n_cmp, n_tps] ; le reshape_2d (relabelling
++        // de meme disposition) en fait la source contigue exigee par ggml_top_k
++        ggml_tensor * score_sel = ggml_add(ctx0, score_vc, mask_blk);
++        score_sel = ggml_reshape_2d(ctx0, score_sel, n_cmp, n_tps);
++
++        ggml_tensor * top_blk = ggml_top_k(ctx0, score_sel, (int) k_blk);   // I32 [k_blk, n_tps]
++        cb(top_blk, "indexer_top_blk", il);
++
++        // r slots par bloc candidat : score du bloc repete, cellule reelle (table hote)
++        ggml_tensor * sc_cand = ggml_get_rows(ctx0, score_v, top_blk);        // [1, k_blk, n_tps]
++        sc_cand = ggml_repeat_4d(ctx0, sc_cand, r, k_blk, n_tps, 1);          // [r, k_blk, n_tps]
++        ggml_tensor * ce_cand = ggml_get_rows(ctx0, inp->cell_lut, top_blk);  // I32 [r, k_blk, n_tps]
++
++        ggml_tensor * scores_all = ggml_reshape_2d(ctx0, sc_cand, r*k_blk, n_tps);
++        ggml_tensor * cells_all  = ggml_reshape_2d(ctx0, ce_cand, r*k_blk, n_tps);
++
++        if (tail_len > 0) {
++            // bloc de queue : score du bloc (biais 1e9 inclus) repete, cellules lues dans la table
++            ggml_tensor * sc_tail = ggml_view_3d(ctx0, score, 1, 1, n_tps,
++                    score->nb[0], score->nb[1], (size_t) n_cmp*score->nb[0]);
++            sc_tail = ggml_repeat_4d(ctx0, sc_tail, tail_len, 1, n_tps, 1);
++            ggml_tensor * ce_tail = ggml_view_3d(ctx0, inp->cell_lut, tail_len, 1, n_tps,
++                    inp->cell_lut->nb[1], inp->cell_lut->nb[2], (size_t) n_cmp*inp->cell_lut->nb[1]);
++
++            scores_all = ggml_concat(ctx0, scores_all,
++                    ggml_reshape_2d(ctx0, sc_tail, tail_len, n_tps), 0);
++            cells_all = ggml_concat(ctx0, cells_all,
++                    ggml_reshape_2d(ctx0, ce_tail, tail_len, n_tps), 0);
++        }
++
++        // masque de CELLULE des candidats (un seul gather par indice de cellule)
++        ggml_tensor * mask_cell_v = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_tps,
++                kq_mask->nb[0], kq_mask->nb[1], 0);
++        ggml_tensor * mask_all = ggml_get_rows(ctx0, mask_cell_v, cells_all);
++        if (kq_mask->type != GGML_TYPE_F32) {
++            mask_all = ggml_cast(ctx0, mask_all, GGML_TYPE_F32);
++        }
++        mask_all = ggml_reshape_2d(ctx0, mask_all, n_cand, n_tps);
++
++        ggml_tensor * cand = ggml_add(ctx0, scores_all, mask_all);   // [n_cand, n_tps]
++        ggml_tensor * sel  = ggml_top_k(ctx0, cand, (int) width);    // I32 [width, n_tps]
++
++        // remap slot candidat -> cellule (gather I32) : la sortie garde le format historique
++        ggml_tensor * cmap = ggml_view_3d(ctx0, cells_all, 1, n_cand, n_tps,
++                cells_all->nb[0], cells_all->nb[1], 0);
++        ggml_tensor * cells_sel = ggml_get_rows(ctx0, cmap, sel);    // I32 [1, width, n_tps]
++        top_k = ggml_reshape_4d(ctx0, cells_sel, width, n_tps, 1, n_stream);
++    } else {
+     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+     ggml_tensor * score_p = ggml_permute(ctx0, score, 1, 0, 2, 3);
+     if (!qsa_no_cont) {
+@@ -1384,12 +1743,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     cb(expanded, "indexer_score_tokens", il);
+ 
+     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+-
++    // (width et n_sel sont calcules plus haut : ils commandent le choix de chemin et le padding)
+     // [TAG_QSA_GATHER] (from EngramHalo.cpp) the decode gather path needs the selection padded
+     // to the flash attention KV granularity; build_attn_qsa_gather masks the extra entries out
+     // again, so the visible set stays `width`
+-    const int64_t n_sel = std::max<int64_t>(width, qsa_gather_n_sel(n_kv, width));
+ 
+     // ggml_top_k (radix selection on the Vulkan backend for large k) returns the top
+     // `width` indices in no particular order — every consumer treats the selection as a
+@@ -1397,10 +1754,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // attention granularity: repeat the first index; the pad entries are re-masked to
+     // -inf in build_attn_qsa_gather, so duplicates are never visible.
+     // [TAG_QSA_OPT] top_k cree deja un tenseur neuf (donc contigu) : le cont etait inutile
+-    ggml_tensor * top_k = ggml_top_k(ctx0, expanded, width);
++    top_k = ggml_top_k(ctx0, expanded, width);
+     if (!qsa_no_cont) {
+         top_k = ggml_cont(ctx0, top_k);
+     }
++    }
++
++    // [TAG_QSA_SEL_DUMP] verification d'egalite d'ensembles : les `width` indices de cellules
++    // reellement selectionnes sont recopies dans un sink (un par couche), relu par l'hote au pas
++    // suivant. Gate par LLAMA_QSA_SEL_DUMP=<chemin> : sans la variable, aucun tenseur, aucun noeud.
++    if (qsa_sel_dump_path() != nullptr) {
++        ggml_tensor * sink = inp->qsa_dump_sink(ctx0, il, width, n_tps, n_stream);
++        if (sink != nullptr) {
++            ggml_tensor * sel_w = ggml_view_3d(ctx0, top_k, width, n_tps, n_stream,
++                    top_k->nb[1], top_k->nb[2], 0);
++            ggml_tensor * dbg = ggml_cpy(ctx0, sel_w, sink);
++            ggml_build_forward_expand(gf, dbg);
++        }
++    }
+ 
+     if (n_sel > width) {
+         ggml_tensor * first = ggml_view_3d(ctx0, top_k, 1, top_k->ne[1], top_k->ne[2],
+-- 
+2.53.0
+

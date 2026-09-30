@@ -1,0 +1,52 @@
+From 91081933e91a6097a7f6a708709cf2b08937d10d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Wed, 2 Sep 2026 14:51:22 +0200
+Subject: [PATCH 15/54] vulkan: parameterize DMMV_LARGE_AMD gate (env = max_m),
+ prod value 8192
+
+Sweep 64/512/8192 on qwen4exp decode with thermal witness shape:
+  27.35 -> 27.71 -> 27.96 t/s (monotonic, +2.2% at 8192 vs 64).
+Winners: m=48 k=2560 (60.4 -> 3.2 us, 19x), m=4 k=10240, f32 m=512 router.
+num_cols==1 gate protects prefill (n>=2 regressed badly without it).
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a9493d7cb48..1b4459d93fd 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8227,6 +8227,16 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
+     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+ }
+ 
++// [TAG_DMMV_LARGE_AMD] env GGML_VK_DMMV_LARGE_AMD = max_m gate for LARGE workgroups on AMD
++// (0 or absent = off, N = apply when num_cols==1 && m <= N)
++static int dmmv_large_amd_max_m() {
++    static const int v = [] {
++        const char * e = getenv("GGML_VK_DMMV_LARGE_AMD");
++        return e ? atoi(e) : 0;
++    }();
++    return v;
++}
++
+ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
+     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
+     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
+@@ -8298,10 +8308,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+     // heuristic to choose workgroup size
+     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL
+-        // [TAG_DMMV_LARGE_AMD] gfx1151: LARGE WG for n=1 matvecs, tiny m, large k.
++        // [TAG_DMMV_LARGE_AMD] gfx1151: LARGE WG for n=1 matvecs, tiny m / large k.
+         // A/B 02/09: m=4 k=10240 (HC w_inject) -125 ms, m=48 k=2560 -78 ms, f32 m=1 -20 ms.
+-        // Regresses m>=320 (n=1) and badly n>=2 (prefill) -> strict gate num_cols==1 && m<=64.
+-        || (getenv("GGML_VK_DMMV_LARGE_AMD") && ctx->device->vendor_id == VK_VENDOR_ID_AMD && num_cols == 1 && m <= 64)) {
++        // Env value = max_m gate (absent/0 = off). Strict num_cols==1 to protect prefill.
++        || (dmmv_large_amd_max_m() > 0 && ctx->device->vendor_id == VK_VENDOR_ID_AMD && num_cols == 1 && m <= (uint32_t) dmmv_large_amd_max_m())) {
+         // Prefer larger workgroups when M is small, to spread the work out more
+         // and keep more SMs busy.
+         // q6_k seems to prefer small workgroup size even for "medium" values of M.
+-- 
+2.53.0
+

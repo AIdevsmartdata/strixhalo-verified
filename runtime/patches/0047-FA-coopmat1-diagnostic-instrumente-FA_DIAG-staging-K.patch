@@ -1,0 +1,343 @@
+From 5071ad668f4a86b1985e85f63753c70bb0ba9bd7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 19 Sep 2026 11:44:06 +0200
+Subject: [PATCH 47/54] FA coopmat1 : diagnostic instrumente (FA_DIAG) +
+ staging K/V (FA_STAGE_KV) + multi-lignes MR=2/4
+
+Diagnostic (variantes neutralisant une phase chacune, GPU exclusif, cas hsk=hsv=256 nh=2
+nr23=[12,1] kv=32768/131072 nb=2048 f16) :
+  sans exp()                -0,2 % / +0,4 %   -> softmax gratuit
+  sans rescale de O         +0,6 % / +1,0 %   -> gratuit
+  sans mma PV              -34,1 % / -51,3 %
+  sans mma QK^T            -47,6 % / -66,7 %
+  sans chargements K/V     -54,8 % / -72,6 %  <-- poste dominant
+  sans chargements, KV q8_0 (controle)  +0,3 % / -0,1 %
+=> la partie mma seule tourne a 19,7-23,3 TFLOPS (au-dessus du GEMM mesure, 17,5) : le
+noyau n'est pas limite par les maths mais par la latence des chargements K/V directs.
+Forcer le staging shmem (GGML_VK_FA_STAGE_KV=1, reserve NVIDIA/hsk<256 en amont) : -12 % a
+131k mais +31 % a 32k (cout shmem/occupation).
+
+[TAG_FA_MR] MR groupes de 16 lignes de requetes par workgroup (Br = 16*MR) partageant les
+chargements KMat/V ; offsets de groupe : Qf + m*16*qstride, sfsh + m*4, Psh + m*16*psh_stride,
+pvsh + m*16*osh_stride ; pvsh dimensionne Br*osh_stride. Variantes SPIR-V mr2/mr4 (f32 acc),
+selection par GGML_VK_FA_MR=2|4 ; le spec constant Br est couple a la variante (Br=32 avec un
+shader MR=1 donne ERR=1,0).
+
+Mesure in-model (prefill 64k, baselines encadrantes) : 455,3 / 481,5 (prod MR=2, +5,8 %) /
+457,0 ; MR=4 = 292,7 (-36 %). Verrous : SHA, RETR 14k 4/4, zebra 2/2 ok=True, pi+read PASS.
+FA_DIAG et FA_STAGE_KV restent inactifs par defaut (infrastructure de mesure).
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 76 ++++++++++++++++++-
+ .../vulkan-shaders/flash_attn_cm1.comp        | 72 +++++++++++++++---
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     | 16 ++++
+ 3 files changed, 150 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index cd97be04232..18e61ae21a2 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4009,6 +4009,33 @@ static void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events
+     );
+ }
+ 
++// [TAG_FA_STAGE_KV] Le banc de diagnostic (variantes FA_DIAG) montre que le FA prefill
++// passe 55 % (32k) a 73 % (131k) de son temps dans les chargements cooperatifs K/V
++// directs depuis la memoire globale : chaque coopMatLoad rapatrie une tuile 16x16 f16
++// par sous-groupe et il n'y a pas assez de registres pour pipeliner les 16 iterations
++// du noyau HSK, donc la latence L2/DRAM n'est pas cachee. Le chemin SHMEM_STAGING
++// (chargement coalesce vers la memoire partagee, puis mma depuis le shmem) existe mais
++// est reserve a NVIDIA avec hsk/hsv < 256 -- ni notre vendor ni notre geometrie.
++// GGML_VK_FA_STAGE_KV=1 force ce chemin pour l'A/B.
++// [TAG_FA_MR] Nombre de groupes de 16 lignes de requetes par workgroup (1 = historique).
++// Le shader est compile avec MR correspondant (variantes mr2/mr4) : les chargements K/V
++// sont partages entre les groupes, ce qui divise leur cout par MR.
++static int ggml_vk_fa_mr() {
++    static const int v = [] {
++        const char * e = getenv("GGML_VK_FA_MR");
++        return e ? atoi(e) : 0;
++    }();
++    return (v == 2 || v == 4) ? v : 1;
++}
++
++static bool ggml_vk_fa_stage_kv_forced() {
++    static const bool v = [] {
++        const char * e = getenv("GGML_VK_FA_STAGE_KV");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return v;
++}
++
+ struct vk_fa_tuning_params {
+     FaCodePath path;
+     uint32_t workgroup_size;
+@@ -4082,7 +4109,7 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device,
+ 
+     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+ 
+-    result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
++    result.shmem_staging = ggml_vk_fa_stage_kv_forced() ? 1 : ((device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0);
+ 
+     if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+         result.block_rows /= 2;
+@@ -4130,10 +4157,17 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
+     result.subgroup_size = device->subgroup_size;
+     result.workgroup_size = num_subgroups * result.subgroup_size;
+ 
++    // [TAG_FA_MR] MR groupes de lignes par workgroup. Uniquement pour l'accumulateur f32 :
++    // les variantes SPIR-V mr2/mr4 ne sont compilees que pour ce cas (sinon Br=32 serait
++    // utilise avec un shader MR=1 -> resultat faux).
++    if (f32acc && ggml_vk_fa_mr() > 1) {
++        result.block_rows = 16 * ggml_vk_fa_mr();
++    }
++
+     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
+     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+ 
+-    result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
++    result.shmem_staging = ggml_vk_fa_stage_kv_forced() ? 1 : ((device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0);
+ 
+     return result;
+ }
+@@ -5058,6 +5092,44 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
+                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
+                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
++                // [TAG_FA_MR] variante multi-lignes (SPIR-V compile avec MR=2 ou 4)
++                if (f32acc) {
++                    const int mr = ggml_vk_fa_mr();
++                    if (mr == 2) {
++                        spv_data = flash_attn_f32_f16_mr2_cm1_data; spv_size = flash_attn_f32_f16_mr2_cm1_len;
++                        name = "flash_attn_f32_f16_mr2_cm1";
++                        static bool mr_logged = false;
++                        if (!mr_logged) { mr_logged = true; fprintf(stderr, "[FA_MR] variante MR=%d active (Br=%u Bc=%u)\n", mr, Br, Bc); }
++                    } else if (mr == 4) {
++                        spv_data = flash_attn_f32_f16_mr4_cm1_data; spv_size = flash_attn_f32_f16_mr4_cm1_len;
++                        name = "flash_attn_f32_f16_mr4_cm1";
++                        static bool mr_logged = false;
++                        if (!mr_logged) { mr_logged = true; fprintf(stderr, "[FA_MR] variante MR=%d active (Br=%u Bc=%u)\n", mr, Br, Bc); }
++                    }
++                }
++                // [TAG_FA_DIAG] variante de diagnostic selectionnee par GGML_VK_FA_DIAG (1..5).
++                // Jamais utilisee en production : ces variantes neutralisent une phase et
++                // produisent donc un resultat FAUX (mesure de temps uniquement).
++                if (f32acc) {
++                    static const int fa_diag_env = [] {
++                        const char * e = getenv("GGML_VK_FA_DIAG");
++                        return e ? atoi(e) : 0;
++                    }();
++                    if (fa_diag_env >= 1 && fa_diag_env <= 5) {
++                        switch (fa_diag_env) {
++                            case 1: spv_data = flash_attn_f32_f16_diag1_cm1_data; spv_size = flash_attn_f32_f16_diag1_cm1_len; break;
++                            case 2: spv_data = flash_attn_f32_f16_diag2_cm1_data; spv_size = flash_attn_f32_f16_diag2_cm1_len; break;
++                            case 3: spv_data = flash_attn_f32_f16_diag3_cm1_data; spv_size = flash_attn_f32_f16_diag3_cm1_len; break;
++                            case 4: spv_data = flash_attn_f32_f16_diag4_cm1_data; spv_size = flash_attn_f32_f16_diag4_cm1_len; break;
++                            case 5: spv_data = flash_attn_f32_f16_diag5_cm1_data; spv_size = flash_attn_f32_f16_diag5_cm1_len; break;
++                        }
++                        name = "flash_attn_f32_f16_diag";
++                        static bool diag_logged = false;
++                        if (!diag_logged) { diag_logged = true;
++                            fprintf(stderr, "[FA_DIAG] variante %d active (f32acc=1, aligned=%d, Br=%u Bc=%u)\n",
++                                    fa_diag_env, (int)aligned, Br, Bc); }
++                    }
++                }
+             }
+             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
+                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+index c812657973e..4134b63886c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+@@ -23,6 +23,13 @@
+ #endif
+ 
+ // These need to be supported N,M values for a MatBc x MatBr x 16 coopmatmuladd
++// [TAG_FA_DIAG] Mode diagnostic (jamais deploye) : neutralise UNE phase pour mesurer son cout.
++// 0 = normal | 1 = sans exp (SFU) | 2 = sans les mma du PV | 3 = sans les mma du QK^T
++// 4 = sans le rescale de l'accumulateur O | 5 = sans les chargements K/V
++#ifndef FA_DIAG
++#define FA_DIAG 0
++#endif
++
+ const uint32_t MatBr = 16;
+ const uint32_t MatBc = 16;
+ 
+@@ -50,6 +57,16 @@ shared FLOAT_TYPEV4 Qf[Br * qstride];
+ const uint psh_stride = Bc / 4 + 2;
+ shared FLOAT_TYPEV4 Psh[Br * psh_stride];
+ 
++// [TAG_FA_MR] Nombre de groupes de 16 lignes de requetes par workgroup.
++// MR=1 : comportement historique (Br=16). MR=2/4 : le workgroup couvre Br = 16*MR lignes
++// et surtout **les chargements K/V sont partages entre les groupes** (le banc FA_DIAG
++// montre que ces chargements pesent 55 % a kv=32k et 73 % a kv=131k, alors que la partie
++// mma tourne deja a ~23 TFLOPS, soit le niveau du GEMM). Offsets de groupe, selon la
++// semantique des buffers : Qf + m*16*qstride | sfsh + m*4 | Psh + m*16*psh_stride |
++// pvsh + m*16*osh_stride.
++#ifndef MR
++#define MR 1
++#endif
+ // Avoid padding for hsk==256 to make it fit in 48KB shmem.
+ const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
+ shared ACC_TYPEV4 sfsh[Bc * sfshstride];
+@@ -61,7 +78,7 @@ const uint vsh_stride = v_cols;
+ shared FLOAT_TYPEV4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
+ 
+ const uint32_t osh_stride = row_split * MatBr / 4;
+-shared O_TYPEV4 pvsh[MatBc * osh_stride];
++shared O_TYPEV4 pvsh[Br * osh_stride];   // [TAG_FA_MR] Br = 16*MR lignes
+ 
+ shared ACC_TYPE slope[Br];
+ 
+@@ -257,7 +274,10 @@ void main() {
+         // K * Q^T -> S^T: Bc x HSK_pad * HSK_pad x Br -> Bc x Br
+         // Bc split across workgroup (four subgroups), loop over HSK in chunks of 16: 16 x 16 * 16 x 16 -> 16 x 16
+         // This is written transposed in order to allow for N being 8 if implementations need it
+-        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
++        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat[MR];
++        [[unroll]] for (uint32_t m = 0; m < MR; ++m) {
++            SfMat[m] = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(ACC_TYPE(0));
++        }
+         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
+         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
+ 
+@@ -302,20 +322,28 @@ void main() {
+                 coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+             } else {
+                 const uint coord = k_offset / 4 + (j * Bc + gl_SubgroupID * MatBc) * k_stride / 4 + d * 16 / 4;
++#if FA_DIAG != 5
+                 coopMatLoad(KMat, data_kv4, coord, k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
++#endif
+             }
+             } else {
+                 uint coord = (gl_SubgroupID * MatBc) * kvsh_stride + d * 16 / 4;
+                 coopMatLoad(KMat, kvsh, coord, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+             }
+ 
+-            coopMatLoad(QMat, Qf, d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
+-
+-            SfMat = coopMatMulAdd(KMat, QMat, SfMat);
++            // [TAG_FA_MR] KMat est charge UNE fois par d, puis reutilise par les MR groupes.
++            [[unroll]] for (uint32_t m = 0; m < MR; ++m) {
++                coopMatLoad(QMat, Qf, m * 16 * qstride + d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
++#if FA_DIAG != 3
++                SfMat[m] = coopMatMulAdd(KMat, QMat, SfMat[m]);
++#endif
++            }
+         }
+ 
+         uint coord = gl_SubgroupID * MatBc * sfshstride;
+-        coopMatStore(SfMat, sfsh, coord, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
++        [[unroll]] for (uint32_t m = 0; m < MR; ++m) {
++            coopMatStore(SfMat[m], sfsh, coord + m * 4, sfshstride, gl_CooperativeMatrixLayoutRowMajor);
++        }
+         barrier();
+ 
+         if (LOGIT_SOFTCAP) {
+@@ -375,7 +403,9 @@ void main() {
+         [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
+             const uint d_local = d0 / threads_per_rowgroup;
+             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
++#if FA_DIAG != 4
+                 Of[r][d_local] = O_TYPE(eMf[r]) * Of[r][d_local];
++#endif
+             }
+         }
+ 
+@@ -393,7 +423,11 @@ void main() {
+                     }
+                 } else {
+                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
++#if FA_DIAG == 1
++                    const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec);
++#else
+                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
++#endif
+                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                         Lf[r + vec_idx] += Pf[vec_idx];
+                         Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = Pf[vec_idx];
+@@ -432,16 +466,21 @@ void main() {
+ 
+         // Psh is not written again until the next KV block, so the P fragments are the same
+         // for every hsv_tile. Load them once instead of re-reading LDS per tile.
+-        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
+-        [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+-            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * (MatBc / 4), psh_stride, gl_CooperativeMatrixLayoutRowMajor);
++        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[MR][Bc / MatBc];
++        [[unroll]] for (uint32_t m = 0; m < MR; ++m) {
++            [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
++                coopMatLoad(PMat[m][bc_chunk], Psh, m * 16 * psh_stride + bc_chunk * (MatBc / 4), psh_stride, gl_CooperativeMatrixLayoutRowMajor);
++            }
+         }
+ 
+         // Each subgroup handles HSV/4 columns
+         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
+             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
+ 
+-            coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
++            coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat[MR];
++            [[unroll]] for (uint32_t m = 0; m < MR; ++m) {
++                PVMat[m] = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(O_TYPE(0));
++            }
+ 
+             // Preload V tiles for [Bc, 16 * num subgroups]
+             const uint v_rows = Bc;
+@@ -495,7 +534,9 @@ void main() {
+                         // F16/BF16 values can be loaded directly from global memory
+                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
+                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
++#if FA_DIAG != 5
+                         coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
++#endif
+                     } else {
+                         const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
+                         coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+@@ -505,11 +546,18 @@ void main() {
+                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                     }
+ 
+-                    PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
++#if FA_DIAG != 2
++                    // [TAG_FA_MR] le fragment V vient d'etre charge : il sert les MR groupes.
++                    [[unroll]] for (uint32_t m = 0; m < MR; ++m) {
++                        PVMat[m] = coopMatMulAdd(PMat[m][bc_chunk], QMat, PVMat[m]);
++                    }
++#endif
+                 }
+ 
+                 // Store PVMat to pvsh and load into Of
+-                coopMatStore(PVMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
++                [[unroll]] for (uint32_t m = 0; m < MR; ++m) {
++                    coopMatStore(PVMat[m], pvsh, o_offset + m * 16 * osh_stride, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
++                }
+             }
+ 
+             barrier();
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 79045998c57..35c24c627bf 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -697,6 +697,22 @@ void process_shaders() {
+ #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
+                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
++                // [TAG_FA_MR] variantes multi-lignes (MR=2 et 4) : partagent les chargements K/V
++                if (!f16acc) {
++                    for (int mr : {2, 4}) {
++                        string_to_spv("flash_attn_f32_f16_mr" + std::to_string(mr), "flash_attn_cm1.comp",
++                            merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
++                                                      {"COOPMAT", "1"}, {"MR", std::to_string(mr)}}), fp16, true, false, f16acc);
++                    }
++                }
++                // [TAG_FA_DIAG] variantes de diagnostic (accumulateur f32, jamais deployees)
++                if (!f16acc) {
++                    for (int diag = 1; diag <= 5; ++diag) {
++                        string_to_spv("flash_attn_f32_f16_diag" + std::to_string(diag), "flash_attn_cm1.comp",
++                            merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
++                                                      {"COOPMAT", "1"}, {"FA_DIAG", std::to_string(diag)}}), fp16, true, false, f16acc);
++                    }
++                }
+ #endif
+             }
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,529 @@
+From 9adaca4faa0a3151262982df69c4977d142ccef6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Fri, 4 Sep 2026 14:48:37 +0200
+Subject: [PATCH 24/54] vulkan: elide the GDN recurrent-cache CPY
+ ([TAG_GDN_ZC])
+
+The GDN kernel already materialises the state snapshots it computes; copying them
+into the recurrent ring is pure overhead (452 us/token of CPY in the 125B decode
+profile). CUDA does the same in commit 5a460dea: write the cache from the kernel
+and drop the copy.
+
+Detection is dependency based rather than adjacency based: a CPY whose source is
+a contiguous view of a GATED_DELTA_NET output at the snapshot tail, writing into
+a [state, seq, slot] view of the recurrent cache. This matters because the Vulkan
+backend reorders nodes for parallelism, which separates the CPY from the GDN by
+several nodes (verified: 42 GDN / 49 CPY with graph_optimize, 41/44 without).
+
+The GGML graph is never modified: the CPY node is simply not executed and the GDN
+shader receives the cache slice as an extra binding (binding 7, used only when
+use_fused_cache is set, aliased to the GDN output otherwise). The cache write is
+declared in the backend's sync bookkeeping so ordering against the cache reads
+(GET_ROWS) and later writes is unchanged.
+
+Consumers of the CPY result stay correct: any consumer depends on the CPY, hence
+on the GDN, so the write always precedes the read.
+
+Shader: binding 7 holds the cache destination; for K>1 the slot stride is the
+destination's nb[2], for K=1 only nb[1] is used - both match the strides the CPY
+would have used, so the cache layout is bit-identical.
+
+Tests: 6 GATED_DELTA_NET_ZC cases reproduce the production graph (including the
+non-contiguous ring view and the K=1 / K>1 paths) and compare CPU against Vulkan
+in whole-graph mode. Verified 6/6 with the fusion active (1 CPY elided per case),
+6/6 with GGML_VK_DISABLE_FUSION=1 and 36/36 legacy GATED_DELTA_NET unchanged.
+On the 27B: 48 cache CPYs elided per graph, byte-identical output with and
+without the fusion on both the !keep (K=1) and keep (K>1) paths.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 179 +++++++++++++++++-
+ .../vulkan-shaders/gated_delta_net.comp       |  31 ++-
+ tests/test-backend-ops.cpp                    |  64 ++++++-
+ 3 files changed, 258 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 1b4459d93fd..c260279e958 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1,5 +1,10 @@
+ #include "ggml-vulkan.h"
+ #include <vulkan/vulkan_core.h>
++
++// Maximum number of extra graph nodes a single node may absorb through fusion.
++// Must match the per-node fusion bookkeeping array in ggml_backend_vk_graph_compute().
++#define GGML_VK_MAX_FUSED_OPS 12
++
+ #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
+ #include <chrono>
+ #include "ggml-cpu.h"
+@@ -62,6 +67,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
+ #include <map>
+ #include <set>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <shared_mutex>
+ #include <mutex>
+ #include <future>
+@@ -1124,6 +1130,7 @@ struct vk_device_struct {
+     ggml_backend_buffer_type buffer_type;
+ 
+     bool disable_fusion;
++    bool disable_gdn_cache_fusion;
+     bool disable_host_visible_vidmem;
+     bool allow_sysmem_fallback;
+     bool disable_graph_optimize;
+@@ -1877,6 +1884,9 @@ struct vk_op_gated_delta_net_push_constants {
+     uint32_t neq1, rq3;
+     float scale;
+     uint32_t K;
++    uint32_t use_fused_cache;
++    uint32_t cache_slot_stride;
++    uint32_t cache_seq_stride;
+ };
+ 
+ struct vk_op_ssm_scan_push_constants {
+@@ -2416,6 +2426,14 @@ struct ggml_backend_vk_context {
+     int fused_ops_write_mask {};
+     topk_moe_mode fused_topk_moe_mode {};
+     bool fused_topk_moe_scale {};
++    // [TAG_GDN_ZC] GDN -> recurrent-cache CPY elision.
++    // The GDN kernel can write the recurrent cache slice directly, which lets the backend
++    // skip the CPY node. The GGML graph itself is never modified.
++    // gdn_cache_dst maps a GDN node to the cache view it must write; gdn_cache_skip holds
++    // the CPY nodes that are therefore elided. Both are rebuilt for each graph.
++    const ggml_tensor * fused_gdn_cache_dst {};
++    std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_cache_dst;
++    std::unordered_set<const ggml_tensor *>                      gdn_cache_skip;
+ 
+     // for GGML_VK_PERF_LOGGER
+     std::unique_ptr<vk_perf_logger> perf_logger;
+@@ -6347,7 +6365,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             for (uint32_t kda = 0; kda < 2; kda++) {
+                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
+-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
++                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+             }
+         }
+@@ -7525,6 +7543,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         device->serialize_submissions = getenv("GGML_VK_SERIALIZE_SUBMISSIONS") != nullptr;
+ 
+         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
++        device->disable_gdn_cache_fusion = getenv("GGML_VK_DISABLE_GDN_CACHE_FUSION") != nullptr;
+ 
+         device->add_rms_fusion = !device->disable_fusion &&
+                                  device->subgroup_arithmetic &&
+@@ -13370,7 +13389,9 @@ static void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context&
+         pc, { (uint32_t)(n_seqs * n_heads), 1, 1 });
+ }
+ 
+-static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++static void ggml_vk_gated_delta_net(
++        ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst,
++        const ggml_tensor * fused_cache_dst) {
+     const ggml_tensor * src_q     = dst->src[0];
+     const ggml_tensor * src_v     = dst->src[2];
+     const ggml_tensor * src_beta  = dst->src[4];
+@@ -13412,6 +13433,19 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
+     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
+ 
+     const float scale = 1.0f / sqrtf((float)S_v);
++
++    uint32_t use_fused_cache = 0;
++    uint32_t cache_slot_stride = 0;
++    uint32_t cache_seq_stride = 0;
++    vk_subbuffer cache_buf = dst_buf; // valid dummy binding in the legacy path
++    if (fused_cache_dst) {
++        GGML_ASSERT(fused_cache_dst->type == GGML_TYPE_F32);
++        use_fused_cache = 1;
++        cache_slot_stride = K > 1 ? (uint32_t)(fused_cache_dst->nb[2] / sizeof(float)) : 0;
++        cache_seq_stride = (uint32_t)(fused_cache_dst->nb[1] / sizeof(float));
++        cache_buf = ggml_vk_tensor_subbuffer(ctx, fused_cache_dst);
++    }
++
+     const vk_op_gated_delta_net_push_constants pc = {
+         H, n_tokens, n_seqs, s_off,
+         sq1, sq2, sq3,
+@@ -13419,11 +13453,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
+         sb1, sb2, sb3,
+         neq1, rq3,
+         scale,
+-        K
++        K,
++        use_fused_cache, cache_slot_stride, cache_seq_stride
+     };
+ 
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
++        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, cache_buf},
+         pc, { H, n_seqs, S_v });
+ }
+ 
+@@ -16024,6 +16059,15 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+             }
+         }
+ 
++        // [TAG_GDN_ZC] le noyau GDN écrit aussi la tranche de cache éliminée : cette écriture
++        // doit être ordonnée contre les lectures/écritures précédentes du même buffer.
++        if (!need_sync && ctx->fused_gdn_cache_dst) {
++            if (overlaps_unsynced(ctx->fused_gdn_cache_dst, ctx->unsynced_nodes_read) ||
++                overlaps_unsynced(ctx->fused_gdn_cache_dst, ctx->unsynced_nodes_written)) {
++                need_sync = true;
++            }
++        }
++
+         if (need_sync) {
+             if (vk_enable_sync_logger) {
+                 std::cerr <<  "sync" << std::endl;
+@@ -16052,6 +16096,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
+             }
+         }
++        // [TAG_GDN_ZC] mémoriser l'écriture du cache pour ordonner les nœuds suivants
++        if (ctx->fused_gdn_cache_dst) {
++            ctx->unsynced_nodes_written.push_back(ctx->fused_gdn_cache_dst);
++        }
+     }
+     if (vk_enable_sync_logger) {
+         for (int i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
+@@ -16431,7 +16479,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         break;
+ 
+     case GGML_OP_GATED_DELTA_NET:
+-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
++        ggml_vk_gated_delta_net(ctx, compute_ctx, node, ctx->fused_gdn_cache_dst);
+ 
+         break;
+ 
+@@ -17806,6 +17854,106 @@ static int32_t find_first_set(uint32_t x) {
+     return ret;
+ }
+ 
++// [TAG_GDN_ZC] Validate the recurrent-cache write-back pattern:
++//   gdn  = GATED_DELTA_NET(...)
++//   src  = VIEW of gdn at the snapshot tail (contiguous)
++//   cpy  = CPY(src, dst) where dst is a VIEW of the recurrent state cache
++// Returns the cache view the GDN kernel must write, or nullptr when the pattern
++// does not match exactly (anything else keeps the plain CPY path).
++static const ggml_tensor * ggml_vk_gdn_cache_dst(
++        const ggml_tensor * gdn, const ggml_tensor * src, const ggml_tensor * cpy) {
++    if (gdn->type != GGML_TYPE_F32) {
++        return nullptr;
++    }
++    if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return nullptr;
++    }
++
++    const ggml_tensor * src_v = gdn->src[2];
++    const int64_t S_v      = src_v->ne[0];
++    const int64_t H        = src_v->ne[1];
++    const int64_t n_tokens = src_v->ne[2];
++    const int64_t n_seqs   = src_v->ne[3];
++    const int64_t D        = S_v * S_v * H;
++    const int64_t K        = ggml_get_op_params_i32(gdn, 0);
++    const int64_t n_written = std::min<int64_t>(n_tokens, K);
++    const size_t tail_off  = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
++
++    // src must be the contiguous snapshot tail of the GDN output
++    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
++        !ggml_is_contiguous(src)) {
++        return nullptr;
++    }
++
++    const ggml_tensor * dst = cpy->src[1];
++    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->buffer == nullptr) {
++        return nullptr;
++    }
++    // [d, seq, slot] layout: the kernel writes slot*nb[2] + seq*nb[1] + head*S_v*S_v
++    if (dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != n_written || dst->ne[3] != 1) {
++        return nullptr;
++    }
++    if (dst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
++        dst->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, D)) {
++        return nullptr;
++    }
++    if (n_written > 1 && dst->nb[2] == 0) {
++        return nullptr; // several slots need a slot stride
++    }
++    return dst;
++}
++
++// [TAG_GDN_ZC] Collect the elidable recurrent-cache CPY nodes of this graph.
++// The scan is dependency based (a CPY whose source views a GDN output), so it does not
++// depend on the node order: the Vulkan backend reorders nodes for parallelism.
++static void ggml_vk_prepare_gdn_cache_fusion(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
++    ctx->gdn_cache_dst.clear();
++    ctx->gdn_cache_skip.clear();
++
++    if (ctx->device->disable_fusion || ctx->device->disable_gdn_cache_fusion) {
++        return;
++    }
++
++    static bool dbg_init = false;
++    static bool dbg = false;
++    if (!dbg_init) {
++        dbg_init = true;
++        dbg = getenv("GGML_VK_DEBUG_GDN_CACHE") != nullptr;
++    }
++
++    std::vector<const ggml_tensor *> candidates;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * n = cgraph->nodes[i];
++        if (n->op != GGML_OP_CPY || !n->src[0] || n->src[0]->op != GGML_OP_VIEW) {
++            continue;
++        }
++        const ggml_tensor * gdn = n->src[0]->view_src;
++        if (!gdn || gdn->op != GGML_OP_GATED_DELTA_NET) {
++            continue;
++        }
++        const ggml_tensor * dst = ggml_vk_gdn_cache_dst(gdn, n->src[0], n);
++        if (!dst) {
++            continue;
++        }
++        candidates.push_back(n);
++        ctx->gdn_cache_dst[gdn] = dst;
++    }
++    if (candidates.empty()) {
++        return;
++    }
++
++    // Consumers of the CPY result are fine: the graph order is dependency based, so any
++    // consumer of the CPY result necessarily runs after the GDN that now writes it.
++    for (auto cpy : candidates) {
++        ctx->gdn_cache_skip.insert(cpy);
++    }
++    if (dbg) {
++        fprintf(stderr, "[GDN_CACHE] %zu cache CPY elided (graph of %d nodes)\n",
++                ctx->gdn_cache_skip.size(), cgraph->n_nodes);
++    }
++}
++
++
+ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+@@ -17946,11 +18094,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         submit_count++;
+     };
+ 
++    // [TAG_GDN_ZC] repérer les CPY de cache récurrent éliminables pour ce graphe
++    ggml_vk_prepare_gdn_cache_fusion(ctx, cgraph);
++
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         if (first_node_in_batch) {
+             submit_node_idx = i;
+         }
+ 
++        // [TAG_GDN_ZC] ce CPY est écrit directement par le noyau GDN : ne pas l'exécuter
++        if (ctx->gdn_cache_skip.count(cgraph->nodes[i])) {
++            continue;
++        }
++
+         {
+             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
+             total_flops += node_flops;
+@@ -17973,10 +18129,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         // the fused result in an elementwise-way. This affects whether the memory for
+         // the src is allowed to overlap the memory for the destination.
+         // The array is sized to handle the largest fusion (asserted later).
+-        bool op_srcs_fused_elementwise[13];
++        bool op_srcs_fused_elementwise[GGML_VK_MAX_FUSED_OPS + 1];
+ 
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
++        ctx->fused_gdn_cache_dst = nullptr;
++        {
++            // [TAG_GDN_ZC] si ce nœud est un GDN dont le CPY de cache est éliminé,
++            // le noyau écrit lui-même la tranche de cache.
++            auto gdn_it = ctx->gdn_cache_dst.find(cgraph->nodes[i]);
++            if (gdn_it != ctx->gdn_cache_dst.end()) {
++                ctx->fused_gdn_cache_dst = gdn_it->second;
++            }
++        }
+         const char *fusion_string {};
+         if (!ctx->device->disable_fusion) {
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+@@ -18195,6 +18360,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_ops_write_mask = 1;
+                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+                 ctx->fused_topk_moe_scale = false;
++                ctx->fused_gdn_cache_dst = nullptr;
+             }
+         }
+ 
+@@ -18238,6 +18404,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         i += ctx->num_additional_fused_ops;
+         ctx->num_additional_fused_ops = 0;
+         ctx->fused_ops_write_mask = 0;
++        ctx->fused_gdn_cache_dst = nullptr;
+     }
+ 
+     ctx->last_total_flops = total_flops;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index 0e384330b9b..1bcbb57bcc2 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -32,6 +32,9 @@ layout(push_constant) uniform Parameters {
+     uint neq1, rq3;
+     float scale;
+     uint K;
++    uint use_fused_cache;
++    uint cache_slot_stride;
++    uint cache_seq_stride;
+ };
+ 
+ layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+@@ -41,6 +44,9 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
+ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
+ layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+ layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
++// Binding 7 is the CPY destination recognized by the backend graph fusion.
++// It aliases DstBuf in the legacy path and is never written there.
++layout(binding = 7)           buffer CacheBuf { FLOAT_TYPE data_cache[]; };
+ 
+ #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
+ shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+@@ -173,17 +179,32 @@ void main() {
+         if (K > 1u) {
+             const int target_slot = int(n_tokens) - 1 - int(t);
+             if (target_slot >= 0 && target_slot < int(K)) {
+-                const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
+-                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+-                    data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++                if (use_fused_cache == 1u) {
++                    const uint cache_base = uint(target_slot) * cache_slot_stride
++                                          + seq_id * cache_seq_stride + head_id * state_size;
++                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                        data_cache[cache_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++                    }
++                } else {
++                    const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
++                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                        data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++                    }
+                 }
+             }
+         }
+     }
+ 
+     if (K == 1u) {
+-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+-            data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++        if (use_fused_cache == 1u) {
++            const uint cache_base = seq_id * cache_seq_stride + head_id * state_size;
++            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                data_cache[cache_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++            }
++        } else {
++            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
++                data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
++            }
+         }
+     }
+ }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 2809d8dcda6..dcf1990fb4d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4395,16 +4395,27 @@ struct test_gated_delta_net : public test_case {
+     const bool    permuted;
+     const bool    kda;
+     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
++    const bool    cache_fusion;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
++        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, cache_fusion);
+     }
+ 
++    // The graph output of a cache-fusion case is the CPY result, so the default op name
++    // would hide these cases. Expose them under a dedicated op name.
++    std::string op_desc(ggml_tensor * t) override {
++        return cache_fusion ? "GATED_DELTA_NET_ZC" : ggml_op_desc(t);
++    }
++
++    // The cache-fusion pattern only exists when GDN and CPY are computed in the same
++    // graph, so these cases must not be split into one-node sub-graphs.
++    bool run_whole_graph() override { return cache_fusion; }
++
+     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
+             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
++            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool cache_fusion = false)
+         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
++          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), cache_fusion(cache_fusion) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * q;
+@@ -4433,8 +4444,36 @@ struct test_gated_delta_net : public test_case {
+         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+         q = ggml_l2_norm(ctx, q, 1e-6f);
+         k = ggml_l2_norm(ctx, k, 1e-6f);
+-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+-        return out;
++        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
++        if (!cache_fusion) {
++            return out;
++        }
++
++        (void)out;
++
++        // Reproduce llama-memory's original GDN -> snapshot-tail VIEW -> CPY graph.
++        // CPU executes the CPY; Vulkan should write this destination in GDN and elide it.
++        const int64_t D = head_size * head_size * head_count * v_repeat;
++        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
++        const int64_t mem_size = n_seqs + 2;
++        const int64_t kv_head = 1;
++        const int64_t attn_score_elems = head_size * head_count * v_repeat * n_seq_tokens * n_seqs;
++        const int64_t state_size_per_snap = D * n_seqs;
++
++        ggml_tensor * src = ggml_view_3d(ctx, out, D, n_seqs, n_written,
++                ggml_row_size(type, D),
++                ggml_row_size(type, state_size_per_snap),
++                ggml_row_size(type, attn_score_elems));
++        ggml_tensor * ring = ggml_new_tensor_2d(ctx, type, D, mem_size * n_written);
++        ggml_tensor * dst = ggml_view_3d(ctx, ring, D, n_seqs, n_written,
++                ring->nb[1], mem_size * ring->nb[1], kv_head * ring->nb[1]);
++        ggml_tensor * copied = ggml_cpy(ctx, src, dst);
++
++        // Keep CPY as an internal node (matching production) while exposing its result:
++        // ggml_cont materialises the written cache slice into a fresh contiguous tensor.
++        // A backend may elide the CPY by writing "dst" straight from the GDN kernel;
++        // the exposed result must be identical either way.
++        return ggml_cont(ctx, copied);
+     }
+ 
+     void initialize_tensors(ggml_context * ctx) override {
+@@ -10110,6 +10149,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ 
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
++    // GATED_DELTA_NET_ZC: the same op followed by the recurrent-cache CPY that a backend
++    // is allowed to elide by writing the cache directly from the GDN kernel.
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 1, true)); // K=1   TG
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16,  64, 1, 2, 1, false, false, 1, true)); // K=1   TG n_seqs=2
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 4, true)); // K=4   TG (keep path)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 4, 1, 1, false, false, 4, true)); // K=4   PP-4
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 8, 2, 1, false, false, 4, true)); // K=4   PP-8 n_seqs=2
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8,  32, 4, 2, 2, false, true,  4, true)); // KDA + v_repeat, K=4
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
+@@ -10553,6 +10600,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
++    // GATED_DELTA_NET_ZC: same op followed by the recurrent-cache CPY that Vulkan may elide
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 1, true)); // K=1 TG
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16,  64, 1, 2, 1, false, false, 1, true)); // K=1 TG, n_seqs=2
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 4, true)); // K=4 TG (keep path)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 4, 1, 1, false, false, 4, true)); // K=4 PP-4
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4,  64, 8, 2, 1, false, false, 4, true)); // K=4 PP-8, n_seqs=2
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8,  32, 4, 2, 2, false, true,  4, true)); // KDA + v_repeat
+ 
+     // lightning_indexer
+     for (int kv : { 256, 4096, 65536 }) {
+-- 
+2.53.0
+

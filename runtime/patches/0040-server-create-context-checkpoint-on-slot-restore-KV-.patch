@@ -1,0 +1,53 @@
+From 022e0ef9b31a1f0ea34ae5998e29d46d9fd7aeb2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Wed, 9 Sep 2026 16:11:55 +0200
+Subject: [PATCH 40/54] server: create context checkpoint on slot restore (KV
+ cache reuse for hybrid/recurrent memory)
+
+Without a checkpoint, the launch path forces a full prompt re-processing after
+restore (n_past = 0) for hybrid/recurrent memory (see PR #13194). The restore
+now registers a checkpoint with pos_min = 0, pos_max = state pos_max, which
+matches the pos_min == 0 escape clause, enabling full cache reuse when the
+next request's prefix equals the restored tokens (the session-resume case).
+
+Validated: 51003-token restore + 8-token suffix request -> cache_n = 51003,
+prompt_ms 1185 vs 148245 before (125x). Partial-LCP requests fall back safely
+to full re-processing.
+---
+ tools/server/server-context.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c89d41a5ed8..15e0f2294fc 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2552,6 +2552,26 @@ private:
+ 
+                         slot->prompt.clear();
+                         slot->prompt.tokens = std::move(restored);
++
++                        // [KV-RESTORE-FIX] create a context checkpoint from the restored state.
++                        // For hybrid/recurrent memory, the launch path requires a checkpoint with
++                        // pos_min < pos_min_thold (or == 0) in order to resume at n_past. Without it,
++                        // the server forces a full prompt re-processing after restore (cache_n = 0),
++                        // see PR #13194. The restored state covers the whole token range, so we
++                        // register pos_min = 0, which also matches the "cur.pos_min == 0" escape.
++                        {
++                            const llama_pos pos_max_ckpt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
++
++                            auto & ckpt = slot->prompt.checkpoints.emplace_back();
++
++                            ckpt.update_pos((int64_t) slot->prompt.n_tokens(), 0, pos_max_ckpt);
++                            ckpt.update_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                            ckpt.update_dft(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++
++                            if (spec) {
++                                common_speculative_get_state(spec.get(), slot->id, ckpt.data_spec);
++                            }
++                        }
+                     } catch (const std::exception & err) {
+                         slot->prompt_clear();
+                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+-- 
+2.53.0
+

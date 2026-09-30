@@ -1,0 +1,109 @@
+From d28930dc43e086697b31623f29d89354ead67116 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?=
+ <kevin.remondiere@gmail.com>
+Date: Wed, 30 Sep 2026 21:47:03 +0200
+Subject: [PATCH 53/54] qwen4exp: hyper-connection injection scale 2*sigmoid
+ (verified against reference logits: KLD 0.478 -> 0.116)
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 19 ++++++-------------
+ .../vulkan-shaders/hc_combine.comp            |  5 ++---
+ src/models/qwen4exp.cpp                       |  5 ++++-
+ 3 files changed, 12 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a369f446cfe..ba3f0e95047 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -20014,11 +20014,7 @@ static bool ggml_vk_match_hc_combine(ggml_backend_vk_context * ctx, const ggml_c
+     if (!s1 || s1->op != GGML_OP_SCALE || s1->type != GGML_TYPE_F32) {
+         return false;
+     }
+-    const ggml_tensor * s2 = s1->src[0];
+-    if (!s2 || s2->op != GGML_OP_SCALE || s2->type != GGML_TYPE_F32) {
+-        return false;
+-    }
+-    const ggml_tensor * sig = s2->src[0];
++    const ggml_tensor * sig = s1->src[0];
+     if (!sig || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->type != GGML_TYPE_F32) {
+         return false;
+     }
+@@ -20028,11 +20024,10 @@ static bool ggml_vk_match_hc_combine(ggml_backend_vk_context * ctx, const ggml_c
+     if (sig_out->ne[0] != hc || sig_out->ne[1] != nt) {
+         return false;
+     }
+-    // les deux scale portent EXACTEMENT le facteur 2.0f (op_params), le kernel fait 2*(2*sig)
+-    float f1, f2;
++    // [FACTEUR2-HC] la scale porte EXACTEMENT 2.0f (op_params), le kernel fait 2*sig
++    float f1;
+     memcpy(&f1, s1->op_params, sizeof(float));
+-    memcpy(&f2, s2->op_params, sizeof(float));
+-    if (f1 != 2.0f || f2 != 2.0f) {
++    if (f1 != 2.0f) {
+         return false;
+     }
+     // intermédiaires à usage unique (par pointeur d'index dans le graphe)
+@@ -20040,7 +20035,7 @@ static bool ggml_vk_match_hc_combine(ggml_backend_vk_context * ctx, const ggml_c
+         auto it = idx_of.find(t);
+         return it != idx_of.end() && ggml_node_get_use_count(cgraph, it->second) == 1;
+     };
+-    if (!uses1(mul) || !uses1(rep) || !uses1(s1) || !uses1(s2) || !uses1(sig)) {
++    if (!uses1(mul) || !uses1(rep) || !uses1(s1) || !uses1(sig)) {
+         return false;
+     }
+     // alignment (comme multi_add : aucun misalign toléré)
+@@ -20101,14 +20096,12 @@ static void ggml_vk_prepare_hc_combine_fusion(ggml_backend_vk_context * ctx, ggm
+         const ggml_tensor * rep = mul->src[0];
+         const ggml_tensor * w_r = mul->src[1];
+         const ggml_tensor * s1 = w_r->src[0];
+-        const ggml_tensor * s2 = s1->src[0];
+-        const ggml_tensor * sig = s2->src[0];
++        const ggml_tensor * sig = s1->src[0];
+         // SIGMOID VOLONTAIREMENT NON élidé : il reste un nœud unary standard
+         // (le kernel lit son résultat — recomputer l'exp in-kernel a produit des
+         // ULP différents et cassé l'identité byte-à-byte, test S2 du 05/09).
+         ctx->hc_combine_fused[add] = entry;
+         ctx->hc_combine_skip.insert(s1);
+-        ctx->hc_combine_skip.insert(s2);
+         ctx->hc_combine_skip.insert(rep);
+         ctx->hc_combine_skip.insert(mul);
+         ++fused_n;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/hc_combine.comp b/ggml/src/ggml-vulkan/vulkan-shaders/hc_combine.comp
+index a98bc887bd7..77c93646093 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/hc_combine.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/hc_combine.comp
+@@ -48,13 +48,12 @@ void main() {
+ 
+     const float s = data_c[j*p.s_j + k*p.s_k];
+ 
+-    precise float w0 = s * 2.0f;  // SCALE(2.0): exact (power of two)
+-    precise float w1 = w0 * 2.0f; // SCALE(2.0): exact (power of two)
++    precise float w0 = s * 2.0f;  // SCALE(2.0): exact (power of two)  [FACTEUR2-HC]
+ 
+     [[unroll]] for (uint l = 0; l < 4; ++l) {
+         precise float r = data_a[rbase + l];
+         precise float b = data_b[bbase + l];
+-        precise float m = b * w1; // no FMA contraction: mul is one rounded step
++        precise float m = b * w0; // no FMA contraction: mul is one rounded step
+         precise float o = r + m; // add is the next rounded step, as in the original chain
+         data_d[dbase + l] = o;
+     }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 50a2d490206..4eb235e61ca 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -476,7 +476,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     const bool folded = hparams.dsv4_hc_scale_fold;
+     ggml_tensor * w = folded ? ggml_sigmoid(ctx0, inject)
+                               : ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+-    w = ggml_scale(ctx0, w, 2.0f);
++    // [FACTEUR2-HC] UNE SEULE SCALE(2.0f) == convention amont (upstream/master 6c84c7d5d)
++    // == 2*sigmoid(inject/hc). Le fork en portait DEUX (le noyau faisait 2*(2*sigmoid)),
++    // soit 4*sigmoid(inject/hc) : facteur 2 systematique sur l'injection hyper-connexion
++    // des 48 couches, invisible aux SHA gloutons (regle 19).
+     w = ggml_scale(ctx0, w, 2.0f);
+     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+ 
+-- 
+2.53.0
+

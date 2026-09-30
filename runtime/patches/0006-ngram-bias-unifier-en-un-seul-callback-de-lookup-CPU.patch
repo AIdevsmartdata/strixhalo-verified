@@ -1,0 +1,206 @@
+From 4d96ce890ee829d186ade513c7dfa953929704f6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
+Date: Sat, 29 Aug 2026 13:42:34 +0200
+Subject: [PATCH 06/54] ngram-bias: unifier en un seul callback de lookup (CPU
+ + backend)
+
+Supprime le callback CPU redondant (ngram_bias_cb) et
+common_ngram_cache_bias_logits (morte): le sampler ngram-bias n'a plus
+qu'un seul callback llama_sampler_ngram_bias_lookup_callback (buffers C
+int32_t*/float*) utilise a la fois par backend_set_input (GPU) et par le
+fallback CPU apply qui fait le lookup puis applique lui-meme.
+
+Meme comportement backend (30.45 t/s conserve), code plus propre.
+---
+ common/ngram-cache.cpp | 22 ----------------------
+ common/ngram-cache.h   |  9 ---------
+ common/sampling.cpp    |  8 +-------
+ include/llama.h        | 15 +++++----------
+ src/llama-sampler.cpp  | 30 +++++++++++++++++++++++-------
+ 5 files changed, 29 insertions(+), 55 deletions(-)
+
+diff --git a/common/ngram-cache.cpp b/common/ngram-cache.cpp
+index 6987806b75e..726982e60ed 100644
+--- a/common/ngram-cache.cpp
++++ b/common/ngram-cache.cpp
+@@ -318,25 +318,3 @@ size_t common_ngram_cache_lookup_bias(
+     }
+     return 0;
+ }
+-
+-void common_ngram_cache_bias_logits(
+-    common_ngram_cache & cache, const llama_token * tokens, int n_tokens,
+-    int ngram_min, int ngram_max, float alpha, llama_token_data * data, size_t n_data) {
+-    std::vector<std::pair<llama_token, float>> pairs;
+-    common_ngram_cache_lookup_bias(cache, tokens, n_tokens, ngram_min, ngram_max, alpha, pairs);
+-    for (const auto & kv : pairs) {
+-        const llama_token token = kv.first;
+-        const float bias = kv.second;
+-        // chemin rapide : les donnees sont en ordre de vocabulaire (idx == id)
+-        if (token >= 0 && n_data > (size_t) token && data[token].id == token) {
+-            data[token].logit += bias;
+-        } else {
+-            for (size_t i = 0; i < n_data; ++i) {
+-                if (data[i].id == token) {
+-                    data[i].logit += bias;
+-                    break;
+-                }
+-            }
+-        }
+-    }
+-}
+diff --git a/common/ngram-cache.h b/common/ngram-cache.h
+index 7e5fef6b68c..d8c5c4beb1f 100644
+--- a/common/ngram-cache.h
++++ b/common/ngram-cache.h
+@@ -106,15 +106,6 @@ size_t common_ngram_cache_lookup_bias(
+     int ngram_min, int ngram_max, float alpha,
+     std::vector<std::pair<llama_token, float>> & out);
+ 
+-// Bias logits toward the empirical next-token distribution of the matching n-gram.
+-// Steering (not speculation): adds alpha * ln(p) to the logits of the predicted tokens.
+-// tokens: the recent token history (last n_tokens tokens, oldest first).
+-// data:   the candidate token array (id + logit), modified in place.
+-// Uses stupid backoff: the longest matching n-gram wins.
+-void common_ngram_cache_bias_logits(
+-    common_ngram_cache & cache, const llama_token * tokens, int n_tokens,
+-    int ngram_min, int ngram_max, float alpha, llama_token_data * data, size_t n_data);
+-
+ // Load an ngram cache saved with common_ngram_cache_save.
+ // filename: the path from which to load the ngram cache.
+ // returns:  an ngram cache containing the information saved to filename.
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 90a0c874e09..fe2304dac21 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -191,12 +191,6 @@ std::string common_params_sampling::print() const {
+     return std::string(result);
+ }
+ 
+-static void ngram_bias_cb(void * ctx, float alpha, const llama_token * tokens, int n_tokens,
+-                          int ngram_min, int ngram_max, llama_token_data * data, size_t n_data) {
+-    common_ngram_cache_bias_logits(*(common_ngram_cache *) ctx, tokens, n_tokens,
+-                                   ngram_min, ngram_max, alpha, data, n_data);
+-}
+-
+ static int ngram_bias_lookup_cb(void * ctx, float alpha, const llama_token * tokens, int n_tokens,
+                                 int ngram_min, int ngram_max, int32_t * out_tokens, float * out_biases, int max_n) {
+     std::vector<std::pair<llama_token, float>> pairs;
+@@ -367,7 +361,7 @@ struct common_sampler * common_sampler_init(
+         // loaded once, reused across slots (MVP: no hot reload of the steering table)
+         static common_ngram_cache ngram_bias_cache = common_ngram_cache_load(params.ngram_bias_cache);
+         samplers.push_back(llama_sampler_init_ngram_bias(
+-            (void *) &ngram_bias_cache, ngram_bias_cb, ngram_bias_lookup_cb, params.ngram_bias_alpha, 2, 4, 8));
++            (void *) &ngram_bias_cache, ngram_bias_lookup_cb, params.ngram_bias_alpha, 2, 4, 8));
+     }
+ 
+     if (params.mirostat == 0) {
+diff --git a/include/llama.h b/include/llama.h
+index 94a81a85876..d683c98c437 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1528,22 +1528,17 @@ extern "C" {
+               const llama_logit_bias * logit_bias);
+ 
+     // n-gram logit steering sampler (bias_logits, never loses speed).
+-    // The callback performs the n-gram lookup and logit biasing; it lives in common/,
+-    // which owns the n-gram cache. ctx is an opaque pointer to that cache.
+-    typedef void (*llama_sampler_ngram_bias_callback)(
+-        void * ctx, float alpha, const llama_token * tokens, int n_tokens,
+-        int ngram_min, int ngram_max, llama_token_data * data, size_t n_data);
+-
+-    // Backend (GPU) variant: fills out_tokens/out_biases with up to max_n (token, bias)
+-    // pairs from the stupid-backoff lookup. Returns the number of pairs written.
+-    // The sampler pads the remainder with (token=0, bias=0) which is a no-op scatter.
++    // Single lookup callback: fills out_tokens/out_biases with up to max_n (token, bias)
++    // pairs from the stupid-backoff lookup; returns the number of pairs written.
++    // The sampler pads the remainder with (token=0, bias=0), a no-op scatter.
++    // Used both for the GPU backend (set_input) and the CPU fallback (apply).
++    // The callback lives in common/, which owns the n-gram cache; ctx is opaque.
+     typedef int (*llama_sampler_ngram_bias_lookup_callback)(
+         void * ctx, float alpha, const llama_token * tokens, int n_tokens,
+         int ngram_min, int ngram_max, int32_t * out_tokens, float * out_biases, int max_n);
+ 
+     LLAMA_API struct llama_sampler * llama_sampler_init_ngram_bias(
+         void * ctx,
+-        llama_sampler_ngram_bias_callback callback,
+         llama_sampler_ngram_bias_lookup_callback lookup_callback,
+         float   alpha,
+         int32_t ngram_min,
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index f8520c9dd79..d241735a8e1 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -4067,7 +4067,6 @@ struct llama_sampler * llama_sampler_init_logit_bias(
+ 
+ struct llama_sampler_ngram_bias : public llama_sampler_backend {
+     void * cache;
+-    llama_sampler_ngram_bias_callback callback;
+     llama_sampler_ngram_bias_lookup_callback lookup_callback;
+     float alpha;
+     int ngram_min;
+@@ -4100,14 +4099,33 @@ static void llama_sampler_ngram_bias_accept(struct llama_sampler * smpl, llama_t
+ 
+ static void llama_sampler_ngram_bias_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+     auto * ctx = (llama_sampler_ngram_bias *) smpl->ctx;
+-    if (ctx->callback == nullptr || ctx->alpha <= 0.0f) {
++    if (ctx->lookup_callback == nullptr || ctx->alpha <= 0.0f) {
+         return;
+     }
+     if ((int) ctx->recent.size() < ctx->ngram_min) {
+         return;
+     }
+-    ctx->callback(ctx->cache, ctx->alpha, ctx->recent.data(), (int) ctx->recent.size(),
+-                  ctx->ngram_min, ctx->ngram_max, cur_p->data, cur_p->size);
++    ctx->pairs_tokens.assign(LLAMA_NGRAM_BIAS_MAX_PAIRS, 0);
++    ctx->pairs_biases.assign(LLAMA_NGRAM_BIAS_MAX_PAIRS, 0.0f);
++    const int n = ctx->lookup_callback(ctx->cache, ctx->alpha, ctx->recent.data(),
++                                       (int) ctx->recent.size(), ctx->ngram_min, ctx->ngram_max,
++                                       ctx->pairs_tokens.data(), ctx->pairs_biases.data(),
++                                       LLAMA_NGRAM_BIAS_MAX_PAIRS);
++    for (int i = 0; i < n; ++i) {
++        const llama_token token = ctx->pairs_tokens[i];
++        const float bias = ctx->pairs_biases[i];
++        // chemin rapide : les donnees sont en ordre de vocabulaire (idx == id)
++        if (token >= 0 && cur_p->size > (size_t) token && cur_p->data[token].id == token) {
++            cur_p->data[token].logit += bias;
++        } else {
++            for (size_t j = 0; j < cur_p->size; ++j) {
++                if (cur_p->data[j].id == token) {
++                    cur_p->data[j].logit += bias;
++                    break;
++                }
++            }
++        }
++    }
+ }
+ 
+ static bool llama_sampler_ngram_bias_backend_init(
+@@ -4189,7 +4207,7 @@ static void llama_sampler_ngram_bias_reset(struct llama_sampler * smpl) {
+ 
+ static struct llama_sampler * llama_sampler_ngram_bias_clone(const struct llama_sampler * smpl) {
+     const auto * ctx = (const llama_sampler_ngram_bias *) smpl->ctx;
+-    return llama_sampler_init_ngram_bias(ctx->cache, ctx->callback, ctx->lookup_callback, ctx->alpha,
++    return llama_sampler_init_ngram_bias(ctx->cache, ctx->lookup_callback, ctx->alpha,
+                                          ctx->ngram_min, ctx->ngram_max, ctx->n_last);
+ }
+ 
+@@ -4214,7 +4232,6 @@ static struct llama_sampler_i llama_sampler_ngram_bias_i = {
+ 
+ struct llama_sampler * llama_sampler_init_ngram_bias(
+         void * ctx,
+-        llama_sampler_ngram_bias_callback callback,
+         llama_sampler_ngram_bias_lookup_callback lookup_callback,
+         float   alpha,
+         int32_t ngram_min,
+@@ -4225,7 +4242,6 @@ struct llama_sampler * llama_sampler_init_ngram_bias(
+         /* .ctx   = */ new llama_sampler_ngram_bias {
+             ("ngram-bias"),
+             /* .cache           = */ ctx,
+-            /* .callback        = */ callback,
+             /* .lookup_callback = */ lookup_callback,
+             /* .alpha           = */ alpha,
+             /* .ngram_min       = */ ngram_min,
+-- 
+2.53.0
+
