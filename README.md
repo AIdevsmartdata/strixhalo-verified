@@ -10,16 +10,16 @@ First model: **Qwen3.8-Flash-Next** (125B MoE). Model card with every measuremen
 
 | | |
 |---|---|
-| 🏎️ writing (decode), 8k / 32k | 42.9 / 39.5 tok/s (~41 at 64k on short answers) |
-| 📖 reading (prefill), 8k / 32k / 64k | 649 / 582 / 483 tok/s |
-| 🛠️ inside a tool call | 48–55 tok/s (was 25) |
-| ⏱️ first token after a short tool result | 0.6 s (was 1.5 s) |
+| 🏎️ writing (decode), 8k / 32k | 43.0 / 40.1 tok/s (~41 at 64k on short answers) |
+| 📖 reading (prefill), 8k / 32k / 64k | 656 / 585 / 483 tok/s |
+| 🛠️ inside a tool call | ~55 tok/s (was 25) |
+| ⏱️ first token after a short tool result | 0.7 s (was 1.5 s) |
 | 🤖 agent loop, 12 shell commands | 15.3 tokens per wall-clock second (was 11.1) |
 | 🎯 KL divergence vs full-precision reference | 0.116, same top-1 token 92.2 % (747-token code passage; 0.43 on a 4k passage) |
 
-Measured with our production launcher; the public launcher here leaves out a private n-gram steering table, a GPU clock
-floor and a server-side reasoning-effort default (details on the model card, where the public-launcher numbers will be
-posted). A from-scratch build of this repository reproduces the production outputs bit for bit.
+✅ Measured with `launch/qwen38-flash-next.sh` unchanged, on a from-scratch build of this repository (GPU clock on its
+default setting): same greedy outputs, same KL divergence to the 6th digit and same agent-loop speed as our production
+runtime. The 64k figures come from our production runs.
 
 ![Agent loop before and after](assets/agent_loop.png)
 
