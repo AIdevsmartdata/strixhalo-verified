@@ -6,6 +6,8 @@
 #   MTP=/path/Qwen3.8-Flash-Next-MTP-ROCmFP4-FAST.gguf \
 #   RUNTIME=/path/to/llama.cpp-strixhalo/build/bin \
 #   ./qwen38-flash-next.sh [--host 0.0.0.0 --port 8081 ...]      (extra arguments override the defaults below)
+# Host prompt cache capped at 6 GiB (--cache-ram 6144). Unlimited (-1) let the server keep every evicted conversation in
+# host RAM: with a 138k-token agent context it reached 25 GB on top of the model and the kernel OOM killer took the box down.
 # Derived from the measured production launcher: same kernels and flags, minus a private n-gram steering table, the GPU
 # clock floor (power_dpm_force_performance_level=high) and a server-side reasoning-effort default, plus --min-p 0.0.
 set -eu
@@ -57,7 +59,7 @@ exec "$RUNTIME/llama-server" \
   -t 24 \
   -b 16384 \
   -ub 2048 \
-  --cache-ram -1 \
+  --cache-ram 6144 \
   --slots \
   --cache-type-k f16 \
   --cache-type-v f16 \

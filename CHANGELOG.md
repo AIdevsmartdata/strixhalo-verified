@@ -75,6 +75,12 @@ extra fusions, tracing). `launch/qwen38-flash-next.sh` is derived from the measu
 flags, minus a private n-gram steering table, the GPU clock floor and the server-side reasoning-effort default, plus
 `--min-p 0.0`.
 
+## 🧯 Fixed in the launcher on 1 October
+
+| issue | impact | fix |
+|---|---|---|
+| `--cache-ram -1` (unlimited host prompt cache) | each conversation the single slot evicts is copied to host RAM; at a 138k-token agent context the server reached 25 GB of host memory on top of the ~100 GB model, and the kernel OOM killer killed the server and the desktop session | `--cache-ram 6144` |
+
 ## 🔍 Found by our own code review, fixed on 01/10
 
 | issue | impact | fix |
