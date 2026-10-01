@@ -1,7 +1,7 @@
 From 1b38a26bde84624fbe1dc3040275f981d08bd02a Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 9 Sep 2026 14:58:31 +0200
-Subject: [PATCH 38/54] vulkan: dmmv SPLITK wide-WG variant for AMD matvecs
+Subject: [PATCH 38/57] vulkan: dmmv SPLITK wide-WG variant for AMD matvecs
  (OFF by default)
 
 New DMMV_WG_SIZE_SPLITK workgroup variant (width = subgroup x factor,

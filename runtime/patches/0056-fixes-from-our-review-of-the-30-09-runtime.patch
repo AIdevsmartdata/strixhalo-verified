@@ -1,0 +1,122 @@
+From 34a2ce086efe2240970f328e380bcc112976541b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?=
+ <kevin.remondiere@gmail.com>
+Date: Wed, 30 Sep 2026 23:23:28 +0200
+Subject: [PATCH 56/57] fixes from our review of the 30/09 runtime
+
+- recurrent state: clear a new sequence's row on the host only for host and Vulkan buffers; other device buffers
+  (OpenCL, Hexagon) do not implement memset_tensor and keep the in-graph clear
+- server: also erase a context checkpoint whose state covers the first token that differs from the new prompt
+  (with two checkpoints one token apart, the checkpoint-reuse path could keep a stale one)
+- Vulkan readback: MFENCE before the streaming loads, as Mesa does; no streaming path on Windows
+- speculative: a per-request n_max below the launch n_min clamps n_min instead of discarding every draft
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WdTYzTHTL3CWzrp46giMJC
+---
+ common/speculative.cpp               |  4 +++-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp |  5 ++++-
+ src/llama-memory-recurrent.cpp       | 16 +++++++++++++++-
+ tools/server/server-context.cpp      |  8 ++++++--
+ 4 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index b4b1ab5c309..0d847f5ea33 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -243,8 +243,10 @@ struct common_speculative_impl {
+             eff.p_min = dp.p_min;
+         }
+         if (dp.n_min >= 0) {
+-            eff.n_min = std::min(dp.n_min, eff.n_max);
++            eff.n_min = dp.n_min;
+         }
++        // a request n_max below the launch n_min would otherwise discard every draft
++        eff.n_min = std::min(eff.n_min, eff.n_max);
+         dp.p_min_used = eff.p_min;
+         dp.n_max_used = eff.n_max;
+         dp.n_min_used = eff.n_min;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index b32e9321b73..0c18fdabb16 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -9757,7 +9757,7 @@ static size_t ggml_vk_align_size(size_t width, size_t align) {
+ // write-combined: a plain memcpy reads it at ~0.4 GB/s, MOVNTDQA streaming loads at 4-13 GB/s (RADV, Strix Halo).
+ // On a cached mapping a streaming load is an ordinary load, so every bulk read from device memory goes through here.
+ // GGML_VK_STREAM_READ=0 restores memcpy.
+-#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
++#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__)) && !defined(_WIN32)
+ #define GGML_VK_HAVE_STREAM_READ 1
+ __attribute__((target("avx512f")))
+ static void ggml_vk_stream_read_avx512(uint8_t * dst, const uint8_t * src, size_t n_blocks) {
+@@ -9804,6 +9804,9 @@ static void ggml_vk_memcpy_from_device(void * dst, const void * src, size_t size
+     }();
+ 
+     if (isa != 0 && size >= 1024) {
++        // order the streaming loads after everything before them, as Mesa does (the fence wait is not a fence)
++        _mm_mfence();
++
+         const uint8_t * s = (const uint8_t *) src;
+         uint8_t * d = (uint8_t *) dst;
+ 
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 1c9395f4604..169b90c3192 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -1250,10 +1250,24 @@ bool llama_memory_recurrent_context::next() {
+     return true;
+ }
+ 
++// can the row be cleared from the host? The graph-order problem this works around was seen with the Vulkan graph
++// optimizer; other device buffers may not implement memset_tensor (OpenCL, Hexagon) and keep the in-graph clear only.
++static bool rs_can_clear_on_host(const ggml_tensor * t) {
++    ggml_backend_buffer_t buf = t->buffer;
++    if (buf == nullptr) {
++        return false;
++    }
++    if (ggml_backend_buffer_is_host(buf)) {
++        return true;
++    }
++    const char * name = ggml_backend_buft_name(ggml_backend_buffer_get_type(buf));
++    return name != nullptr && strncmp(name, "Vulkan", 6) == 0;
++}
++
+ // clear one state row on the host
+ static void rs_clear_row(const std::vector<ggml_tensor *> & tensors, int32_t row) {
+     for (ggml_tensor * t : tensors) {
+-        if (t != nullptr) {
++        if (t != nullptr && rs_can_clear_on_host(t)) {
+             ggml_backend_tensor_memset(t, 0, (size_t) row * t->nb[1], t->nb[1]);
+         }
+     }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index ae2cefc9dd1..8aa5a45b7a7 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3259,6 +3259,10 @@ private:
+ 
+                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+ 
++                            // position of the first token that differs from the cached prompt: a checkpoint whose state
++                            // covers it is stale, even if a restore below moves pos_next back
++                            const llama_pos pos_next_match = pos_next;
++
+                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
+                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
+ 
+@@ -3355,10 +3359,10 @@ private:
+                             }
+ 
+                             {
+-                                // erase any checkpoints with pos_max > pos_next
++                                // erase any checkpoints with pos_max > pos_next, and any that cover the first differing token
+                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                     const auto & cur = *it;
+-                                    if (cur.pos_max > pos_next) {
++                                    if (cur.pos_max > pos_next || cur.pos_max >= pos_next_match) {
+                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                         it = slot.prompt.checkpoints.erase(it);
+                                     } else {
+-- 
+2.53.0
+

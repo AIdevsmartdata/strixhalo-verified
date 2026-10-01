@@ -2,7 +2,7 @@ From 41150455ac74b7566b5a1025a0c46ef92b691b71 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?=
  <kevin.remondiere@gmail.com>
 Date: Wed, 30 Sep 2026 21:48:01 +0200
-Subject: [PATCH 54/54] strixhalo-verified: production runtime of 30/09/2026
+Subject: [PATCH 54/57] strixhalo-verified: production runtime of 30/09/2026
  (agent loop speed + state correctness)
 
 - recurrent state: per-slot rollback planes (upstream #28123) and host-side zeroing of the

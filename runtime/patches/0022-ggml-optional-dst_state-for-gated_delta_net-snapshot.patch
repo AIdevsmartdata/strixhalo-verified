@@ -1,7 +1,7 @@
 From 2d096a62c92d5499ea8b7b98dc0adf128dcb1946 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 4 Sep 2026 07:26:03 +0200
-Subject: [PATCH 22/54] ggml: optional dst_state for gated_delta_net snapshots
+Subject: [PATCH 22/57] ggml: optional dst_state for gated_delta_net snapshots
  ([TAG_GDN_ZC] stage A)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

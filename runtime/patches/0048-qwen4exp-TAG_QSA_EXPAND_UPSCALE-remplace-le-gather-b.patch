@@ -1,7 +1,7 @@
 From 40129aa8e66e57a4936dc0a25158a0c82d755783 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 19 Sep 2026 12:23:47 +0200
-Subject: [PATCH 48/54] qwen4exp: TAG_QSA_EXPAND_UPSCALE - remplace le gather
+Subject: [PATCH 48/57] qwen4exp: TAG_QSA_EXPAND_UPSCALE - remplace le gather
  bloc->cellule par un upscale NEAREST (valeurs identiques)
 
 ---

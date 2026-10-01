@@ -1,7 +1,7 @@
 From f85689c7f45c33363b4a31651d6b06b637ba8f0e Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 29 Aug 2026 10:58:46 +0200
-Subject: [PATCH 02/54] vulkan: opt-in coalesced loads + tunable MMVQ rows for
+Subject: [PATCH 02/57] vulkan: opt-in coalesced loads + tunable MMVQ rows for
  ROCmFP4
 
 Both behind env vars (off by default), correctness 2440/2440.

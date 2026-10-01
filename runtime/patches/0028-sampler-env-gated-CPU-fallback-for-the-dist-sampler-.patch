@@ -1,7 +1,7 @@
 From ddbefbdee22e871ef34e84398a297886ffab1223 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 4 Sep 2026 21:23:58 +0200
-Subject: [PATCH 28/54] sampler: env-gated CPU fallback for the dist sampler
+Subject: [PATCH 28/57] sampler: env-gated CPU fallback for the dist sampler
  ([TAG_SAMPLER_CPU_AUDIT])
 
 The backend dist sampler ends with a GET_ROWS (dist_sampled_token) that

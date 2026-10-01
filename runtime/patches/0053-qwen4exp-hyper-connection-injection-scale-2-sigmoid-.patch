@@ -2,7 +2,7 @@ From d28930dc43e086697b31623f29d89354ead67116 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?=
  <kevin.remondiere@gmail.com>
 Date: Wed, 30 Sep 2026 21:47:03 +0200
-Subject: [PATCH 53/54] qwen4exp: hyper-connection injection scale 2*sigmoid
+Subject: [PATCH 53/57] qwen4exp: hyper-connection injection scale 2*sigmoid
  (verified against reference logits: KLD 0.478 -> 0.116)
 
 ---

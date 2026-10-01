@@ -1,7 +1,7 @@
 From b047d19f511f204611e2c04764fc043d7e3c50e6 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sun, 30 Aug 2026 07:55:32 +0200
-Subject: [PATCH 08/54] =?UTF-8?q?server:=20toggle=20MTP=20s=C3=A9lectif=20?=
+Subject: [PATCH 08/57] =?UTF-8?q?server:=20toggle=20MTP=20s=C3=A9lectif=20?=
  =?UTF-8?q?sur=20temp<=3D0.01=20(code)=20+=20force=20backend-sampling=20of?=
  =?UTF-8?q?f?=
 MIME-Version: 1.0

@@ -1,7 +1,7 @@
 From ddb27b04343e729a927cd65d30afd12f30bf4773 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 4 Sep 2026 07:26:03 +0200
-Subject: [PATCH 21/54] qwen4exp: drop redundant cont in conv/PLE state
+Subject: [PATCH 21/57] qwen4exp: drop redundant cont in conv/PLE state
  write-back ([TAG_ZC_TRANCHE0])
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

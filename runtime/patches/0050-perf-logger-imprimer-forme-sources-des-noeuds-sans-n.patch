@@ -1,7 +1,7 @@
 From 6422243fd00eefe08c55b550cfcadb95b56e20d4 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 19 Sep 2026 13:05:29 +0200
-Subject: [PATCH 50/54] perf-logger: imprimer forme + sources des noeuds sans
+Subject: [PATCH 50/57] perf-logger: imprimer forme + sources des noeuds sans
  nom cb() (permis d'identifier les 12 gathers de l'expansion QSA)
 
 ---

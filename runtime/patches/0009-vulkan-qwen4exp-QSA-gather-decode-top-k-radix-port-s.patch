@@ -1,7 +1,7 @@
 From ebd40d709f91a5c959608efd0f037d9964a65f51 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sun, 30 Aug 2026 17:46:04 +0200
-Subject: [PATCH 09/54] =?UTF-8?q?vulkan/qwen4exp:=20QSA=20gather=20(decode?=
+Subject: [PATCH 09/57] =?UTF-8?q?vulkan/qwen4exp:=20QSA=20gather=20(decode?=
  =?UTF-8?q?)=20+=20top-k=20radix,=20port=C3=A9s=20depuis=20apepojken?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

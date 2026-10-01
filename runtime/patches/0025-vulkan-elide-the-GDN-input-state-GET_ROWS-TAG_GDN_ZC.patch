@@ -1,7 +1,7 @@
 From 7e76d9ae4e36193e25a7761e874fa86544ed8414 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 4 Sep 2026 16:15:59 +0200
-Subject: [PATCH 25/54] vulkan: elide the GDN input-state GET_ROWS
+Subject: [PATCH 25/57] vulkan: elide the GDN input-state GET_ROWS
  ([TAG_GDN_ZC] input side)
 
 The GDN state gather (GET_ROWS on the recurrent ring, ~780 us/token on the 125B

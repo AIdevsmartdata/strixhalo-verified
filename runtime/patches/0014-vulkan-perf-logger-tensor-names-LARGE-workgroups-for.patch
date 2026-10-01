@@ -1,7 +1,7 @@
 From ff00ba0e7d7c65f2053c29706be3402d715cd0f0 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 2 Sep 2026 14:11:41 +0200
-Subject: [PATCH 14/54] vulkan: perf-logger tensor names + LARGE workgroups for
+Subject: [PATCH 14/57] vulkan: perf-logger tensor names + LARGE workgroups for
  AMD small-m matvecs (env-gated)
 
 - [TAG_PERF_NAMES] perf logger includes graph cb() tensor names for op attribution

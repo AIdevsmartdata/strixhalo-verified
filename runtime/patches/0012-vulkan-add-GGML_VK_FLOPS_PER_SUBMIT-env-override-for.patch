@@ -1,7 +1,7 @@
 From 4b0afdcbbd779d864414e527e130c1065a59fc03 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Tue, 1 Sep 2026 13:31:25 +0200
-Subject: [PATCH 12/54] vulkan: add GGML_VK_FLOPS_PER_SUBMIT env override for
+Subject: [PATCH 12/57] vulkan: add GGML_VK_FLOPS_PER_SUBMIT env override for
  submit granularity
 
 Diagnostic knob for latency-bound decode on unified-memory iGPUs.

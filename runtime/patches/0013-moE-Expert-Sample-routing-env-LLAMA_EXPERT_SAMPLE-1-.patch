@@ -1,7 +1,7 @@
 From 48fb33ad5f0f5533c649aaba40d2910d8ae1ad5e Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Tue, 1 Sep 2026 17:13:00 +0200
-Subject: [PATCH 13/54] moE: Expert-Sample routing (env LLAMA_EXPERT_SAMPLE=1)
+Subject: [PATCH 13/57] moE: Expert-Sample routing (env LLAMA_EXPERT_SAMPLE=1)
  + THP madvise (env LLAMA_MMAP_THP=1)
 
 Expert-Sample (arXiv 2602.02443): top k_keep=6 experts deterministes + k-k_keep

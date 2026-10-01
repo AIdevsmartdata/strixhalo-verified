@@ -1,7 +1,7 @@
 From 5fa1dd81fae4d4548dd037011ea3498b50af1d08 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Thu, 27 Aug 2026 23:11:23 +0200
-Subject: [PATCH 04/54] ngram-bias: use O(1) vocabulary-order fast path for
+Subject: [PATCH 04/57] ngram-bias: use O(1) vocabulary-order fast path for
  logit lookup
 
 Avoids a linear scan over the full vocab per biased token. When the

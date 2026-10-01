@@ -1,7 +1,7 @@
 From cd7a02486067c3660970bf0e5399b94da0239851 Mon Sep 17 00:00:00 2001
 From: agent <agent@ace>
 Date: Wed, 16 Sep 2026 13:33:51 +0200
-Subject: [PATCH 44/54] qsa: fix pooled shadowing (segfault), write indexer
+Subject: [PATCH 44/57] qsa: fix pooled shadowing (segfault), write indexer
  keys below budget, env-gated FA split-k, debug traces
 
 ---

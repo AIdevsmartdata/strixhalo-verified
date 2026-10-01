@@ -1,7 +1,7 @@
 From 5071ad668f4a86b1985e85f63753c70bb0ba9bd7 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 19 Sep 2026 11:44:06 +0200
-Subject: [PATCH 47/54] FA coopmat1 : diagnostic instrumente (FA_DIAG) +
+Subject: [PATCH 47/57] FA coopmat1 : diagnostic instrumente (FA_DIAG) +
  staging K/V (FA_STAGE_KV) + multi-lignes MR=2/4
 
 Diagnostic (variantes neutralisant une phase chacune, GPU exclusif, cas hsk=hsv=256 nh=2

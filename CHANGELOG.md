@@ -1,8 +1,8 @@
-# Runtime changes (late August → 30 September 2026)
+# Runtime changes (late August → 1 October 2026)
 
 Everything below sits on top of [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp), branch
 `vulkan/qwen4exp-rocmfpx` (commit `322e5cdf4cc`), which brought Qwen3.8-Flash-Next (`qwen4exp`) and the ROCmFPx types
-to llama.cpp's Vulkan backend, including sparse attention (QSA) and the per-layer n-gram table read from SSD. The 54
+to llama.cpp's Vulkan backend, including sparse attention (QSA) and the per-layer n-gram table read from SSD. The 57
 patches in `runtime/patches/` are the complete delta.
 
 The work was done over five weeks by AI coding agents (DeepSeek, GPT, Claude, and the local Qwen3.8 itself) under my
@@ -22,17 +22,25 @@ adopted, and later re-measurements are given when they disagree.
 | Grammar-compatible backend sampling + reasoning budget with backend sampling | tool calls and reasoning budgets stay correct with `--backend-sampling` (with the default sampler chain the backend path was only really taken once the 30/09 grammar fast path landed) |
 | Context checkpoint created on slot restore | a restored slot (pi's `kv-restore`) reuses its cache instead of re-reading the whole prompt |
 
-## ⚡ Agent-loop speed (30/09)
+## ⚡ Agent-loop speed (30/09 – 01/10)
 
 | change | effect |
 |---|---|
+| Scheduler reservation kept across requests that use the same backend sampler chain (a server sets and clears the chain on every request, and each set or clear re-created the scheduler) | re-reservations **13 → 1** over 12 tool turns; first token after a short tool result **0.62 → 0.40 s**; a 49-token result on a 10.6k context **863 → 636 ms**; identical outputs **(01/10)** |
 | Streaming loads (`MOVNTDQA`, AVX-512/AVX2/SSE4.1) for CPU reads of device memory | the write-combined carve-out read at ~0.4 GB/s with `memcpy`; state checkpoint read **516 → 41 ms**, first token after a short tool result **1.51 → 0.58 s** |
 | Grammar fast path: draw without the constraint, check the single token, full-vocabulary pass only on rejection (same semantics as upstream's default `grammar_first = false`) | the default sampler chain cannot run on the GPU, so every verified position applied the tool-call grammar to all 248,320 tokens; tool-call decode **25 → 48–55 tok/s**, identical output at temperature 0 (diagnosed and written by the local Qwen3.8 through pi) |
 | Reuse of an identical context checkpoint instead of reading the state back again | saved ~0.5 s per reuse before the streaming-load fix; ~40 ms now |
 | Per-request MTP parameters (`speculative.n_max`, `.p_min`, `.n_min`) | tuning without restarting the server |
 
-Agent loop, 12 shell commands, pi's request parameters: **11.1 → 15.3 tokens per wall-clock second**, one short turn
-**3.06 → 1.60 s** (from the afternoon's v2 candidate to the final runtime).
+Agent loop, 12 shell commands, pi's request parameters: **11.1 → 16.2 tokens per wall-clock second**, one short turn
+**3.06 → 1.38 s** (from the 30/09 afternoon's v2 candidate to the 01/10 runtime).
+
+## 🧪 Adaptive MTP draft length (01/10, off by default)
+
+`LLAMA_MTP_N_MAX_ANSWER=N` caps drafts at N tokens outside the `<think>` block while `--spec-draft-n-max` applies inside
+it (the server follows the block from the prompt, then token by token). Measured with 5 against 4 on reasoning text,
+paired rounds: **+5.6 % at 32k** (8/8 rounds), +2.1 % at 8k, +0.9 % at 16k; code text −3 % (noisy). The gain only shows
+at long context, so the launcher leaves it off.
 
 ## 🏎️ Decode and prefill kernels (Vulkan)
 
@@ -67,15 +75,15 @@ extra fusions, tracing). `launch/qwen38-flash-next.sh` is derived from the measu
 flags, minus a private n-gram steering table, the GPU clock floor and the server-side reasoning-effort default, plus
 `--min-p 0.0`.
 
-## 🔍 Known issues (found by our own code review of the last two commits, 30/09)
+## 🔍 Found by our own code review, fixed on 01/10
 
-| issue | impact | status |
+| issue | impact | fix |
 |---|---|---|
-| Host-side zeroing of the recurrent state calls `ggml_backend_tensor_memset`, which asserts on backends whose buffers do not implement it (OpenCL, Hexagon, one SYCL buffer type) | recurrent/hybrid models abort on those backends; Vulkan and CPU are not affected | fix planned: fall back to the in-graph clear |
-| Checkpoint reuse matches on position only: with two checkpoints one token apart and a new prompt diverging exactly at the second one, a stale checkpoint can be kept | wrong recurrent state after a later restore; needs that exact layout, never seen in our agent-loop logs | fix planned: erase checkpoints that cover the first diverging token |
-| No `MFENCE` before the streaming loads | none observed (a blocking fence wait sits between the GPU write and the read); Mesa issues one | hardening planned |
-| A per-request `speculative.n_max` below the launch `n_min` disables drafting instead of clamping `n_min` | slower request, no wrong output | fix planned |
-| `__builtin_cpu_supports` in the streaming-load path needs compiler-rt on Windows clang (MSVC target) | link error on that toolchain | guard planned |
+| Host-side zeroing of the recurrent state called `ggml_backend_tensor_memset`, which asserts on backends whose buffers do not implement it (OpenCL, Hexagon, one SYCL buffer type) | recurrent/hybrid models aborted on those backends; Vulkan and CPU were not affected | host clearing only for host and Vulkan buffers; the others keep the in-graph clear |
+| Checkpoint reuse matched on position only: with two checkpoints one token apart and a new prompt diverging exactly at the second one, a stale checkpoint could be kept | wrong recurrent state after a later restore; that exact layout was never seen in our agent-loop logs | checkpoints that cover the first diverging token are erased |
+| No `MFENCE` before the streaming loads | none observed (a blocking fence wait sits between the GPU write and the read) | `MFENCE` added, as Mesa does |
+| A per-request `speculative.n_max` below the launch `n_min` disabled drafting | slower request, no wrong output | `n_min` is clamped to `n_max` |
+| `__builtin_cpu_supports` in the streaming-load path needs compiler-rt on Windows clang (MSVC target) | link error on that toolchain | no streaming path on Windows |
 
 The grammar fast path follows upstream's default semantics (sample, check, fall back on rejection): at temperature > 0
 with truncating samplers the distribution is the rejection-sampling one, not grammar-first; token probabilities reported

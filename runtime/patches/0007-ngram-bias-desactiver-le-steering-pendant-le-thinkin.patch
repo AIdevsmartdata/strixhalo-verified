@@ -1,7 +1,7 @@
 From 234aa75a7bafe39253ed1808f6156ff84ef741cc Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 29 Aug 2026 13:51:58 +0200
-Subject: [PATCH 07/54] ngram-bias: desactiver le steering pendant le thinking
+Subject: [PATCH 07/57] ngram-bias: desactiver le steering pendant le thinking
  (P0)
 
 Le sampler ngram_bias suit desormais l'etat <think>/</think> (IDs extraits

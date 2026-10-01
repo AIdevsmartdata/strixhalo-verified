@@ -1,0 +1,125 @@
+From 086d0fd6fb8410928d66e5474d30f33e219e9326 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?=
+ <kevin.remondiere@gmail.com>
+Date: Thu, 1 Oct 2026 02:06:45 +0200
+Subject: [PATCH 57/57] context: keep the scheduler reservation across requests
+ that use the same backend sampler chain
+
+A server sets a backend sampler chain for every request and clears it at the end. Each set and each clear re-created
+the scheduler and re-reserved the prompt and token graphs: about 150 ms per request on Qwen3.8-Flash-Next, paid on
+every agent turn (13 re-reservations over 12 tool turns). Now a cleared chain keeps the reservation (the buffers
+reserved with the chain also fit the graph without it) and its signature (the sampler names, in order); a new chain
+with the same signature reuses the reservation. The graph is still rebuilt (llm_graph_input_sampling::can_reuse
+compares sampler pointers) and the allocator grows its buffers if a graph ever needs more.
+Measured: re-reservations 13 -> 1, first token after a short tool result 0.62 -> 0.40 s, agent loop 15.3 -> 16.2
+tokens per wall-clock second, identical outputs. LLAMA_SAMPLER_KEEP_RESERVE=0 restores the old behavior.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WdTYzTHTL3CWzrp46giMJC
+---
+ src/llama-context.cpp | 42 ++++++++++++++++++++++++++++++++++++++++--
+ src/llama-context.h   |  2 ++
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7d5ffbd4875..03621ad1c07 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1206,11 +1206,29 @@ void llama_context::set_warmup(bool value) {
+     //sched_need_reserve = true;
+ }
+ 
++// [TAG_SAMPLER_KEEP_RESERVE] the samplers of a backend chain, in order: two chains with the same signature add the
++// same operations to the graph, so the compute buffers reserved for one fit the other
++static std::string llama_sampler_chain_signature(llama_sampler * chain) {
++    std::string sig;
++    const int32_t n = llama_sampler_chain_n(chain);
++    for (int32_t i = 0; i < n; ++i) {
++        sig += llama_sampler_name(llama_sampler_chain_get(chain, i));
++        sig += '|';
++    }
++    return sig;
++}
++
+ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+         return true;
+     }
+ 
++    // [TAG_SAMPLER_KEEP_RESERVE] LLAMA_SAMPLER_KEEP_RESERVE=0 restores the old behavior (re-reserve on every change)
++    static const bool keep_reserve = [] {
++        const char * e = getenv("LLAMA_SAMPLER_KEEP_RESERVE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
+     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
+ 
+     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+@@ -1223,6 +1241,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+             sched_need_reserve = true;
+         }
+         sampling.samplers.erase(seq_id);
++        sampling.signatures.erase(seq_id);
+         return false;
+     }
+ 
+@@ -1237,9 +1256,19 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+ 
+         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+ 
+-        sampling.samplers[seq_id] = sampler;
++        // [TAG_SAMPLER_KEEP_RESERVE] a server sets a new chain for every request (and clears it in between), usually
++        // identical to the previous one; re-creating the scheduler and re-reserving the graphs costs ~150 ms per
++        // request on a large MoE. The graph itself is still rebuilt (llm_graph_input_sampling::can_reuse compares the
++        // sampler pointers), and the allocator grows its buffers if a graph ever needs more.
++        const std::string sig = llama_sampler_chain_signature(sampler);
++        const bool same_chain = keep_reserve && sampling.signatures.count(seq_id) > 0 && sampling.signatures[seq_id] == sig;
+ 
+-        sched_need_reserve = true;
++        sampling.samplers[seq_id]   = sampler;
++        sampling.signatures[seq_id] = sig;
++
++        if (!same_chain) {
++            sched_need_reserve = true;
++        }
+ 
+         return true;
+     }
+@@ -1252,12 +1281,21 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+         }
+ 
+         sampling.samplers.erase(seq_id);
++        sampling.signatures.erase(seq_id);
+ 
+         return false;
+     }
+ 
+     sampling.samplers.erase(seq_id);
+ 
++    if (keep_reserve) {
++        // [TAG_SAMPLER_KEEP_RESERVE] the buffers reserved with the chain also fit the graph without it: keep them, and
++        // remember the chain, which the next request of this sequence usually sets again
++        return true;
++    }
++
++    sampling.signatures.erase(seq_id);
++
+     sched_need_reserve = true;
+ 
+     return true;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 3913cedaa39..a48fac6c7ae 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -317,6 +317,8 @@ private:
+     struct sampling_info {
+         // !samplers.empty() to check if any samplers are active
+         std::map<llama_seq_id, llama_sampler *> samplers;
++        // [TAG_SAMPLER_KEEP_RESERVE] names of the backend chain last set per sequence
++        std::map<llama_seq_id, std::string> signatures;
+         // [TAG_GRAMMAR_BACKEND] sequences that need the raw logits downloaded even though the
+         // chain runs on the backend (grammar rejection resample reads them host-side)
+         std::set<llama_seq_id> need_raw;
+-- 
+2.53.0
+

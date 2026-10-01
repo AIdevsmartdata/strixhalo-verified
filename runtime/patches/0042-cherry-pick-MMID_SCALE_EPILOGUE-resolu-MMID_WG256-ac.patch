@@ -1,7 +1,7 @@
 From 18ef83cb792fb61cd55b41834da169308a1e05fd Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sun, 13 Sep 2026 23:18:34 +0200
-Subject: [PATCH 42/54] cherry-pick: MMID_SCALE_EPILOGUE (resolu) + MMID_WG256
+Subject: [PATCH 42/57] cherry-pick: MMID_SCALE_EPILOGUE (resolu) + MMID_WG256
  actif en prod
 
 ---

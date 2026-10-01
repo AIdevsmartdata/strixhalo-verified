@@ -1,7 +1,7 @@
 From f7ebbf8e550b55a7667e8984ea56c30838b0dcf9 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 19 Sep 2026 01:32:36 +0200
-Subject: [PATCH 45/54] prod 18/09 nuit : KV f16 coalesce avant le FA (+85%
+Subject: [PATCH 45/57] prod 18/09 nuit : KV f16 coalesce avant le FA (+85%
  prefill) + etat deploye
 
 [TAG_FA_F16_CONTIG] Le cache KV f16 est stocke entrelace par token ([HS, NH, KV] :

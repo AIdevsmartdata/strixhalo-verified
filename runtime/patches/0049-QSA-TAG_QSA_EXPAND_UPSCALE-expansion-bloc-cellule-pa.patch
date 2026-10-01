@@ -1,7 +1,7 @@
 From b70cb9ce3b230760e69d349dc0efea80fa299e82 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 19 Sep 2026 12:57:27 +0200
-Subject: [PATCH 49/54] QSA : TAG_QSA_EXPAND_UPSCALE (expansion bloc->cellule
+Subject: [PATCH 49/57] QSA : TAG_QSA_EXPAND_UPSCALE (expansion bloc->cellule
  par upscale NEAREST) - MESURE ET REJETEE
 
 Le poste, identifie par le logger (formes + sources pour les noeuds sans nom) :

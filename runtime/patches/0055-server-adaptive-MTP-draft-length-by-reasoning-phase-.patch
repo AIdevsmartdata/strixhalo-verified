@@ -1,0 +1,120 @@
+From 9a6937c3df8a375001e1f3c465fa3d743c0cd129 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?=
+ <kevin.remondiere@gmail.com>
+Date: Wed, 30 Sep 2026 23:23:03 +0200
+Subject: [PATCH 55/57] server: adaptive MTP draft length by reasoning phase
+ (LLAMA_MTP_N_MAX_ANSWER)
+
+Draft acceptance is higher on reasoning text than on answers and tool calls. With LLAMA_MTP_N_MAX_ANSWER=N the
+server follows the <think> ... </think> block of each slot (from the prompt, then token by token) and caps drafts
+at N tokens outside it, while --spec-draft-n-max applies inside. A per-request speculative.n_max still wins.
+Off by default; ignored when <think> / </think> are not single tokens.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WdTYzTHTL3CWzrp46giMJC
+---
+ tools/server/server-context.cpp | 53 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8ee5390d0ef..ae2cefc9dd1 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -230,6 +230,9 @@ struct server_slot {
+     llama_tokens spec_prompt;
+     std::vector<int32_t> spec_i_batch;
+     common_prompt_checkpoint spec_ckpt;
++
++    // [TAG_MTP_PHASE] true while the slot generates inside the reasoning block (<think> ... </think>)
++    bool in_reasoning = false;
+     bool spec_is_replay = false;
+ 
+     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
+@@ -822,6 +825,11 @@ public:
+     mtmd_context * mctx = nullptr;
+     const llama_vocab * vocab = nullptr;
+ 
++    // [TAG_MTP_PHASE] reasoning markers, and the draft length used outside the reasoning block (0 = off)
++    llama_token tok_think_start  = LLAMA_TOKEN_NULL;
++    llama_token tok_think_end    = LLAMA_TOKEN_NULL;
++    int32_t     mtp_n_max_answer = 0;
++
+     server_queue    queue_tasks;
+     server_response queue_results;
+ 
+@@ -1091,6 +1099,25 @@ private:
+ 
+         vocab = llama_model_get_vocab(model_tgt);
+ 
++        {
++            // [TAG_MTP_PHASE] LLAMA_MTP_N_MAX_ANSWER=N: drafts are capped at N tokens outside the reasoning block, while
++            // --spec-draft-n-max applies inside it (acceptance is higher on reasoning text than on answers and tool calls)
++            const char * e = getenv("LLAMA_MTP_N_MAX_ANSWER");
++            mtp_n_max_answer = e ? std::max(0, atoi(e)) : 0;
++            const llama_tokens ts = common_tokenize(vocab, "<think>",  false, true);
++            const llama_tokens te = common_tokenize(vocab, "</think>", false, true);
++            if (ts.size() == 1 && te.size() == 1) {
++                tok_think_start = ts[0];
++                tok_think_end   = te[0];
++            } else if (mtp_n_max_answer > 0) {
++                SRV_WRN("%s", "LLAMA_MTP_N_MAX_ANSWER ignored: <think> / </think> are not single tokens in this vocabulary\n");
++                mtp_n_max_answer = 0;
++            }
++            if (mtp_n_max_answer > 0) {
++                SRV_INF("adaptive draft length: --spec-draft-n-max inside <think>, at most %d outside\n", mtp_n_max_answer);
++            }
++        }
++
+         n_ctx = llama_n_ctx(ctx_tgt);
+ 
+         add_bos_token = llama_vocab_get_add_bos(vocab);
+@@ -1770,6 +1797,13 @@ private:
+         const std::string token_str = result.text_to_send;
+         slot.sampled = result.tok;
+ 
++        // [TAG_MTP_PHASE] follow the reasoning block as tokens are generated
++        if (result.tok == tok_think_start) {
++            slot.in_reasoning = true;
++        } else if (result.tok == tok_think_end) {
++            slot.in_reasoning = false;
++        }
++
+         slot.generated_text += token_str;
+         if (slot.task->params.return_tokens) {
+             slot.generated_tokens.push_back(result.tok);
+@@ -2952,7 +2986,9 @@ private:
+                             /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
+                             // [TAG_SPEC_REQ] per-request overrides (negative = boot values)
+                             /* .p_min     = */ slot.task->params.spec_req_p_min,
+-                            /* .n_max_req = */ slot.task->params.spec_req_n_max,
++                            // [TAG_MTP_PHASE] a per-request value wins; otherwise answers and tool calls use the shorter cap
++                            /* .n_max_req = */ slot.task->params.spec_req_n_max > 0 || mtp_n_max_answer <= 0 || slot.in_reasoning
++                                                   ? slot.task->params.spec_req_n_max : mtp_n_max_answer,
+                             /* .n_min     = */ slot.task->params.spec_req_n_min,
+                         };
+ 
+@@ -3769,6 +3805,21 @@ private:
+                 // prompt evaluated for next-token prediction
+                 slot.state = SLOT_STATE_GENERATING;
+ 
++                // [TAG_MTP_PHASE] does the prompt end inside an open reasoning block?
++                slot.in_reasoning = false;
++                if (mtp_n_max_answer > 0) {
++                    for (size_t i = slot.prompt.tokens.size(); i-- > 0; ) {
++                        const llama_token t = slot.prompt.tokens[i];
++                        if (t == tok_think_end) {
++                            break;
++                        }
++                        if (t == tok_think_start) {
++                            slot.in_reasoning = true;
++                            break;
++                        }
++                    }
++                }
++
+                 if (slot.can_speculate()) {
+                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                 }
+-- 
+2.53.0
+

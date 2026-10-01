@@ -1,7 +1,7 @@
 From 0fd8d9af8a43ecc9ab8f870fe39a206c3e0947d5 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 2 Sep 2026 15:26:27 +0200
-Subject: [PATCH 16/54] =?UTF-8?q?qwen4exp:=20graph=20hygiene=20=E2=80=94?=
+Subject: [PATCH 16/57] =?UTF-8?q?qwen4exp:=20graph=20hygiene=20=E2=80=94?=
  =?UTF-8?q?=20hoist=20PLE=20conv1d=20weight=20cast,=20drop=20per-layer=20H?=
  =?UTF-8?q?C=20cont=20copy?=
 MIME-Version: 1.0

@@ -1,7 +1,7 @@
 From 33391770cc4a516f201e3d1488e566a36506a4c1 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 4 Sep 2026 20:08:17 +0200
-Subject: [PATCH 27/54] vulkan: harden GDN state-index transport
+Subject: [PATCH 27/57] vulkan: harden GDN state-index transport
 
 Restrict input-state fusion to coherent host-visible leaf indices, validate the runtime row before eliding GET_ROWS, and use memcpy for the scalar read. Device-local or computed indices now retain the legacy gather instead of falling back to the descriptor path that produced stale values on RADV. Remove the unused index binding and assert the single-sequence dispatch contract.
 ---

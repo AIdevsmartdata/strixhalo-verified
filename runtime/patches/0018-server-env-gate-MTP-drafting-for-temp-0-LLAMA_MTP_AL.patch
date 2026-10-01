@@ -1,7 +1,7 @@
 From d26576f3d89b8f9189d4e606caa5b8f8fdbc36f9 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 2 Sep 2026 20:00:05 +0200
-Subject: [PATCH 18/54] server: env-gate MTP drafting for temp>0
+Subject: [PATCH 18/57] server: env-gate MTP drafting for temp>0
  (LLAMA_MTP_ALL_TEMPS, default off)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

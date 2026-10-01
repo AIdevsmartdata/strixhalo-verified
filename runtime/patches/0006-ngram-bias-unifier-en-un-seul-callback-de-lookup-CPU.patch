@@ -1,7 +1,7 @@
 From 4d96ce890ee829d186ade513c7dfa953929704f6 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 29 Aug 2026 13:42:34 +0200
-Subject: [PATCH 06/54] ngram-bias: unifier en un seul callback de lookup (CPU
+Subject: [PATCH 06/57] ngram-bias: unifier en un seul callback de lookup (CPU
  + backend)
 
 Supprime le callback CPU redondant (ngram_bias_cb) et

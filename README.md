@@ -13,13 +13,14 @@ First model: **Qwen3.8-Flash-Next** (125B MoE). Model card with every measuremen
 | 🏎️ writing (decode), 8k / 32k | 43.0 / 40.1 tok/s (~41 at 64k on short answers) |
 | 📖 reading (prefill), 8k / 32k / 64k | 656 / 585 / 483 tok/s |
 | 🛠️ inside a tool call | ~55 tok/s (was 25) |
-| ⏱️ first token after a short tool result | 0.7 s (was 1.5 s) |
-| 🤖 agent loop, 12 shell commands | 15.3 tokens per wall-clock second (was 11.1) |
+| ⏱️ first token after a short tool result | 0.4 s (was 1.5 s) |
+| 🤖 agent loop, 12 shell commands | 16.2 tokens per wall-clock second (was 11.1) |
 | 🎯 KL divergence vs full-precision reference | 0.116, same top-1 token 92.2 % (747-token code passage; 0.43 on a 4k passage) |
 
 ✅ Measured with `launch/qwen38-flash-next.sh` unchanged, on a from-scratch build of this repository (GPU clock on its
 default setting): same greedy outputs, same KL divergence to the 6th digit and same agent-loop speed as our production
-runtime. The 64k figures come from our production runs.
+runtime. The 64k figures come from our production runs; the agent-loop and first-token figures come from the 1 Oct
+runtime (the 57 patches here), which is what runs in production.
 
 ![Agent loop before and after](assets/agent_loop.png)
 
@@ -27,7 +28,7 @@ runtime. The 64k figures come from our production runs.
 
 | path | content |
 |---|---|
-| `runtime/patches/` | 54 patches on top of [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp) `322e5cdf4cc` |
+| `runtime/patches/` | 57 patches on top of [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp) `322e5cdf4cc` |
 | `runtime/build.sh` | clone, apply, build (Vulkan) |
 | `launch/qwen38-flash-next.sh` | the launcher, derived from our production launcher, every environment switch commented |
 | `launch/mtp_head_gen_32k.bin` | the 32k-token vocabulary of the MTP draft head |

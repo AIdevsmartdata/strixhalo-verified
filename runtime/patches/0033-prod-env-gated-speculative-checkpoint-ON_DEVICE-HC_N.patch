@@ -1,7 +1,7 @@
 From 95487bcfb36b63ccbed67f06ae0322636f55b106 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sun, 6 Sep 2026 15:20:32 +0200
-Subject: [PATCH 33/54] prod: env-gated speculative checkpoint ON_DEVICE +
+Subject: [PATCH 33/57] prod: env-gated speculative checkpoint ON_DEVICE +
  HC_NORM_DIRECT opt-in
 
 - LLAMA_SPEC_CHECKPOINT_ON_DEVICE=1 : checkpoint speculatif stocke sur GPU

@@ -1,7 +1,7 @@
 From 5aa9f8a58c26c3c01e8f40639f8f77a86b3b5fa1 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 29 Aug 2026 13:31:34 +0200
-Subject: [PATCH 05/54] =?UTF-8?q?ngram-bias:=20GPU=20backend=20sampler=20?=
+Subject: [PATCH 05/57] =?UTF-8?q?ngram-bias:=20GPU=20backend=20sampler=20?=
  =?UTF-8?q?=E2=80=94=20steering=20+=20backend-sampling=20compatibles?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

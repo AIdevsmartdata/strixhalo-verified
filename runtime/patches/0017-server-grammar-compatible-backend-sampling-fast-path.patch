@@ -1,7 +1,7 @@
 From 734b9dcb6980f618505729c9a21f34fc1e5706c6 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 2 Sep 2026 18:35:52 +0200
-Subject: [PATCH 17/54] server: grammar-compatible backend sampling (fast-path
+Subject: [PATCH 17/57] server: grammar-compatible backend sampling (fast-path
  validation + raw-logits resample)
 
 [TAG_GRAMMAR_BACKEND] common/sampling.cpp:448 used to hard-disable backend sampling

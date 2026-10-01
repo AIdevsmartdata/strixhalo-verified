@@ -1,7 +1,7 @@
 From 9ce7674061edf026cdf164aadd7bb5d1a933bdd8 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Tue, 8 Sep 2026 12:42:52 +0200
-Subject: [PATCH 34/54] sampler: backend-sampling + MTP safety fixes
+Subject: [PATCH 34/57] sampler: backend-sampling + MTP safety fixes
  (F2/F1/F3/F4)
 
 F2 - ngram-bias transactional state: clone/copy preserve recent + in_thinking,

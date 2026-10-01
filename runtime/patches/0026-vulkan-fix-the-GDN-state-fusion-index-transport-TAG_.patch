@@ -1,7 +1,7 @@
 From ae0a1d2a023ee6e9350b4d988c200dc34da63764 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 4 Sep 2026 19:07:50 +0200
-Subject: [PATCH 26/54] vulkan: fix the GDN state-fusion index transport
+Subject: [PATCH 26/57] vulkan: fix the GDN state-fusion index transport
  ([TAG_GDN_ZC] state side)
 
 The fused GDN reads the recurrent ring directly instead of the gathered

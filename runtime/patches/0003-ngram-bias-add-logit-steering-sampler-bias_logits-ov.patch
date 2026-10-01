@@ -1,7 +1,7 @@
 From 918f00d73d02f82d2200afdbbb42a13c3fff2963 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Thu, 27 Aug 2026 23:08:53 +0200
-Subject: [PATCH 03/54] ngram-bias: add logit-steering sampler (bias_logits)
+Subject: [PATCH 03/57] ngram-bias: add logit-steering sampler (bias_logits)
  over static n-gram cache
 
 Steers logits via logits[token] += alpha * ln(p) from a pre-built n-gram

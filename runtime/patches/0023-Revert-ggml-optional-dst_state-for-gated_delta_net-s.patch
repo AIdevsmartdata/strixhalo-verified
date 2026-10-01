@@ -1,7 +1,7 @@
 From bcf49d3c3de7af5a6338f69c1938cf6e5613efe8 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 4 Sep 2026 14:48:22 +0200
-Subject: [PATCH 23/54] Revert "ggml: optional dst_state for gated_delta_net
+Subject: [PATCH 23/57] Revert "ggml: optional dst_state for gated_delta_net
  snapshots ([TAG_GDN_ZC] stage A)"
 
 The Vulkan port does not need to extend the GGML op API: the recurrent-cache CPY

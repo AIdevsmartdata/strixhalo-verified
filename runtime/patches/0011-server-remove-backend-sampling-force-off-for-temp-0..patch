@@ -1,7 +1,7 @@
 From cc0c06c23f4894cc8b75244bde2b7732ce67d4e1 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sun, 30 Aug 2026 23:41:32 +0200
-Subject: [PATCH 11/54] server: remove backend-sampling force-off for
+Subject: [PATCH 11/57] server: remove backend-sampling force-off for
  temp<=0.01 (MTP disabled)
 
 The MTP-selective toggle forced backend-sampling OFF when temp<=0.01

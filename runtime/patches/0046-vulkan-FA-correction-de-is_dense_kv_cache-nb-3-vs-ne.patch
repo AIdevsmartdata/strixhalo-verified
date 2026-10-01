@@ -1,7 +1,7 @@
 From 2814a75ba385fd23c40b90525d94bfed016217fb Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 19 Sep 2026 02:29:04 +0200
-Subject: [PATCH 46/54] vulkan FA: correction de is_dense_kv_cache (nb[3] vs
+Subject: [PATCH 46/57] vulkan FA: correction de is_dense_kv_cache (nb[3] vs
  ne[3]) - le chemin q8_0 dequant_transpose ne s'activait jamais non plus
 
 La garde amont exigeait nb[3] == nb[1]*ne[1], faux pour une vue du cache prealloue

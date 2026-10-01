@@ -1,7 +1,7 @@
 From 793004638ebef859682f1e66beae8ced0991ae3d Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 9 Sep 2026 03:24:07 +0200
-Subject: [PATCH 36/54] vulkan: fused weighted MoE combine (multi_add WEIGHTED)
+Subject: [PATCH 36/57] vulkan: fused weighted MoE combine (multi_add WEIGHTED)
  with upstream-conflict guard
 
 ---

@@ -1,7 +1,7 @@
 From 7ef8c4c48226e09271c25c47552dabea94f72f18 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Thu, 3 Sep 2026 23:09:07 +0200
-Subject: [PATCH 20/54] qwen4exp: fold HC scale constants into gamma weights
+Subject: [PATCH 20/57] qwen4exp: fold HC scale constants into gamma weights
  ([TAG_HC_SCALE_FOLD])
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

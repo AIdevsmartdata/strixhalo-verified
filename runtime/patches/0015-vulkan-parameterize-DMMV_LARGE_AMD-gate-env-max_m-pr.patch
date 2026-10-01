@@ -1,7 +1,7 @@
 From 91081933e91a6097a7f6a708709cf2b08937d10d Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 2 Sep 2026 14:51:22 +0200
-Subject: [PATCH 15/54] vulkan: parameterize DMMV_LARGE_AMD gate (env = max_m),
+Subject: [PATCH 15/57] vulkan: parameterize DMMV_LARGE_AMD gate (env = max_m),
  prod value 8192
 
 Sweep 64/512/8192 on qwen4exp decode with thermal witness shape:

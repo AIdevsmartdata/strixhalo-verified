@@ -1,7 +1,7 @@
 From 8dcec3c799da1ce6fc87112a06ae9a7582c15f8d Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 9 Sep 2026 14:58:31 +0200
-Subject: [PATCH 39/54] tests: exact FA prefill case for qwen4exp (hsk/hsv 256,
+Subject: [PATCH 39/57] tests: exact FA prefill case for qwen4exp (hsk/hsv 256,
  GQA 12, KV q8_0, ub 2048) [TAG_FA_256_GQA12]
 
 ---

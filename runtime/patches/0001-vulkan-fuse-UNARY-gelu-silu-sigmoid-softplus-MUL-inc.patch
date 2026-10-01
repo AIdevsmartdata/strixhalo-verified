@@ -1,7 +1,7 @@
 From faba251abdf7e23e0ef970f3d0b2fa7d40ae0928 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 28 Aug 2026 22:28:52 +0200
-Subject: [PATCH 01/54] vulkan: fuse UNARY(gelu|silu|sigmoid|softplus) + MUL
+Subject: [PATCH 01/57] vulkan: fuse UNARY(gelu|silu|sigmoid|softplus) + MUL
  (incl. OP-on-B gate)
 
 Generic fused kernel in unary.comp (UNARY_MUL_FUSION variant), 256 threads x 2 iters,

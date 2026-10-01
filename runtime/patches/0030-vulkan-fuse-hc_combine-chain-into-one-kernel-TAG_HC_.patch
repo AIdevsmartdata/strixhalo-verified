@@ -1,7 +1,7 @@
 From f28e2b04269ee0ac655e75a98bbd43b511b41d91 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Sat, 5 Sep 2026 17:30:05 +0200
-Subject: [PATCH 30/54] vulkan: fuse hc_combine chain into one kernel
+Subject: [PATCH 30/57] vulkan: fuse hc_combine chain into one kernel
  ([TAG_HC_COMBINE_FUSED] S2, soup)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

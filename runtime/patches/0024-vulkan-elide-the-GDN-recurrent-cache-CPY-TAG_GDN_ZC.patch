@@ -1,7 +1,7 @@
 From 9adaca4faa0a3151262982df69c4977d142ccef6 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Fri, 4 Sep 2026 14:48:37 +0200
-Subject: [PATCH 24/54] vulkan: elide the GDN recurrent-cache CPY
+Subject: [PATCH 24/57] vulkan: elide the GDN recurrent-cache CPY
  ([TAG_GDN_ZC])
 
 The GDN kernel already materialises the state snapshots it computes; copying them

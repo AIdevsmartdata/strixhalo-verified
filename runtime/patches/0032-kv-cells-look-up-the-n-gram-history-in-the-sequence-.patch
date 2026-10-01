@@ -1,7 +1,7 @@
 From f91b62f8378b6985f0868f5b9130b2a5a72aa2e8 Mon Sep 17 00:00:00 2001
 From: Pascal <admin@serveurperso.com>
 Date: Tue, 1 Sep 2026 20:16:07 +0200
-Subject: [PATCH 32/54] kv-cells: look up the n-gram history in the sequence
+Subject: [PATCH 32/57] kv-cells: look up the n-gram history in the sequence
  position index (#28040)
 
 get_prev_tokens() rebuilt a (seq, pos) -> token hash map on every

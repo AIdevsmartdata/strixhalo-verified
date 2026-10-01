@@ -1,7 +1,7 @@
 From f13d235b6ac00d75670082da09eafdb4014fe318 Mon Sep 17 00:00:00 2001
 From: agent <agent@ace>
 Date: Wed, 16 Sep 2026 13:38:35 +0200
-Subject: [PATCH 43/54] cherry-pick amont: #28023 (somme indexeur par tranches)
+Subject: [PATCH 43/57] cherry-pick amont: #28023 (somme indexeur par tranches)
  + #27941 (seq_cp indexer keys, blocs (seq,index), gardes metadata) -
  qwen4exp.cpp en 'ours' (features PLE du fork)
 

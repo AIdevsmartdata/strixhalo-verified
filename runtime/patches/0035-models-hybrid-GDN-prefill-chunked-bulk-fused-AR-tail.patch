@@ -1,7 +1,7 @@
 From 3e542f76e371f5c7003539ba879e866a3f94615d Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Tue, 8 Sep 2026 17:38:24 +0200
-Subject: [PATCH 35/54] models: hybrid GDN prefill (chunked bulk + fused AR
+Subject: [PATCH 35/57] models: hybrid GDN prefill (chunked bulk + fused AR
  tail) behind LLAMA_GDN_PREFILL_CHUNKED
 
 - large prompt ubatches route the first n-K tokens through the chunked

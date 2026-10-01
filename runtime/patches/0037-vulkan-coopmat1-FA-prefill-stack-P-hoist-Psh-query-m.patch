@@ -1,7 +1,7 @@
 From ca66b69d0efc3453be12c1bb977823334f32bb9b Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?K=C3=A9vin=20R=C3=A9mondi=C3=A8re?= <kevin@localhost>
 Date: Wed, 9 Sep 2026 13:15:24 +0200
-Subject: [PATCH 37/54] vulkan: coopmat1 FA prefill stack (P-hoist + Psh
+Subject: [PATCH 37/57] vulkan: coopmat1 FA prefill stack (P-hoist + Psh
  query-major), ported from Nathanw1014
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

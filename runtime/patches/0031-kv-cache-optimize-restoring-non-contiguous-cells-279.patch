@@ -1,7 +1,7 @@
 From 1f6cbbedef99c4ae3413acb4488be2d9073b738c Mon Sep 17 00:00:00 2001
 From: itsnotoger <19309683+itsnotoger@users.noreply.github.com>
 Date: Mon, 31 Aug 2026 18:49:58 +0200
-Subject: [PATCH 31/54] kv-cache : optimize restoring non-contiguous cells
+Subject: [PATCH 31/57] kv-cache : optimize restoring non-contiguous cells
  (#27991)
 
 * kv cache : batch state restore scatter reads per contiguous run
