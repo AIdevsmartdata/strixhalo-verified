@@ -2,62 +2,67 @@
 
 ![Qwen3.8-Flash-Next on one Strix Halo](assets/banner.png)
 
-Large mixture-of-experts models on **one AMD Strix Halo box** (Ryzen AI Max+ 395, 128 GB unified memory) through
-**Vulkan**, tuned for **local coding agents** and **checked against full-precision reference logits**. 🧪
-
-First model: **Qwen3.8-Flash-Next** (125B MoE). Model card with every measurement and its method:
+**Qwen3.8-Flash-Next** (125B MoE) on **one AMD Strix Halo box** (Ryzen AI Max+ 395, 128 GB unified memory), served by
+**a llama.cpp fork on ROCm/HIP**, tuned for **local coding agents**, and **checked against BF16 reference logits**. 🧪
+The model card has every measurement and its method:
 🤗 [Kevletesteur/Qwen3.8-Flash-Next-StrixHalo-Verified](https://huggingface.co/Kevletesteur/Qwen3.8-Flash-Next-StrixHalo-Verified).
 
-| | |
+| | this runtime (8 Nov 2026) |
 |---|---|
-| 🏎️ writing (decode), 8k / 32k | 43.0 / 40.1 tok/s (~41 at 64k on short answers) |
-| 📖 reading (prefill), 8k / 32k / 64k | 656 / 585 / 483 tok/s |
-| 🛠️ inside a tool call | ~55 tok/s (was 25) |
-| ⏱️ first token after a short tool result | 0.4 s (was 1.5 s) |
-| 🤖 agent loop, 12 shell commands | 16.2 tokens per wall-clock second (was 11.1) |
-| 🎯 KL divergence vs full-precision reference | 0.116, same top-1 token 92.2 % (747-token code passage; 0.43 on a 4k passage) |
+| 📖 reading a fresh prompt, 1k / 4k / 16k tokens | 783 / 1,286 / 1,516 tok/s |
+| 🏎️ writing, agent settings (MTP drafting, temperature 1, reasoning xhigh) | 42–59 tok/s depending on the task |
+| 📋 copying a file with two renames | 75–78 tok/s |
+| 🎯 KL divergence vs BF16 logits (747-token code passage) | 0.121, same top-1 token 91.3 % |
 
-✅ Measured with `launch/qwen38-flash-next.sh` unchanged, on a from-scratch build of this repository (GPU clock on its
-default setting): same greedy outputs, same KL divergence to the 6th digit and same agent-loop speed as our production
-runtime. The 64k figures come from our production runs; the agent-loop and first-token figures come from the 1 Oct
-runtime (the 57 patches here), which is what runs in production.
+🤝 **On the same box, [Gufo 0.31](https://github.com/gufo-org/gufo) is faster at the same quality.** Prefill is +54 %
+at 1k, and decode is faster on most tasks. The card has the full comparison.
 
-![Agent loop before and after](assets/agent_loop.png)
+The first version of this repository (Vulkan runtime, 1 Oct 2026) is at tag
+[`v1-vulkan`](https://github.com/AIdevsmartdata/strixhalo-verified/tree/v1-vulkan).
 
 ## 📦 What is here
 
 | path | content |
 |---|---|
-| `runtime/patches/` | 57 patches on top of [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp) `322e5cdf4cc` |
-| `runtime/build.sh` | clone, apply, build (Vulkan) |
-| `launch/qwen38-flash-next.sh` | the launcher, derived from our production launcher, every environment switch commented |
-| `launch/mtp_head_gen_32k.bin` | the 32k-token vocabulary of the MTP draft head |
-| `bench/` | agent-turn benchmark, tool-call speed probe |
-| `CHANGELOG.md` | the main runtime changes of the last five weeks, with the measured effect where one was recorded, and known issues |
+| `runtime/patches/0001-strixhalo-hip-b29.patch` | the whole runtime delta, on top of [Aristo94/GSQHalo.cpp](https://github.com/Aristo94/GSQHalo.cpp) `5fc881b` |
+| `runtime/COMMITS.md` | the 180 commits that make up that patch |
+| `runtime/build.sh`, `runtime/cmake-options.txt` | clone, apply, **check the source tree hash**, build with the exact options of our production build (HIP, gfx1151) |
+| `launch/qwen38-flash-next.sh` | the launcher, identical to our production launcher apart from paths, every environment switch commented |
+| `launch/mtp_vocab_65k_fr4096.bin` | the 69,632 token ids scored by the MTP draft head |
+| `bench/` | launcher parity check, agent-turn benchmark, tool-call speed probe |
+| `CHANGELOG.md` | the main changes since August, with the measured effect of each |
+| `THIRD_PARTY_NOTICES.md` | licences and credits for adapted code (Gufo, MIT) and data files |
 
-Weights are not redistributed: use Unsloth's
-[UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (four shards; point `-m` at the first one) and
-`mmproj-F16.gguf` from the same repository, and agentionai's
-[MTP draft head](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-MTP-ROCmFP4-FAST-GGUF)
-(`Qwen3.8-Flash-Next-MTP-ROCmFP4-FAST.gguf`).
+Weights are not redistributed. You need:
+- Unsloth's [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), merged into one file with
+  `llama-gguf-split --merge`;
+- `mmproj-F16.gguf` from the same repository;
+- drluoto's [MTP draft head](https://huggingface.co/drluoto/Qwen3.8-Flash-Next-MTP-GGUF), `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`.
 
 ## 🚀 Quick start
 
 ```bash
 hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" --include "mmproj-F16.gguf" --local-dir ~/models/qwen38
-hf download agentionai/Qwen3.8-Flash-Next-MTP-ROCmFP4-FAST-GGUF Qwen3.8-Flash-Next-MTP-ROCmFP4-FAST.gguf --local-dir ~/models/qwen38
+hf download drluoto/Qwen3.8-Flash-Next-MTP-GGUF mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf --local-dir ~/models/qwen38
 
 git clone https://github.com/AIdevsmartdata/strixhalo-verified && cd strixhalo-verified
-./runtime/build.sh      # needs git, cmake, a C++17 compiler, libvulkan-dev, glslc and spirv-headers
-MODEL=~/models/qwen38/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+ROCM_PATH=/opt/rocm ./runtime/build.sh      # ROCm with gfx1151 (7.14 measured), git, cmake, a C++17 compiler
+./llama.cpp-strixhalo/build/bin/llama-gguf-split --merge \
+  ~/models/qwen38/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf ~/models/qwen38/Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf
+
+MODEL=~/models/qwen38/Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf \
 MMPROJ=~/models/qwen38/mmproj-F16.gguf \
-MTP=~/models/qwen38/Qwen3.8-Flash-Next-MTP-ROCmFP4-FAST.gguf \
+MTP=~/models/qwen38/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf \
+MTP_IDS=$PWD/launch/mtp_vocab_65k_fr4096.bin \
 RUNTIME=$PWD/llama.cpp-strixhalo/build/bin \
 ./launch/qwen38-flash-next.sh
 ```
 
-Host settings we run with: kernel boot options `amd_iommu=off amdgpu.gttsize=112640 ttm.pages_limit=28835840 amdgpu.lockup_timeout=30000`,
-Ubuntu 26.04 (kernel 7.0, Mesa 26.0.8).
+Host settings we run with:
+- kernel boot options `amd_iommu=off amdgpu.gttsize=112640 ttm.pages_limit=28835840 amdgpu.lockup_timeout=30000`
+  (Ubuntu 26.04, kernel 7.0);
+- the model file on a fast NVMe;
+- at least 15 GB of RAM left free.
 
 ## 🔍 Check your setup
 
@@ -66,27 +71,18 @@ python3 bench/probe_tool_call_speed.py 8081 mine out/      # a module written as
 python3 bench/probe_agent_turns.py 8081 mine out/ 12 8000 fidele
 ```
 
-On this runtime the tool-call probe gives about 50 tok/s for both arms; a runtime without the grammar fast path gives
-about half inside the tool call:
-
-![Tool-call speed before and after the grammar fast path](assets/tool_call.png)
-
 ## 🎯 Fidelity
 
-![KL divergence vs the full-precision reference](assets/fidelity_kld.png)
+![KL divergence vs the BF16 reference](assets/fidelity_kld.png)
 
-Method, caveats and the bugs this caught are on the [model card](https://huggingface.co/Kevletesteur/Qwen3.8-Flash-Next-StrixHalo-Verified).
+Method, caveats and the paired comparison are on the
+[model card](https://huggingface.co/Kevletesteur/Qwen3.8-Flash-Next-StrixHalo-Verified).
 
 ## 🙏 Credits
 
-Qwen team (model) · Unsloth (quants) · llama.cpp and its Vulkan maintainers · LaurentZuijdwijk (Qwen3.8 Vulkan fork,
-the base of this work) · Nathanw1014 (flash-attention prefill stack) · apepojken (QSA gather, radix top-k) ·
-ciru-ai/ROCmFPX (FP4 types) · agentionai (MTP draft head) · nitinpanj (reference logits) · the authors of upstream PRs
-#27941, #27991, #28023, #28040, #28068, #28123 and #28333 (open).
+Qwen team · Unsloth · Aristo94 (GSQHalo.cpp) · halo-box/strix-llama.cpp contributors · llama.cpp and ggml maintainers ·
+gufo-org/gufo (MIT, adapted code credited in the source) · drluoto (MTP heads) · nitinpanj (reference logits) ·
+LaurentZuijdwijk (base of the Vulkan version).
 
-Built by [Kévin Rémondière](https://huggingface.co/Kevletesteur) with AI coding agents under his direction —
-👋 **open to work** in LLM inference and applied AI (kevin.remondiere@gmail.com).
-
-## 📜 License
-
-MIT (the patches modify MIT-licensed llama.cpp code). The model weights are under the Qwen Community License.
+Licence: MIT (see `LICENSE` and `THIRD_PARTY_NOTICES.md`). Author: Kévin Rémondière
+([Hugging Face](https://huggingface.co/Kevletesteur), [GitHub](https://github.com/AIdevsmartdata)).
